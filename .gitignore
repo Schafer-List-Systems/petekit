@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.whl
+.venv/
+
+# Environment
+.env
+.env.local
+.venv/
+
+# Editors
+*.swp
+*.swo
+*~
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Playwright
+.playwright-mcp/
+
+# Project-specific
+.markdown-collab/
+examples/
+grocerylist.md
+ROADMAP.md
+AGENTS.md
+test.py
+
+# OS
+.DS_Store
+Thumbs.db
