@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import cv2
 
-from peteos.agentic_objects.camera_driver import CameraDriver, CV2CameraDriver
 from peteos import AgenticObject
 from peteos.oap.decorators import tool
 
+from .camera_driver import V4L2CameraDriver
 from .image_buffer_manager import ImageBufferManager
 
 
@@ -24,7 +24,7 @@ class CameraObserver(ImageBufferManager, AgenticObject):
         scaling: int | None = None,
     ) -> None:
         super().__init__()
-        self._driver: CameraDriver = driver or CV2CameraDriver()
+        self._driver: CameraDriver = driver or V4L2CameraDriver()
         self._scaling: int | None = scaling
         self._active_camera_id: int | None = None
 
