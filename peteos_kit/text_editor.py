@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import difflib
-from three_merge import merge
+from .three_merge import merge
 import os
 
 from dataclasses import dataclass
@@ -80,7 +80,7 @@ class TextEditor(BufferManager, AgenticObject):
                         return (
                             f"Error: file '{abs_path}' was modified externally. "
                             f"Your loaded mtime: {self.expected_file_state[abs_path].mtime}, current mtime: {current_mtime}. "
-                            "Use diff_text to see the difference, or pass merge_changes=True to store_text to attempt a 3-way merge."
+                            "Use diff_text to see the external changes, or pass merge_changes=True to store_text to attempt a 3-way merge."
                         )
                     try:
                         with open(abs_path, "r", encoding="utf-8") as f:
@@ -90,7 +90,7 @@ class TextEditor(BufferManager, AgenticObject):
                         pass
                     base = self.expected_file_state[abs_path].content
                     my_lines = [entry.data for entry in buf.lines]
-                    merged_text = merge("\n".join(disk_lines), "\n".join(my_lines), "\n".join(base))
+                    merged_text, had_conflicts = merge("\n".join(disk_lines), "\n".join(my_lines), "\n".join(base))
                     try:
                         with open(abs_path, "w", encoding="utf-8") as f:
                             f.write(merged_text)
@@ -101,10 +101,11 @@ class TextEditor(BufferManager, AgenticObject):
                         buf.lines = [BufferEntry(data=line, timestamp=new_mtime, seen=True) for line in merged_lines]
                     except Exception as e:
                         return f"Error: {type(e).__name__}: {e}"
+                    if not had_conflicts:
+                        return f"File '{abs_path}': 3-way merge applied cleanly — all changes preserved."
                     return (
-                        f"File '{abs_path}' was modified externally. 3-way merge applied — changes merged, conflicts may exist. "
-                        f"Use diff_text('{abs_path}') to inspect external changes. "
-                        f"Use load_text('{abs_path}') to overwrite the buffer with the merged result and continue editing."
+                        f"File '{abs_path}': 3-way merge applied — unresolved conflicts detected. "
+                        "Use diff_text('{abs_path}') to locate and resolve them."
                     )
         try:
             text = "\n".join(entry.data for entry in buf.lines)
