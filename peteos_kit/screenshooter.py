@@ -18,7 +18,7 @@ class Screenshooter(ImageBufferManager, AgenticObject):
     and read_np_buffer to send a captured image to the LLM for reasoning.
     """
 
-    @tool(description="Capture the full screen or a specific pixel region and store it as a named image buffer. Pass an ImageRegion with x1, y1 (top-left) and x2, y2 (bottom-right) to capture only that region. Omit the region to capture the full screen. The image is stored under the given name and can be read with read_np_buffer.")
+    @tool(description="Capture the full screen or a specific pixel region and store it as a named image buffer. Pass region as a dict with keys x1, y1 (top-left corner) and x2, y2 (bottom-right corner) to capture only that pixel region. Omit region entirely to capture the full screen. The image is stored with an 'image:' prefix. When calling read_np_buffer, use the exact buffer name from the return message.")
     def take_screenshot(self, name: str, region: ImageRegion | None = None) -> str:
         """Capture screen (full or region) and store in the image buffer."""
         with mss.MSS() as s:
