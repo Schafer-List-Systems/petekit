@@ -5,10 +5,19 @@ from __future__ import annotations
 import difflib
 import os
 
+from dataclasses import dataclass
+
 from peteos.oap.agentic_object import AgenticObject
 from peteos.oap.decorators import tool
 
 from .buffer_manager import BufferManager
+
+
+@dataclass
+class ExpectedFileData:
+    """The file state the agent expects — mtime and content lines when loaded or last stored."""
+    mtime: float
+    content: list[str]
 
 
 class TextEditor(BufferManager, AgenticObject):
@@ -23,7 +32,7 @@ class TextEditor(BufferManager, AgenticObject):
 
     def __init__(self) -> None:
         super().__init__()
-        self.file_awareness: dict[str, float] = {}
+        self.file_awareness: dict[str, ExpectedFileData] = {}
 
     @tool(description="Load a file from disk into a buffer named 'file:<abs_path>'.")
     def load_text(self, file_path: str, overwrite_internal_buffer: bool = False) -> str:
@@ -33,7 +42,7 @@ class TextEditor(BufferManager, AgenticObject):
             with open(abs_path, "w", encoding="utf-8") as f:
                 pass
             mtime = os.path.getmtime(abs_path)
-            self.file_awareness[abs_path] = mtime
+            self.file_awareness[abs_path] = ExpectedFileData(mtime=mtime, content=[])
             key = f"file:{abs_path}"
             count = self._create_buffer(key, text="", modified_at=mtime)
             return f"Created empty buffer 'file:{abs_path}' (0 lines)."
@@ -41,7 +50,7 @@ class TextEditor(BufferManager, AgenticObject):
             with open(abs_path, "r", encoding="utf-8") as f:
                 content = f.read()
             mtime = os.path.getmtime(abs_path)
-            self.file_awareness[abs_path] = mtime
+            self.file_awareness[abs_path] = ExpectedFileData(mtime=mtime, content=content.splitlines())
             key = f"file:{abs_path}"
             count = self._create_buffer(key, text=content, modified_at=mtime, overwrite=overwrite_internal_buffer)
             if count is None:
@@ -65,10 +74,10 @@ class TextEditor(BufferManager, AgenticObject):
             except FileNotFoundError:
                 pass
             else:
-                if current_mtime > self.file_awareness[abs_path]:
+                if current_mtime > self.file_awareness[abs_path].mtime:
                     return (
                         f"Error: file '{abs_path}' was modified externally. "
-                        f"Your loaded mtime: {self.file_awareness[abs_path]}, current mtime: {current_mtime}. "
+                        f"Your loaded mtime: {self.file_awareness[abs_path].mtime}, current mtime: {current_mtime}. "
                         "Use diff_file to see the difference. "
                     )
         try:
@@ -77,7 +86,8 @@ class TextEditor(BufferManager, AgenticObject):
                 f.write(text)
             new_mtime = os.path.getmtime(abs_path)
             buf.modified_at = new_mtime
-            self.file_awareness[abs_path] = new_mtime
+            buf_content = [entry.data for entry in buf.lines]
+            self.file_awareness[abs_path] = ExpectedFileData(mtime=new_mtime, content=buf_content)
             return f"Stored {len(buf.lines)} lines to {abs_path}."
         except Exception as e:
             return f"Error: {type(e).__name__}: {e}"
