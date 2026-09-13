@@ -8,7 +8,7 @@ from pathlib import Path
 from peteos.oap.agentic_object import AgenticObject
 from peteos.oap.decorators import tool
 
-from .buffer import Buffer, BufferManager
+from .buffer_manager import Buffer, BufferManager
 
 
 class Basher(BufferManager, AgenticObject):

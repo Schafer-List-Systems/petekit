@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from peteos.oap.agentic_object import AgenticObject
 from peteos.oap.decorators import tool
 
-from .buffer import Buffer, BufferManager
+from .buffer_manager import Buffer, BufferManager
 
 
 def _find_chrome() -> str:

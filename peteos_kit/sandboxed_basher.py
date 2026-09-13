@@ -11,7 +11,7 @@ from peteos.oap.agentic_object import AgenticObject
 from peteos.oap.decorators import tool
 from peteos.utils import get_logger
 
-from .buffer import Buffer
+from .buffer_manager import Buffer
 from .basher import Basher
 
 _logger = get_logger(__name__)

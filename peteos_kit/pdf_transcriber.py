@@ -11,7 +11,7 @@ from pathlib import Path
 
 from peteos.oap.agentic_object import AgenticObject, tool, Error
 
-from .buffer import Buffer, BufferManager
+from .buffer_manager import Buffer, BufferManager
 
 
 class PdfTranscriber(BufferManager, AgenticObject):

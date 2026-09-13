@@ -8,7 +8,7 @@ import os
 from peteos.oap.agentic_object import AgenticObject
 from peteos.oap.decorators import tool
 
-from .buffer import Buffer, BufferManager
+from .buffer_manager import Buffer, BufferManager
 
 
 class TextEditor(BufferManager, AgenticObject):
@@ -97,7 +97,7 @@ class TextEditor(BufferManager, AgenticObject):
             fromfile=abs_path, tofile=abs_path,
             lineterm="",
         ))
-        from .buffer import Buffer
+        from .buffer_manager import Buffer
         import time as time_mod
         now = time_mod.time()
         self._buffers[diff_name] = Buffer(lines=diff_lines, created_at=now, modified_at=now)
