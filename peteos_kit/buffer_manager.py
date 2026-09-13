@@ -70,6 +70,19 @@ class BufferManager(AgenticObject):
             return f"Buffer '{name}' overwritten with {result} lines."
         return f"Buffer '{name}' created ({result} lines)."
 
+    @tool(description="Copy a buffer to a new name. Copies all lines by value. Timestamps of individual lines are preserved. Set overwrite=True to replace an existing target buffer.")
+    def copy_buffer(self, source_name: str, target_name: str, overwrite: bool = False) -> str:
+        """Copy a buffer by value to a new name."""
+        if source_name not in self._buffers:
+            return f"Error: no buffer named '{source_name}'."
+        if target_name in self._buffers and not overwrite:
+            return f"Error: buffer '{target_name}' already exists. Use overwrite=True to replace it."
+        src = self._buffers[source_name]
+        now = time.time()
+        new_entries = [BufferEntry(data=e.data, timestamp=e.timestamp, seen=e.seen) for e in src.lines]
+        self._buffers[target_name] = Buffer(lines=new_entries, created_at=now, modified_at=now)
+        return f"Buffer '{target_name}' copied from '{source_name}' ({len(new_entries)} lines)."
+
     @tool(description="Fill a buffer with text. Each line in the text becomes one line in the buffer. Replaces existing content. The buffer must already exist.")
     def write_buffer(self, name: str, text: str) -> str:
         """Write text into a named buffer, replacing its content."""
