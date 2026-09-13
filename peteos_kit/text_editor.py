@@ -40,13 +40,7 @@ class TextEditor(BufferManager, AgenticObject):
         """Load a file. Creates it if it does not exist. Sets modified_at from the file's mtime."""
         abs_path = os.path.abspath(file_path)
         if not os.path.isfile(abs_path):
-            with open(abs_path, "w", encoding="utf-8") as f:
-                pass
-            mtime = os.path.getmtime(abs_path)
-            self.expected_file_state[abs_path] = ExpectedFileData(mtime=mtime, content=[])
-            key = f"file:{abs_path}"
-            count = self._create_buffer(key, text="", modified_at=mtime)
-            return f"Created empty buffer 'file:{abs_path}' (0 lines)."
+            return f"Error: file '{abs_path}' does not exist. Cannot load a non-existent file."
         try:
             with open(abs_path, "r", encoding="utf-8") as f:
                 content = f.read()
