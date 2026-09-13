@@ -30,7 +30,7 @@ class Screenshooter(ImageBufferManager, AgenticObject):
 
         array_bgr = cv2.cvtColor(np.asarray(screenshot), cv2.COLOR_BGRA2BGR)
 
-        buffer_name = f"image:{name}"
+        buffer_name = name if name.startswith("image:") else f"image:{name}"
         self._store_np_buffer(buffer_name, array_bgr)
 
         h, w = array_bgr.shape[:2]
