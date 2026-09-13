@@ -154,30 +154,129 @@ class BufferManager(AgenticObject):
         if name not in self._buffers:
             return f"Error: no buffer named '{name}'. Use create_buffer first."
         buf = self._buffers[name]
-        content = "\n".join(entry.data for entry in buf.lines)
-        if not replace_all:
-            if content.count(old_string) > 1:
-                line_numbers = [i + 1 for i, entry in enumerate(buf.lines) if old_string in entry.data]
-                clusters = self._cluster_lines_to_ranges(name, line_numbers, 5)
-                cluster_msgs = ", ".join(f"lines {s}–{e} ({n} occurrence(s))" for s, e, n in clusters)
-                return (
-                    f"Error: '{old_string}' found multiple times ({content.count(old_string)} total) at: {cluster_msgs}. "
-                    "Set replace_all=True to replace all occurrences."
-                )
-            if old_string not in content:
-                return f"Error: '{old_string}' not found in buffer."
-            new_content = content.replace(old_string, new_string, 1)
-        else:
-            if old_string not in content:
-                return f"Error: '{old_string}' not found in buffer."
-            new_content = content.replace(old_string, new_string)
+        old_entries = buf.lines
+        old_timestamps = [e.timestamp for e in old_entries]
+        original_content = "\n".join(entry.data for entry in old_entries)
+
+        all_ranges: list[tuple[int, int]] = []
+        pos = 0
+        while True:
+            idx = original_content.find(old_string, pos)
+            if idx == -1:
+                break
+            all_ranges.append((idx, idx + len(old_string)))
+            pos = idx + 1
+
+        if len(all_ranges) == 0:
+            return f"Error: '{old_string}' not found in buffer."
+
+        if not replace_all and len(all_ranges) > 1:
+            line_numbers = [i + 1 for i, entry in enumerate(buf.lines) if old_string in entry.data]
+            clusters = self._cluster_lines_to_ranges(name, line_numbers, 5)
+            cluster_msgs = ", ".join(f"lines {s}–{e} ({n} occurrence(s))" for s, e, n in clusters)
+            return (
+                f"Error: '{old_string}' found multiple times ({original_content.count(old_string)} total) at: {cluster_msgs}. "
+                "Set replace_all=True to replace all occurrences."
+            )
+        char_ranges = all_ranges if replace_all else [all_ranges[0]]
+
+        new_content = original_content
+        for start, end in reversed(char_ranges):
+            new_content = new_content[:start] + new_string + new_content[end:]
+
+        if not replace_all and len(char_ranges) > 1:
+            line_numbers = [i + 1 for i, entry in enumerate(buf.lines) if old_string in entry.data]
+            clusters = self._cluster_lines_to_ranges(name, line_numbers, 5)
+            cluster_msgs = ", ".join(f"lines {s}–{e} ({n} occurrence(s))" for s, e, n in clusters)
+            return (
+                f"Error: '{old_string}' found multiple times ({original_content.count(old_string)} total) at: {cluster_msgs}. "
+                "Set replace_all=True to replace all occurrences."
+            )
+        if len(char_ranges) == 0:
+            return f"Error: '{old_string}' not found in buffer."
+
+        new_content = original_content
+        for start, end in reversed(char_ranges):
+            new_content = new_content[:start] + new_string + new_content[end:]
+
+        new_lines = new_content.splitlines()
         now = time.time()
-        buf.lines = [BufferEntry(data=line, timestamp=now, seen=True) for line in new_content.splitlines()]
+        result_entries: list[BufferEntry] = []
+        used_old_indices: set[int] = set()
+
+        sorted_ranges = sorted(char_ranges)
+
+        replaced_line_indices: set[int] = set()
+        for r_start, r_end in sorted_ranges:
+            first_newline = original_content[:r_start].count('\n')
+            last_newline = original_content[:r_end].count('\n') - 1
+            for li in range(first_newline, last_newline + 1):
+                replaced_line_indices.add(li)
+
+        char_offset = 0
+        for new_i, line_text in enumerate(new_lines):
+            char_pos_new = sum(len(new_lines[j]) + 1 for j in range(new_i)) if new_i > 0 else 0
+
+            in_replaced = False
+            effective_offset = 0
+            matched_range: tuple[int, int] | None = None
+            for r_start, r_end in sorted_ranges:
+                adj_start = r_start + effective_offset
+                adj_end = r_end + effective_offset
+                if char_pos_new < adj_start:
+                    break
+                if adj_start <= char_pos_new < adj_end:
+                    in_replaced = True
+                    matched_range = (r_start, r_end)
+                    effective_offset += len(new_string) - (r_end - r_start)
+                    break
+                effective_offset += len(new_string) - (r_end - r_start)
+
+            if in_replaced and matched_range is not None:
+                r_start, r_end = matched_range
+                net_change = len(new_string) - (r_end - r_start)
+                if net_change < 0:
+                    remapped_pos = char_pos_new - net_change
+                else:
+                    remapped_pos = char_pos_new - net_change
+                if not (r_start <= remapped_pos < r_end):
+                    in_replaced = False
+
+            if in_replaced:
+                result_entries.append(BufferEntry(data=line_text, timestamp=now, seen=True))
+            else:
+                mapped_pos = char_pos_new - effective_offset
+                if mapped_pos <= 0:
+                    mapped_line_idx = 0
+                else:
+                    mapped_line_idx = original_content[:mapped_pos].count('\n')
+                if (
+                    new_i < len(old_entries)
+                    and old_entries[new_i].data == line_text
+                    and new_i not in used_old_indices
+                    and new_i not in replaced_line_indices
+                ):
+                    result_entries.append(
+                        BufferEntry(data=line_text, timestamp=old_timestamps[new_i], seen=True)
+                    )
+                    used_old_indices.add(new_i)
+                elif (
+                    mapped_line_idx < len(old_entries)
+                    and old_entries[mapped_line_idx].data == line_text
+                    and mapped_line_idx not in used_old_indices
+                    and mapped_line_idx not in replaced_line_indices
+                ):
+                    result_entries.append(
+                        BufferEntry(data=line_text, timestamp=old_timestamps[mapped_line_idx], seen=True)
+                    )
+                    used_old_indices.add(mapped_line_idx)
+                else:
+                    result_entries.append(BufferEntry(data=line_text, timestamp=now, seen=True))
+
+        buf.lines = result_entries
         buf.modified_at = now
-        if replace_all:
-            count = content.count(old_string)
-            return f"Replaced {count} occurrence(s) of '{old_string}'."
-        return f"Replaced '{old_string}' with '{new_string}'."
+        count = len(char_ranges)
+        return f"Replaced {count} occurrence(s) of '{old_string}'."
 
     @tool(description="Diff two buffers line-by-line using a unified diff. Stores the result in a target buffer named diff:a→b. Use overwrite=True to overwrite an existing diff buffer.")
     def diff_buffers(self, a: str, b: str, overwrite: bool = False) -> str:
