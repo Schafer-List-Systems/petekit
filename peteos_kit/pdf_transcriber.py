@@ -67,12 +67,11 @@ class PdfTranscriber(BufferManager, AgenticObject):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
         buffer_name = f"pdf:{abs_path}"
-        lines = [
+        text = "\n".join([
             f"=== Page {i+1} ===\n{text}\n### Image Description: {desc}"
             for i, (text, desc) in enumerate(results)
-        ]
-        now = time_mod.time()
-        self._buffers[buffer_name] = Buffer(lines=lines, created_at=now, modified_at=now)
+        ])
+        self._create_buffer(buffer_name, text=text)
         return (
             f"Transcribed {len(results)} page(s) from '{pdf_path}' into buffer '{buffer_name}'. "
             f"Use read_buffer to access the content."

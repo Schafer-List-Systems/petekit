@@ -161,10 +161,8 @@ class WebNavigator(BufferManager, AgenticObject):
         if html.startswith("Error"):
             return html
         formatted = _format_for_buffer(html)
-        lines = formatted.splitlines()
-        now = time_mod.time()
-        self._buffers[url] = Buffer(lines=lines, created_at=now, modified_at=now)
-        return f"Loaded buffer '{url}' ({len(lines)} lines)."
+        result = self._create_buffer(url, text=formatted)
+        return f"Loaded buffer '{url}' ({result} lines)."
 
     @tool(description="Render a URL via headless Chrome and store extracted text in a buffer keyed by the URL.")
     def render_url(self, url: str, timeout: int = 30) -> str:
@@ -175,10 +173,8 @@ class WebNavigator(BufferManager, AgenticObject):
         if html.startswith("Error"):
             return html
         formatted = _format_for_buffer(html)
-        lines = formatted.splitlines()
-        now = time_mod.time()
-        self._buffers[url] = Buffer(lines=lines, created_at=now, modified_at=now)
-        return f"Rendered buffer '{url}' ({len(lines)} lines)."
+        result = self._create_buffer(url, text=formatted)
+        return f"Rendered buffer '{url}' ({result} lines)."
 
     @tool(description="Extract all links from a URL and store them as lines in a derived buffer (keyed by URL+:links).")
     def extract_links(self, url: str, timeout: int = 15) -> str:
@@ -193,8 +189,8 @@ class WebNavigator(BufferManager, AgenticObject):
             return f"No links found in '{url}'."
         lines = [f"{link['title']}\t{link['href']}" for link in links]
         key = f"{url}:links"
-        now = time_mod.time()
-        self._buffers[key] = Buffer(lines=lines, created_at=now, modified_at=now)
+        text = "\n".join(lines)
+        result = self._create_buffer(key, text=text)
         return f"Extracted {len(links)} link(s) into buffer '{key}'."
 
     @tool(description="Extract all image src URLs from a URL and store them as lines in a derived buffer (keyed by URL+:images).")
@@ -209,8 +205,8 @@ class WebNavigator(BufferManager, AgenticObject):
         if not images:
             return f"No images found in '{url}'."
         key = f"{url}:images"
-        now = time_mod.time()
-        self._buffers[key] = Buffer(lines=images, created_at=now, modified_at=now)
+        text = "\n".join(images)
+        result = self._create_buffer(key, text=text)
         return f"Extracted {len(images)} image(s) into buffer '{key}'."
 
     @tool(description="Extract text content of HTML elements matching the CSS selector. Stores each match as a line in a derived buffer (keyed by URL+:selector:{selector}).")
@@ -227,8 +223,8 @@ class WebNavigator(BufferManager, AgenticObject):
         if not results:
             return f"No elements matching selector '{selector}' found in '{url}'."
         key = f"{url}:selector:{selector}"
-        now = time_mod.time()
-        self._buffers[key] = Buffer(lines=results, created_at=now, modified_at=now)
+        text = "\n".join(results)
+        self._create_buffer(key, text=text)
         return f"Extracted {len(results)} element(s) into buffer '{key}'."
 
     @tool

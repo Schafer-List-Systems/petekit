@@ -3,7 +3,7 @@ import difflib
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from peteos.oap.agentic_object import AgenticObject
@@ -11,9 +11,17 @@ from peteos.oap.decorators import tool
 
 
 @dataclass
+class BufferEntry:
+    """A single line in a buffer with timestamp and seen flag."""
+    data: str
+    timestamp: float
+    seen: bool = False
+
+
+@dataclass
 class Buffer:
-    """A buffer holding text as a list of lines with timestamps."""
-    lines: list[str]
+    """A buffer holding a list of line entries with creation and modification timestamps."""
+    lines: list[BufferEntry]
     created_at: float
     modified_at: float
 
@@ -39,24 +47,36 @@ class BufferManager(AgenticObject):
         """List all buffers and their line counts."""
         return {name: len(buf.lines) for name, buf in self._buffers.items()}
 
-    @tool(description="Create a new empty buffer with the given name. Fails if a buffer with that name already exists.")
-    def create_buffer(self, name: str) -> str:
-        """Create a new empty named buffer."""
+    def _create_buffer(self, name: str, text: str | None = None, modified_at: float | None = None, overwrite: bool = False) -> int | None:
+        """Internal buffer creation. Returns number of lines stored, or None if buffer exists and overwrite=False."""
+        ts = modified_at if modified_at is not None else time.time()
         if name in self._buffers:
-            return f"Error: a buffer named '{name}' already exists."
-        now = time.time()
-        self._buffers[name] = Buffer(lines=[], created_at=now, modified_at=now)
-        return f"Buffer '{name}' created (empty)."
+            if not overwrite:
+                return None
+        self._buffers[name] = Buffer(lines=[], created_at=ts, modified_at=ts)
+        if text is None:
+            return 0
+        self._buffers[name].lines = [BufferEntry(data=line, timestamp=ts, seen=True) for line in text.splitlines()]
+        return len(self._buffers[name].lines)
+
+    @tool(description="Create a new buffer with the given name. Optionally provide initial text. Use overwrite=True to replace an existing buffer.")
+    def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False) -> str:
+        """Create a new named buffer, optionally populated with text."""
+        existed = name in self._buffers
+        result = self._create_buffer(name, text, overwrite=overwrite)
+        if result is None:
+            return f"Error: a buffer named '{name}' already exists. Use overwrite=True to replace it."
+        if existed:
+            return f"Buffer '{name}' overwritten with {result} lines."
+        return f"Buffer '{name}' created ({result} lines)."
 
     @tool(description="Fill a buffer with text. Each line in the text becomes one line in the buffer. Replaces existing content. The buffer must already exist.")
     def write_buffer(self, name: str, text: str) -> str:
         """Write text into a named buffer, replacing its content."""
         if name not in self._buffers:
             return f"Error: no buffer named '{name}'. Use create_buffer first."
-        now = time.time()
-        self._buffers[name].lines = text.splitlines()
-        self._buffers[name].modified_at = now
-        return f"Wrote {len(self._buffers[name].lines)} lines to buffer '{name}'."
+        result = self._create_buffer(name, text=text, overwrite=True)
+        return f"Wrote {result} lines to buffer '{name}'."
 
     @tool(description="Drop (delete) a buffer by name. The buffer and its content are discarded.")
     def drop_buffer(self, name: str) -> str:
@@ -77,13 +97,13 @@ class BufferManager(AgenticObject):
             raise ValueError(f"Invalid regex pattern '{pattern}': {e}")
         matches = []
         buf = self._buffers[name]
-        for i, line in enumerate(buf.lines, start=1):
-            if compiled.search(line):
+        for i, entry in enumerate(buf.lines, start=1):
+            if compiled.search(entry.data):
                 matches.append(i)
         return self._cluster_lines_to_ranges(name, matches, self._NUM_CLUSTERS)
 
-    @tool(description="Read a range of lines from a buffer. start and end are 1-based and inclusive.")
-    def read_buffer(self, name: str, start: int | None = None, end: int | None = None) -> str:
+    @tool(description="Read a range of lines from a buffer. start and end are 1-based and inclusive. Set show_timestamps=True to prefix each line with its unix timestamp.")
+    def read_buffer(self, name: str, start: int | None = None, end: int | None = None, show_timestamps: bool = False) -> str:
         """Read buffer content with size guard-rails. Returns a hint if the range is too large."""
         if name not in self._buffers:
             return f"Error: no buffer named '{name}'. Use create_buffer first."
@@ -100,10 +120,15 @@ class BufferManager(AgenticObject):
 
         s = max(0, (start - 1) if start is not None else 0)
         e = min(total, end if end is not None else total)
-        segment = buf.lines[s:e]
+        if show_timestamps:
+            segment = [f"({entry.timestamp:.6f}) {entry.data}" for entry in buf.lines[s:e]]
+        else:
+            segment = [entry.data for entry in buf.lines[s:e]]
         total_chars = sum(len(l) for l in segment) + len(segment)
 
         if total_chars <= BufferManager._MAX_CHUNK_CHARS:
+            for entry in buf.lines[s:e]:
+                entry.seen = True
             return "\n".join(segment)
 
         to_skip, rest = self._lines_to_skip(segment, s + 1)
@@ -123,25 +148,36 @@ class BufferManager(AgenticObject):
             f"Bucket distribution (start-end:chars): {bucket_msgs}."
         )
 
-    @tool(description="Replace all occurrences of `old` with `new` across all lines in a buffer. old is interpreted as a regex. Use (?i) at the start of old for case-insensitive replacement.")
-    def edit_buffer(self, name: str, old: str, new: str) -> str:
-        """Replace occurrences of old with new across all lines in a buffer."""
+    @tool(description="Replace old_string with new_string in the buffer content. Both old_string and new_string can span multiple lines. Use replace_all to replace all occurrences (default False — errors if old_string appears more than once).")
+    def edit_buffer(self, name: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+        """Replace text content with new text, rebuild lines array."""
         if name not in self._buffers:
             return f"Error: no buffer named '{name}'. Use create_buffer first."
-        try:
-            compiled = re.compile(old)
-        except re.error as e:
-            raise ValueError(f"Invalid regex pattern '{old}': {e}")
         buf = self._buffers[name]
-        count = 0
-        new_lines: list[str] = []
-        for line in buf.lines:
-            new_line, n = compiled.subn(new, line)
-            new_lines.append(new_line)
-            count += n
-        buf.lines = new_lines
-        buf.modified_at = time.time()
-        return f"Replaced {count} occurrence(s) in buffer '{name}'."
+        content = "\n".join(entry.data for entry in buf.lines)
+        if not replace_all:
+            if content.count(old_string) > 1:
+                line_numbers = [i + 1 for i, entry in enumerate(buf.lines) if old_string in entry.data]
+                clusters = self._cluster_lines_to_ranges(name, line_numbers, 5)
+                cluster_msgs = ", ".join(f"lines {s}–{e} ({n} occurrence(s))" for s, e, n in clusters)
+                return (
+                    f"Error: '{old_string}' found multiple times ({content.count(old_string)} total) at: {cluster_msgs}. "
+                    "Set replace_all=True to replace all occurrences."
+                )
+            if old_string not in content:
+                return f"Error: '{old_string}' not found in buffer."
+            new_content = content.replace(old_string, new_string, 1)
+        else:
+            if old_string not in content:
+                return f"Error: '{old_string}' not found in buffer."
+            new_content = content.replace(old_string, new_string)
+        now = time.time()
+        buf.lines = [BufferEntry(data=line, timestamp=now, seen=True) for line in new_content.splitlines()]
+        buf.modified_at = now
+        if replace_all:
+            count = content.count(old_string)
+            return f"Replaced {count} occurrence(s) of '{old_string}'."
+        return f"Replaced '{old_string}' with '{new_string}'."
 
     @tool(description="Diff two buffers line-by-line using a unified diff. Stores the result in a target buffer named diff:a→b. Use overwrite=True to overwrite an existing diff buffer.")
     def diff_buffers(self, a: str, b: str, overwrite: bool = False) -> str:
@@ -150,8 +186,8 @@ class BufferManager(AgenticObject):
             return f"Error: no buffer named '{a}'."
         if b not in self._buffers:
             return f"Error: no buffer named '{b}'."
-        buf_a = self._buffers[a].lines
-        buf_b = self._buffers[b].lines
+        buf_a = [e.data for e in self._buffers[a].lines]
+        buf_b = [e.data for e in self._buffers[b].lines]
         if buf_a == buf_b:
             return f"No differences — buffers '{a}' and '{b}' are identical."
         diff_name = f"diff:{a}→{b}"
@@ -169,7 +205,7 @@ class BufferManager(AgenticObject):
             lineterm="",
         ))
         now = time.time()
-        self._buffers[diff_name] = Buffer(lines=diff_lines, created_at=now, modified_at=now)
+        self._buffers[diff_name] = Buffer(lines=[BufferEntry(data=line, timestamp=now, seen=True) for line in diff_lines], created_at=now, modified_at=now)
         return f"Diff written to buffer '{diff_name}' ({len(diff_lines)} lines). Use read_buffer to access it."
 
     def _lines_to_skip(self, segment: list[str], start_offset: int) -> tuple[list[tuple[int, int]], int]:

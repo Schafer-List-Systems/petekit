@@ -22,21 +22,23 @@ class TextEditor(BufferManager, AgenticObject):
     """
 
     @tool(description="Load a file from disk into a buffer. The buffer is keyed by its file path.")
-    def load_file(self, file_path: str) -> str:
+    def load_file(self, file_path: str, overwrite_internal_buffer: bool = False) -> str:
         """Load a file. Creates it if it does not exist. Sets modified_at from the file's mtime."""
         abs_path = os.path.abspath(file_path)
         if not os.path.isfile(abs_path):
             with open(abs_path, "w", encoding="utf-8") as f:
                 pass
-            now = os.path.getmtime(abs_path)
-            self._buffers[abs_path] = Buffer(lines=[], created_at=now, modified_at=now)
+            mtime = os.path.getmtime(abs_path)
+            count = self._create_buffer(abs_path, text="", modified_at=mtime)
             return f"Created empty buffer '{abs_path}' (0 lines)."
         try:
             with open(abs_path, "r", encoding="utf-8") as f:
                 content = f.read()
-            now = os.path.getmtime(abs_path)
-            self._buffers[abs_path] = Buffer(lines=content.splitlines(), created_at=now, modified_at=now)
-            return f"Loaded buffer '{abs_path}' ({len(self._buffers[abs_path].lines)} lines)."
+            mtime = os.path.getmtime(abs_path)
+            count = self._create_buffer(abs_path, text=content, modified_at=mtime, overwrite=overwrite_internal_buffer)
+            if count is None:
+                return f"Error: buffer '{abs_path}' already exists. Use overwrite_internal_buffer=True to replace it."
+            return f"Loaded buffer '{abs_path}' ({count} lines)."
         except Exception as e:
             return f"Error: {type(e).__name__}: {e}"
 
@@ -97,8 +99,8 @@ class TextEditor(BufferManager, AgenticObject):
             fromfile=abs_path, tofile=abs_path,
             lineterm="",
         ))
-        from .buffer_manager import Buffer
         import time as time_mod
         now = time_mod.time()
-        self._buffers[diff_name] = Buffer(lines=diff_lines, created_at=now, modified_at=now)
+        diff_text = "\n".join(diff_lines)
+        self._create_buffer(diff_name, text=diff_text, modified_at=now)
         return f"Diff written to buffer '{diff_name}' ({len(diff_lines)} lines). Use read_buffer to access it."

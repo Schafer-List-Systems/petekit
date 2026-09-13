@@ -152,12 +152,8 @@ class SandboxedBasher(Basher, AgenticObject):
                 output_lines.extend(result.stdout.splitlines())
             if result.stderr:
                 output_lines.append(f"[stderr] {result.stderr}")
-            now = time_mod.time()
-            self._buffers[buffer_name] = Buffer(
-                lines=output_lines,
-                created_at=now,
-                modified_at=now,
-            )
+            text = "\n".join(output_lines)
+            self._create_buffer(buffer_name, text=text)
             return (
                 f"Output stored in buffer '{buffer_name}' ({len(output_lines)} lines, "
                 f"exit_code={result.returncode}). "
