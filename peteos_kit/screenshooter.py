@@ -30,7 +30,8 @@ class Screenshooter(ImageBufferManager, AgenticObject):
 
         array_bgr = cv2.cvtColor(np.asarray(screenshot), cv2.COLOR_BGRA2BGR)
 
-        self._store_np_buffer(name, array_bgr)
+        buffer_name = f"image:{name}"
+        self._store_np_buffer(buffer_name, array_bgr)
 
         h, w = array_bgr.shape[:2]
-        return f"Screenshot stored as '{name}' ({w}x{h} pixels). Use read_np_buffer to send it to the LLM."
+        return f"Screenshot stored as '{buffer_name}' ({w}x{h} pixels). Use read_np_buffer to send it to the LLM."
