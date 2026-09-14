@@ -43,8 +43,11 @@ class StreamObserver(StreamBufferManager, AgenticObject):
             return
 
         def _timer_tick() -> None:
-            loop = asyncio.get_running_loop()
-            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self._fallback_action(None, stream, {})))
+            try:
+                loop = asyncio.get_event_loop()
+                loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self._fallback_action(None, stream, {})))
+            except RuntimeError:
+                pass
 
         cfg._timer = threading.Timer(interval, _timer_tick)
         cfg._timer.daemon = True

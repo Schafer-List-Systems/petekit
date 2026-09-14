@@ -426,10 +426,10 @@ class BufferManager(AgenticObject):
         buf_lines = self._buffers[name].lines
 
         def span_chars(start: int, end: int) -> int:
-            return sum(len(buf_lines[i - 1]) + 1 for i in range(start, end + 1))
+            return sum(len(buf_lines[i - 1].data) + 1 for i in range(start, end + 1))
 
         clusters = [
-            {'s': ln, 'e': ln, 'v': len(buf_lines[ln - 1]) + 1, 'n': 1}
+            {'s': ln, 'e': ln, 'v': len(buf_lines[ln - 1].data) + 1, 'n': 1}
             for ln in line_numbers
         ]
 

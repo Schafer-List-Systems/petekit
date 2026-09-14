@@ -102,8 +102,8 @@ class Connector(StreamObserver, AgenticObject):
         )
 
     @tool
-    async def send(self, name: str, text: str, flush: bool = False) -> str:
-        """Send text over the named connection. Pass flush=True to drain the write buffer without sending new data."""
+    async def send(self, name: str, text: str, flush: bool = False, fix_crlf: bool = False) -> str:
+        """Send text over the named connection. Pass flush=True to drain the write buffer without sending new data. Pass fix_crlf=True to replace LF (\\n) with CRLF (\\r\\n) as required by protocols such as HTTP."""
         if name not in self.connections:
             raise KeyError(f"No connection named '{name}'.")
         handle = self.connections[name]
@@ -112,6 +112,8 @@ class Connector(StreamObserver, AgenticObject):
             raise ConnectionError(f"Connection '{name}' is closed. {handle.close_reason}")
         try:
             if text:
+                if fix_crlf:
+                    text = text.replace("\n", "\r\n")
                 data = text.encode("utf-8")
                 handle.writer.write(data)
             if flush:
