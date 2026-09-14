@@ -15,7 +15,7 @@ from .buffer_manager import Buffer, BufferEntry, BufferManager
 
 @dataclass
 class Rule:
-    """A named rule with a condition and an action.
+    """A rule with a condition and an action, keyed by name in StreamBufferRules.rules.
 
     The condition is the full boolean check (e.g. any(p.match(e.data) for p in patterns))
     — OR-semantics are the caller's responsibility inside the condition callable.
@@ -24,21 +24,20 @@ class Rule:
     The action is responsible for marking the entry as consumed (seen=True) once
     it has processed it. This ensures the entry is excluded from the unseen_count
     and the router only surfaces unconsumed entries to the agent for reasoning."""
-    name: str
     condition: Callable[["BufferEntry", "Buffer"], bool]
     action: Callable[["BufferEntry"], None] | None = None
 
 
 @dataclass
-class BufferRules:
-    """Holds rules and an optional fallback rule for a stream.
+class StreamBufferRules:
+    """Holds rules (keyed by name) and an optional fallback rule for a stream.
 
     Content lives in BufferManager._buffers (stream: prefix).
 
     Rule evaluation: each rule is checked in order; its action fires if condition
     is True. The fallback rule fires only when no other rule matched — this is the
     'unexpected data' path that surfaces to the agent for reasoning."""
-    rules: list[Rule] = field(default_factory=list)
+    rules: dict[str, Rule] = field(default_factory=dict)
     fallback: Rule | None = None
 
 
@@ -56,32 +55,38 @@ class StreamBufferManager(BufferManager, AgenticObject):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._stream_buffers: dict[str, BufferRules] = {}
+        self._stream_buffer_rules: dict[str, StreamBufferRules] = {}
 
-    def _create_stream(self, stream_buffer: str) -> BufferRules:
+    def _create_stream(self, stream_buffer: str) -> StreamBufferRules:
         """Create a named stream. Raises KeyError if it already exists or name lacks 'stream:' prefix."""
         if not stream_buffer.startswith("stream:"):
             raise KeyError(f"Stream name '{stream_buffer}' must start with 'stream:' prefix.")
-        if stream_buffer in self._stream_buffers:
+        if stream_buffer in self._stream_buffer_rules:
             raise KeyError(f"Stream '{stream_buffer}' already exists.")
         super().create_buffer(stream_buffer)
-        rules = BufferRules(rules=[], fallback=None)
-        self._stream_buffers[stream_buffer] = rules
+        rules = StreamBufferRules(rules={}, fallback=None)
+        self._stream_buffer_rules[stream_buffer] = rules
         return rules
 
     def _drop_stream(self, stream_buffer: str) -> None:
         """Drop a stream and all its entries. Raises KeyError if it doesn't exist."""
-        if stream_buffer not in self._stream_buffers:
+        if stream_buffer not in self._stream_buffer_rules:
             raise KeyError(f"No stream named '{stream_buffer}'.")
         super().drop_buffer(stream_buffer)
-        del self._stream_buffers[stream_buffer]
+        del self._stream_buffer_rules[stream_buffer]
 
     def _list_streams(self) -> dict[str, int]:
         """List all streams with their unseen counts."""
         return {
             name: sum(1 for e in self._buffers[name].lines if not e.seen)
-            for name in self._stream_buffers
+            for name in self._stream_buffer_rules
         }
+
+    def _get_stream_rules(self, stream_buffer: str) -> StreamBufferRules:
+        """Get the StreamBufferRules for a stream. Raises KeyError if it doesn't exist."""
+        if stream_buffer not in self._stream_buffer_rules:
+            raise KeyError(f"No stream named '{stream_buffer}'.")
+        return self._stream_buffer_rules[stream_buffer]
 
     def _timestamp_range_to_lines(self, buf: Buffer, start_time: float, end_time: float) -> tuple[int, int]:
         """Convert [start_time, end_time] to 1-based line range using binary search. Returns (lo, hi) or (-1, -1) if no entries match."""
@@ -115,7 +120,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         Uses _read_buffer and reformulates hints in timestamp-space for skip/bucket branches.
         Raises KeyError if the stream doesn't exist or no entries fall in the range.
         """
-        if stream_buffer not in self._stream_buffers:
+        if stream_buffer not in self._stream_buffer_rules:
             raise KeyError(f"No stream named '{stream_buffer}'.")
         buf = self._buffers[stream_buffer]
         lo, hi = self._timestamp_range_to_lines(buf, start_time, end_time)
@@ -154,24 +159,21 @@ class StreamBufferManager(BufferManager, AgenticObject):
             f"Bucket distribution (start-end:chars): {', '.join(bucket_msgs)}."
         )
 
-    def _get_stream_rules(self, stream_buffer: str) -> BufferRules:
-        """Get the BufferRules for a stream. Raises KeyError if it doesn't exist."""
-        if stream_buffer not in self._stream_buffers:
-            raise KeyError(f"No stream named '{stream_buffer}'.")
-        return self._stream_buffers[stream_buffer]
-
-    def _register_stream_rule(self, stream_buffer: str, rule: Rule) -> None:
-        """Register a rule on a stream. Raises KeyError if the stream doesn't exist."""
-        if stream_buffer not in self._stream_buffers:
+    def _register_stream_rule(self, stream_buffer: str, name: str, rule: Rule) -> None:
+        """Register a rule by name on a stream. Raises KeyError if the stream doesn't exist or name is already registered."""
+        if stream_buffer not in self._stream_buffer_rules:
             raise KeyError(f"No stream named '{stream_buffer}'. Create it with _create_stream first.")
-        self._stream_buffers[stream_buffer].rules.append(rule)
+        br = self._stream_buffer_rules[stream_buffer]
+        if name in br.rules:
+            raise KeyError(f"Rule '{name}' already registered on '{stream_buffer}'.")
+        br.rules[name] = rule
 
     def _exchange_stream_fallback_rule(self, stream_buffer: str, fallback: Rule) -> Rule | None:
         """Exchange the fallback rule on a stream. Returns the previous fallback (or None)."""
-        if stream_buffer not in self._stream_buffers:
+        if stream_buffer not in self._stream_buffer_rules:
             raise KeyError(f"No stream named '{stream_buffer}'. Create it with _create_stream first.")
-        previous = self._stream_buffers[stream_buffer].fallback
-        self._stream_buffers[stream_buffer].fallback = fallback
+        previous = self._stream_buffer_rules[stream_buffer].fallback
+        self._stream_buffer_rules[stream_buffer].fallback = fallback
         return previous
 
     def _append_stream_entry(self, stream_buffer: str, data: str) -> None:
@@ -190,15 +192,15 @@ class StreamBufferManager(BufferManager, AgenticObject):
         seen/unseen semantics aligned with "has an intelligent consumer processed this."
         Only entries with seen=False accumulate toward the unseen_count batch threshold.
         """
-        if stream_buffer not in self._stream_buffers:
+        if stream_buffer not in self._stream_buffer_rules:
             raise KeyError(f"No stream named '{stream_buffer}'. Create it with _create_stream first.")
-        br = self._stream_buffers[stream_buffer]
+        br = self._stream_buffer_rules[stream_buffer]
         buf = self._buffers[stream_buffer]
         now = time.time()
         entry = BufferEntry(timestamp=now, data=data, seen=False)
         buf.lines.append(entry)
         any_matched = False
-        for rule in br.rules:
+        for rule in br.rules.values():
             if rule.condition(entry, buf):
                 any_matched = True
                 if rule.action is not None:
