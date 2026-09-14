@@ -6,7 +6,7 @@ import bisect
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Coroutine
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos.oap.decorators import tool
@@ -25,7 +25,7 @@ class Rule:
     it has processed it. This ensures the entry is excluded from the unseen_count
     and the router only surfaces unconsumed entries to the agent for reasoning."""
     condition: Callable[["BufferEntry", "Buffer"], bool]
-    action: Callable[["BufferEntry"], None] | None = None
+    action: Callable[["BufferEntry", str], Coroutine[Any, Any, None]] | None = None
 
 
 @dataclass
@@ -176,7 +176,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         self._stream_buffer_rules[stream_buffer].fallback = fallback
         return previous
 
-    def _append_stream_entry(self, stream_buffer: str, data: str) -> None:
+    async def _append_stream_entry(self, stream_buffer: str, data: str) -> None:
         """
         Append a data entry to the named stream. Raises KeyError if the stream doesn't exist.
 
@@ -200,11 +200,11 @@ class StreamBufferManager(BufferManager, AgenticObject):
         entry = BufferEntry(timestamp=now, data=data, seen=False)
         buf.lines.append(entry)
         any_matched = False
-        for rule in br.rules.values():
+        for name, rule in br.rules.items():
             if rule.condition(entry, buf):
                 any_matched = True
                 if rule.action is not None:
-                    rule.action(entry)
+                    await rule.action(entry, name)
         if not any_matched and br.fallback is not None:
             if br.fallback.action is not None:
-                br.fallback.action(entry)
+                await br.fallback.action(entry, stream_buffer)
