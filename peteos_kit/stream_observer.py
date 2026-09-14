@@ -112,8 +112,8 @@ class StreamObserver(StreamBufferManager, AgenticObject):
     def observe_stream(
         self,
         stream: str,
-        batch_size: int = 1,
-        interval_secs: float | None = None,
+        batch_size: int = 64,
+        interval_secs: float | None = 30,
         invoke_on_empty: bool = False,
         runner: Runner | None = None,
     ) -> str:
