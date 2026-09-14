@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from peteos import AgenticObject, tool
+from peteos.conversation import ContentPart, Message
+from peteos.engine import Runner
 
 from .stream_buffer_manager import BufferEntry, Rule, StreamBufferManager
 
@@ -19,6 +21,7 @@ class _FallbackConfig:
     batch_size: int = 1
     interval_secs: float | None = None
     invoke_on_empty: bool = False
+    observing_runner: Runner | None = None
     _timer: threading.Timer | None = field(default=None, init=False, repr=False)
 
 
@@ -61,7 +64,7 @@ class StreamObserver(StreamBufferManager, AgenticObject):
             cfg._timer = None
 
     async def _fallback_action(self, entry: BufferEntry | None, stream: str, signal: dict) -> None:
-        """Fallback action — invoke agent to reason about unexpected entries.
+        """Fallback action — enqueue notification for the agent about unexpected entries.
 
         Called by StreamBufferManager when the fallback condition passes (entry is provided)
         or by the timer directly (entry is None). Re-arms the timer after firing if configured.
@@ -94,7 +97,15 @@ class StreamObserver(StreamBufferManager, AgenticObject):
                 f"Last entry at {self._fmt_ts(last_ts, round_up=True)}. "
                 f"Nothing new for {self._fmt_ts(now - last_ts)} seconds."
             )
-        await self.invoke_agent(prompt)
+        if cfg.observing_runner:
+            msg = Message.create(
+                role="user",
+                content_parts=[ContentPart.create_text(prompt)]
+            )
+            await cfg.observing_runner.queue_message(msg)
+        else:
+            # TODO: possible deadlock when runner is None (timer path) — investigate passing runner through _timer_tick
+            await self.invoke_agent(prompt)
         if cfg.interval_secs is not None:
             self._start_timer(stream)
 
@@ -105,6 +116,7 @@ class StreamObserver(StreamBufferManager, AgenticObject):
         batch_size: int = 1,
         interval_secs: float | None = None,
         invoke_on_empty: bool = False,
+        runner: Runner | None = None,
     ) -> str:
         """Observe an existing "stream:" buffer for unexpected entries."""
         if stream not in self._buffers:
@@ -121,6 +133,7 @@ class StreamObserver(StreamBufferManager, AgenticObject):
         else:
             cfg.interval_secs = None
             self._stop_timer(stream)
+        cfg.observing_runner = runner
 
         def condition(entry: BufferEntry, buf) -> None | dict:
             unseen = [e for e in buf.lines if not e.seen]
@@ -135,6 +148,7 @@ class StreamObserver(StreamBufferManager, AgenticObject):
 
         if cfg.interval_secs is not None and cfg.interval_secs > 0:
             self._start_timer(stream)
+        return f"Now observing stream '{stream}'. Notified every {cfg.batch_size} new entries."
 
     @tool
     def deobserve_stream(self, stream: str) -> str:

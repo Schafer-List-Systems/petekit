@@ -2,7 +2,7 @@ import asyncio
 from dataclasses import dataclass
 
 from peteos import AgenticObject, tool
-from .stream_buffer_manager import StreamBufferManager
+from .stream_observer import StreamObserver
 
 
 @dataclass
@@ -20,7 +20,7 @@ class ConnectionHandle:
     close_reason: str = ""
 
 
-class Connector(StreamBufferManager, AgenticObject):
+class Connector(StreamObserver, AgenticObject):
     """You manage network connections."""
 
     def __init__(self, **kwargs) -> None:
