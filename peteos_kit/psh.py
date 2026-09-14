@@ -35,8 +35,8 @@ def _c(tag: str, text: str, hook: str = "") -> str:
     hook_info = f"<{hook}>" if hook else ""
     return f"{color}{BOLD}[{tag}]{hook_info} {text}{RESET}" if color else f"[{tag}]{hook_info} {text}"
 
-_FUNC_COLOR = "\033[96m"
-_ARG_COLOR = "\033[93m"
+_FUNC_COLOR = "\033[93m"
+_ARG_COLOR = "\033[96m"
 _TYPE_COLOR = "\033[35m"
 
 def _fmt_tool(t: Any) -> str:
