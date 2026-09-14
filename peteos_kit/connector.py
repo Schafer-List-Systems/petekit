@@ -84,15 +84,20 @@ class Connector(StreamObserver, AgenticObject):
         if name not in self.connections:
             raise KeyError(f"No connection named '{name}'.")
         handle = self.connections.pop(name)
-        if handle.task:
+        if not handle.closed:
             handle.task.cancel()
-        handle.writer.close()
+            handle.writer.close()
+        reason = f"({handle.close_reason})" if handle.closed else ""
         if cleanup:
             self._drop_stream(handle.in_buffer)
             self._drop_stream(handle.out_buffer)
-            return f"Disconnected '{name}'. Cleaned up stream buffers."
+            return (
+                f"Disconnected '{name}'. {reason}\n"
+                f"Cleaned up stream buffers."
+            )
         return (
-            f"Disconnected '{name}'. Stream buffers '{handle.in_buffer}', '{handle.out_buffer}' still exist for analysis. "
+            f"Disconnected '{name}'. {reason}\n"
+            f"Stream buffers '{handle.in_buffer}', '{handle.out_buffer}' still exist for analysis. "
             f"— drop them with drop_buffer before reconnecting."
         )
 
@@ -132,10 +137,10 @@ class Connector(StreamObserver, AgenticObject):
                     # EOF — remote closed, mark closed and exit
                     handle.closed = True
                     handle.close_reason = "Remote closed."
-                    if handle.task:
-                        handle.task.cancel()
+                    handle.task.cancel()
+                    handle.writer.close()
                     break
-                line = line_bytes.decode("utf-8", errors="replace")
+                line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
                 await self._append_stream_entry(handle.in_buffer, line)
         except asyncio.CancelledError:
             pass
