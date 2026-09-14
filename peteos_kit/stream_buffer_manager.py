@@ -17,15 +17,15 @@ from .buffer_manager import Buffer, BufferEntry, BufferManager
 class Rule:
     """A rule with a condition and an action, keyed by name in StreamBufferRules.rules.
 
-    The condition is the full boolean check (e.g. any(p.match(e.data) for p in patterns))
-    — OR-semantics are the caller's responsibility inside the condition callable.
-    The action fires at most once per entry when condition is True.
+    The condition returns None (no match) or a dict (matched, dict is signal metadata).
+    Returning {} means matched with no metadata. Returning {"key": "val"} means matched
+    with rich metadata that the action can use (e.g. matched text, entity key, etc.).
 
     The action is responsible for marking the entry as consumed (seen=True) once
     it has processed it. This ensures the entry is excluded from the unseen_count
     and the router only surfaces unconsumed entries to the agent for reasoning."""
-    condition: Callable[["BufferEntry", "Buffer"], bool]
-    action: Callable[["BufferEntry", str], Coroutine[Any, Any, None]] | None = None
+    condition: Callable[["BufferEntry", "Buffer"], None | dict]
+    action: Callable[["BufferEntry", str, dict], Coroutine[Any, Any, None]] | None = None
 
 
 @dataclass
@@ -201,10 +201,11 @@ class StreamBufferManager(BufferManager, AgenticObject):
         buf.lines.append(entry)
         any_matched = False
         for name, rule in br.rules.items():
-            if rule.condition(entry, buf):
+            signal = rule.condition(entry, buf)
+            if signal is not None:
                 any_matched = True
                 if rule.action is not None:
-                    await rule.action(entry, name)
+                    await rule.action(entry, name, signal)
         if not any_matched and br.fallback is not None:
             if br.fallback.action is not None:
-                await br.fallback.action(entry, stream_buffer)
+                await br.fallback.action(entry, stream_buffer, {})

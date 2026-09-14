@@ -45,7 +45,7 @@ class StreamObserver(StreamBufferManager, AgenticObject):
 
         def _timer_tick() -> None:
             loop = asyncio.get_running_loop()
-            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self._fallback_action(None, stream)))
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self._fallback_action(None, stream, {})))
 
         cfg._timer = threading.Timer(interval, _timer_tick)
         cfg._timer.daemon = True
@@ -60,12 +60,14 @@ class StreamObserver(StreamBufferManager, AgenticObject):
             cfg._timer.cancel()
             cfg._timer = None
 
-    async def _fallback_action(self, entry: BufferEntry | None, stream: str) -> None:
+    async def _fallback_action(self, entry: BufferEntry | None, stream: str, signal: dict) -> None:
         """Fallback action — invoke agent to reason about unexpected entries.
 
         Called by StreamBufferManager when the fallback condition passes (entry is provided)
         or by the timer directly (entry is None). Re-arms the timer after firing if configured.
-        Skips invocation if no unseen entries and invoke_on_empty is False."""
+        Skips invocation if no unseen entries and invoke_on_empty is False.
+
+        The signal dict is ignored for the fallback (fallback has no user-provided metadata)."""
         cfg = self._stream_fallback_config.get(stream)
         if cfg is None:
             return
@@ -120,8 +122,11 @@ class StreamObserver(StreamBufferManager, AgenticObject):
             cfg.interval_secs = None
             self._stop_timer(stream)
 
-        def condition(entry: BufferEntry, buf) -> bool:
-            return len([e for e in buf.lines if not e.seen]) >= cfg.batch_size
+        def condition(entry: BufferEntry, buf) -> None | dict:
+            unseen = [e for e in buf.lines if not e.seen]
+            if len(unseen) >= cfg.batch_size:
+                return {"unseen_count": len(unseen), "batch_size": cfg.batch_size}
+            return None
 
         self._exchange_stream_fallback_rule(
             stream,
