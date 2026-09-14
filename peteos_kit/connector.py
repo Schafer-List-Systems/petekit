@@ -1,4 +1,5 @@
 import asyncio
+import time
 from dataclasses import dataclass
 
 from peteos import AgenticObject, tool
@@ -34,6 +35,7 @@ class Connector(StreamBufferManager, AgenticObject):
             raise KeyError(f"Connection '{name}' already exists.")
 
         # Prepare stream buffers for incoming and outgoing data
+        now = time.time()
         in_buffer = f"stream:in:{name}"
         out_buffer = f"stream:out:{name}"
         for buf in (in_buffer, out_buffer):
@@ -66,6 +68,7 @@ class Connector(StreamBufferManager, AgenticObject):
         handle.task = asyncio.create_task(self._read_loop(name, handle))
         return (
             f"Connected to {host}:{port} (ssl={ssl}) as '{name}'. "
+            f"Streams created at {now}. "
             f"Receiving data into '{in_buffer}', sending data into '{out_buffer}'."
         )
 

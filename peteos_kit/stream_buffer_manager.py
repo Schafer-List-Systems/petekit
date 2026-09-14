@@ -43,12 +43,9 @@ class StreamBufferRules:
 
 class StreamBufferManager(BufferManager, AgenticObject):
     """
-    You additionally manage named streams, stored as buffers with the 'stream:'
-    prefix (e.g. 'stream:auth'). Streams are continuously appended to as data
-    arrives. You can read, search, and otherwise interact with stream buffers
-    using the buffer tools — they behave like any other named buffer.
-
-    Timestamps shown in read_stream_buffer hints are rounded to 6 decimals.
+    - You can read buffers also via "read_stream_buffer", which will allow you to access them via timestamps.
+      - Usually only 'stream:' prefixed buffers will work because their timestamps are ordered.
+      - Timestamps shown in read_stream_buffer hints are rounded to 6 decimals.
     """
 
     # DESIGN: window_size (rolling trim) is deferred — buffers grow indefinitely for now.
@@ -115,14 +112,26 @@ class StreamBufferManager(BufferManager, AgenticObject):
         return f"{ts:.6f}".rstrip("0").rstrip(".") or "0"
 
     @tool
-    def read_stream_buffer(self, stream_buffer: str, start_time: float, end_time: float) -> str:
+    def read_stream_buffer(self, stream_buffer: str, start_time: float | None = None, end_time: float | None = None) -> str:
         """Read from a buffer within a time range [start_time, end_time] instead of using line numbers."""
         if stream_buffer not in self._stream_buffer_rules:
             raise KeyError(f"No stream named '{stream_buffer}'.")
         buf = self._buffers[stream_buffer]
+        if not buf.lines:
+            return f"Buffer '{stream_buffer}' is empty."
+        if start_time is None:
+            start_time = buf.lines[0].timestamp
+        if end_time is None:
+            end_time = buf.lines[-1].timestamp
         lo, hi = self._timestamp_range_to_lines(buf, start_time, end_time)
         if lo == -1:
-            return f"No entries in '{stream_buffer}' between {start_time} and {end_time}."
+            timestamps = [entry.timestamp for entry in buf.lines]
+            idx = bisect.bisect_left(timestamps, start_time)
+            nearest_before = f", nearest before: {self._fmt_ts(timestamps[idx - 1])}" if idx > 0 else ""
+            nearest_after = f", nearest after: {self._fmt_ts(timestamps[idx])}" if idx < len(timestamps) else ""
+            hint = (nearest_before + nearest_after).strip(", ")
+            suffix = f" ({hint})" if hint else ""
+            return f"No entries in '{stream_buffer}' between {start_time} and {end_time}.{suffix}"
         result = self._read_buffer(stream_buffer, start=lo, end=hi, show_timestamps=True)
         if result.kind == "content":
             return result.content  # type: ignore
