@@ -65,6 +65,20 @@ class Connector(StreamObserver, AgenticObject):
         )
 
     @tool
+    def list_connections(self) -> list[dict]:
+        """List all connections with their details."""
+        return [
+            {
+                "name": name,
+                "host": h.host,
+                "port": h.port,
+                "ssl": h.ssl,
+                "closed": h.closed,
+            }
+            for name, h in self.connections.items()
+        ]
+
+    @tool
     async def disconnect(self, name: str, cleanup: bool = True) -> str:
         """Close the named connection. Pass cleanup=True (default) to also drop stream buffers."""
         if name not in self.connections:
