@@ -36,6 +36,11 @@ class Connector(StreamBufferManager, AgenticObject):
         # Prepare stream buffers for incoming and outgoing data
         in_buffer = f"stream:in:{name}"
         out_buffer = f"stream:out:{name}"
+        for buf in (in_buffer, out_buffer):
+            try:
+                self._drop_stream(buf)
+            except KeyError:
+                pass
         self._create_stream(in_buffer)
         try:
             self._create_stream(out_buffer)
@@ -79,8 +84,8 @@ class Connector(StreamBufferManager, AgenticObject):
         ]
 
     @tool
-    async def disconnect(self, name: str, cleanup: bool = True) -> str:
-        """Close the named connection. Pass cleanup=True (default) to also drop stream buffers."""
+    async def disconnect(self, name: str, drop_buffers: bool = True) -> str:
+        """Close the named connection. Pass drop_buffers=True (default) to also drop stream buffers."""
         if name not in self.connections:
             raise KeyError(f"No connection named '{name}'.")
         handle = self.connections.pop(name)
@@ -88,7 +93,7 @@ class Connector(StreamBufferManager, AgenticObject):
             handle.task.cancel()
             handle.writer.close()
         reason = f"({handle.close_reason})" if handle.closed else ""
-        if cleanup:
+        if drop_buffers:
             self._drop_stream(handle.in_buffer)
             self._drop_stream(handle.out_buffer)
             return (
