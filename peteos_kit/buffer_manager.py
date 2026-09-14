@@ -5,9 +5,23 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from typing import Literal
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos.oap.decorators import tool
+
+
+@dataclass
+class ReadBufferResult:
+    """Result of _read_buffer. Signals which branch was taken and carries data for hint construction."""
+    kind: Literal["content", "skip", "bucket", "error"]
+    content: str | None = None
+    line_range: tuple[int, int] | None = None  # (1-based start, 1-based end)
+    total_chars: int = 0
+    line_count: int = 0
+    skip_lines: list[tuple[int, int]] | None = None  # (1-based line index, char count)
+    bucket_info: list[tuple[int, int, int]] | None = None  # (start, end, chars)
+    error: str | None = None
 
 
 @dataclass
@@ -115,21 +129,20 @@ class BufferManager(AgenticObject):
                 matches.append(i)
         return self._cluster_lines_to_ranges(name, matches, self._NUM_CLUSTERS)
 
-    @tool(description="Read a range of lines from a buffer. start and end are 1-based and inclusive. Set show_timestamps=True to prefix each line with its unix timestamp.")
-    def read_buffer(self, name: str, start: int | None = None, end: int | None = None, show_timestamps: bool = False) -> str:
-        """Read buffer content with size guard-rails. Returns a hint if the range is too large."""
+    def _read_buffer(self, name: str, start: int | None = None, end: int | None = None, show_timestamps: bool = False) -> ReadBufferResult:
+        """Internal read. Returns ReadBufferResult with kind and branch data."""
         if name not in self._buffers:
-            return f"Error: no buffer named '{name}'. Use create_buffer first."
+            return ReadBufferResult(kind="error", error=f"Error: no buffer named '{name}'. Use create_buffer first.")
         buf = self._buffers[name]
         total = len(buf.lines)
 
         if start is not None and end is not None:
             if start > end:
-                return f"Error: start ({start}) > end ({end}). Buffer has {total} lines."
+                return ReadBufferResult(kind="error", error=f"Error: start ({start}) > end ({end}). Buffer has {total} lines.")
         if start is not None and start > total:
-            return f"Error: start ({start}) is beyond buffer length ({total} lines)."
+            return ReadBufferResult(kind="error", error=f"Error: start ({start}) is beyond buffer length ({total} lines).")
         if end is not None and end < 1:
-            return f"Error: end ({end}) must be at least 1."
+            return ReadBufferResult(kind="error", error=f"Error: end ({end}) must be at least 1.")
 
         s = max(0, (start - 1) if start is not None else 0)
         e = min(total, end if end is not None else total)
@@ -142,21 +155,54 @@ class BufferManager(AgenticObject):
         if total_chars <= BufferManager._MAX_CHUNK_CHARS:
             for entry in buf.lines[s:e]:
                 entry.seen = True
-            return "\n".join(segment)
+            return ReadBufferResult(
+                kind="content",
+                content="\n".join(segment),
+                line_range=(s + 1, e),
+                total_chars=total_chars,
+                line_count=len(segment),
+            )
 
-        to_skip, rest = self._lines_to_skip(segment, s + 1)
+        to_skip, _ = self._lines_to_skip(segment, s + 1)
         if to_skip and len(to_skip) <= 10:
-            skip_msg = ", ".join(f"line {idx}({cl} chars)" for idx, cl in to_skip)
-            return (
-                f"Range [{s+1}–{e}] is {total_chars} chars ({len(segment)} lines). "
-                f"Heaviest lines ({len(to_skip)} totaling {sum(c for _, c in to_skip)} chars): {skip_msg}. "
-                f"Consider re-reading with a narrower range to avoid them."
+            return ReadBufferResult(
+                kind="skip",
+                line_range=(s + 1, e),
+                total_chars=total_chars,
+                line_count=len(segment),
+                skip_lines=to_skip,
             )
 
         buckets = self._make_buckets(segment, 10, s + 1)
-        bucket_msgs = ", ".join(f"{sa}-{en}:{c}" for sa, en, c in buckets)
+        return ReadBufferResult(
+            kind="bucket",
+            line_range=(s + 1, e),
+            total_chars=total_chars,
+            line_count=len(segment),
+            bucket_info=buckets,
+        )
+
+    @tool(description="Read a range of lines from a buffer. start and end are 1-based and inclusive. Set show_timestamps=True to prefix each line with its unix timestamp.")
+    def read_buffer(self, name: str, start: int | None = None, end: int | None = None, show_timestamps: bool = False) -> str:
+        """Read buffer content with size guard-rails. Returns a hint if the range is too large."""
+        result = self._read_buffer(name, start, end, show_timestamps)
+        if result.kind == "error":
+            return result.error  # type: ignore
+        if result.kind == "content":
+            return result.content  # type: ignore
+        if result.kind == "skip":
+            skip_lines = result.skip_lines  # type: ignore
+            skip_msg = ", ".join(f"line {idx}({cl} chars)" for idx, cl in skip_lines)
+            return (
+                f"Range [{result.line_range[0]}–{result.line_range[1]}] is {result.total_chars} chars ({result.line_count} lines). "
+                f"Heaviest lines ({len(skip_lines)} totaling {sum(c for _, c in skip_lines)} chars): {skip_msg}. "
+                f"Consider re-reading with a narrower range to avoid them."
+            )
+        # kind == "bucket"
+        result_bucket = result.bucket_info  # type: ignore
+        bucket_msgs = ", ".join(f"{sa}-{en}:{c}" for sa, en, c in result_bucket)
         return (
-            f"Range [{s+1}–{e}] is {total_chars} chars ({len(segment)} lines) and exceeds the {BufferManager._MAX_CHUNK_CHARS}-char threshold. "
+            f"Range [{result.line_range[0]}–{result.line_range[1]}] is {result.total_chars} chars ({result.line_count} lines) and exceeds the {BufferManager._MAX_CHUNK_CHARS}-char threshold. "
             f"Reduce the read range to stay under the limit. "
             f"Bucket distribution (start-end:chars): {bucket_msgs}."
         )
