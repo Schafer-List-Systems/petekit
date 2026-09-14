@@ -56,19 +56,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._stream_buffer_rules: dict[str, StreamBufferRules] = {}
-        self._stream_fallback_config: dict[str, dict] = {}
-
-    @tool
-    def list_stream_observations(self) -> list[dict]:
-        """List all streams being observed with their configuration."""
-        return [
-            {
-                "stream": stream,
-                "batch_size": cfg.get("batch_size", 1),
-                "interval_secs": cfg.get("interval_secs"),
-            }
-            for stream, cfg in self._stream_fallback_config.items()
-        ]
+        self._stream_fallback_config: dict = {}
 
     def _create_stream(self, stream_buffer: str) -> StreamBufferRules:
         """Create a named stream. Raises KeyError if it already exists or name lacks 'stream:' prefix."""

@@ -32,10 +32,6 @@ class StreamObserver(StreamBufferManager, AgenticObject):
     - Use `deobserve_stream` when you no longer want to be informed about unexpected messages in a stream.
     """
 
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._stream_fallback_config: dict[str, _FallbackConfig] = {}
-
     def _start_timer(self, stream: str) -> None:
         """Start or restart the periodic fallback timer for a stream. Raises KeyError if not configured."""
         if stream not in self._stream_fallback_config:
@@ -149,6 +145,18 @@ class StreamObserver(StreamBufferManager, AgenticObject):
         if cfg.interval_secs is not None and cfg.interval_secs > 0:
             self._start_timer(stream)
         return f"Now observing stream '{stream}'. Notified every {cfg.batch_size} new entries."
+
+    @tool
+    def list_stream_observations(self) -> list[dict]:
+        """List all streams being observed with their configuration."""
+        return [
+            {
+                "stream": stream,
+                "batch_size": cfg.batch_size,
+                "interval_secs": cfg.interval_secs,
+            }
+            for stream, cfg in self._stream_fallback_config.items()
+        ]
 
     @tool
     def deobserve_stream(self, stream: str) -> str:
