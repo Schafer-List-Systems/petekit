@@ -20,9 +20,9 @@ class ImageRegion:
 
 class ImageBufferManager(NumPyBufferManager, AgenticObject):
     """
-    You are an image buffer manager.
-    - Only call read_np_buffer for buffers you know to contain image data.
-    - Never call it for arbitrary NumPy arrays.
+    - For image-like numpy buffers, you can call read_np_buffer to have a look at them.
+    - The read_np_buffer tool will transform image coordinates into numpy coordinates for you.
+    - Image-like buffer names are usually prefixed with "image:"
     """
 
     @tool(description="Read a NumPy buffer as an image and send it to the LLM for reasoning. Pass an ImageRegion for pixel-based region cropping (0-based, inclusive): (x1, y1) is the top-left corner, (x2, y2) is the bottom-right corner. Omit the region to read the full image.")

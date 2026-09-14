@@ -13,14 +13,17 @@ from .image_buffer_manager import ImageBufferManager, ImageRegion
 
 class Screenshooter(ImageBufferManager, AgenticObject):
     """
-    You are a screen capture tool. You take screenshots of the full screen or a specific
-    region and store them as named image buffers. Use list_np_buffers to see stored buffers
-    and read_np_buffer to send a captured image to the LLM for reasoning.
+    - You can call the take_screenshoot tool to take a screenshoot and store it into a numby buffer.
     """
 
-    @tool(description="Capture the full screen or a specific pixel region and store it as a named image buffer. Pass region as a dict with keys x1, y1 (top-left corner) and x2, y2 (bottom-right corner) to capture only that pixel region. Omit region entirely to capture the full screen. The image is stored with an 'image:' prefix. When calling read_np_buffer, use the exact buffer name from the return message.")
+    @tool(description="")
     def take_screenshot(self, name: str, region: ImageRegion | None = None) -> str:
-        """Capture screen (full or region) and store in the image buffer."""
+        """
+        Take a screenshot and store it into a numby buffer.
+        Pass region as a dict with keys x1, y1 (top-left corner) and x2, y2 (bottom-right corner) to capture only that pixel region.
+        Omit region entirely to capture the full screen.
+        When calling read_np_buffer, use the exact buffer name from the return message.
+        """
         with mss.MSS() as s:
             if region is None:
                 monitor = s.monitors[0]
@@ -34,4 +37,4 @@ class Screenshooter(ImageBufferManager, AgenticObject):
         self._store_np_buffer(buffer_name, array_bgr)
 
         h, w = array_bgr.shape[:2]
-        return f"Screenshot stored as '{buffer_name}' ({w}x{h} pixels). Use read_np_buffer to send it to the LLM."
+        return f"Screenshot stored in buffer '{buffer_name}' ({w}x{h} pixels). Use read_np_buffer to send it to the LLM."
