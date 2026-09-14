@@ -115,11 +115,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
 
     @tool
     def read_stream_buffer(self, stream_buffer: str, start_time: float, end_time: float) -> str:
-        """Read entries from a stream buffer within a time range [start_time, end_time].
-
-        Uses _read_buffer and reformulates hints in timestamp-space for skip/bucket branches.
-        Raises KeyError if the stream doesn't exist or no entries fall in the range.
-        """
+        """Read from a buffer within a time range [start_time, end_time] instead of using line numbers."""
         if stream_buffer not in self._stream_buffer_rules:
             raise KeyError(f"No stream named '{stream_buffer}'.")
         buf = self._buffers[stream_buffer]
