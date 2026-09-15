@@ -81,12 +81,16 @@ class PSH:
 
     _TITLE = "=== PSH Context ==="
 
-    def __init__(self, agent: AgenticObject, prompt_queue: queue.Queue[str | None], result_queue: queue.Queue[Any], state: _ShellState) -> None:
+    def __init__(self, agents: dict[str, AgenticObject], prompt_queue: queue.Queue[str | None], result_queue: queue.Queue[Any], state: _ShellState) -> None:
         super().__init__()
-        self._agent = agent
+        self._agents = agents
         self._prompt_queue = prompt_queue
         self._result_queue = result_queue
         self._state = state
+
+    @property
+    def _agent(self) -> AgenticObject:
+        return self._agents[self._state.foreground_agent_name]
 
     def run_shell(self) -> str:
         print(f"{self._TITLE}")
@@ -126,6 +130,8 @@ class PSH:
             self._state.confirm_dangerous = not self._state.confirm_dangerous
             state = "ON" if self._state.confirm_dangerous else "OFF"
             print(_c("SHELL", f"Dangerous tool confirmation: {state}"))
+        elif cmd == "agent":
+            self._agent_cmd(parts[1:] if len(parts) > 1 else None)
         elif cmd == "help":
             print(
                 _c("SHELL",
@@ -136,6 +142,8 @@ class PSH:
                 "  /session  show current session ID\n"
                 "  /session <id>  switch to session <id>\n"
                 "  /session none  anonymous session (no memory)\n"
+                "  /agent  show current agent name\n"
+                "  /agent <name>  switch to agent <name>\n"
                 "  /dangerous  toggle dangerous tool confirmation\n"
                 "  /help   this message\n"
                 "  <text>  send to agent\n"
@@ -159,6 +167,18 @@ class PSH:
                 print(_c("SESSION", f"Current session: {self._state.thread_id}"))
             else:
                 print(_c("SESSION", "Session: none — anonymous (no memory)"))
+
+    def _agent_cmd(self, args: list[str] | None) -> None:
+        if args:
+            name = args[0]
+            if name in self._agents:
+                self._state.foreground_agent_name = name
+                self._state.first_invoke = True
+                print(_c("AGENT", f"Switched to agent: {name}"))
+            else:
+                print(_c("ERROR", f"Unknown agent: {name}"))
+        else:
+            print(_c("AGENT", f"Current agent: {self._state.foreground_agent_name}"))
 
     def _list_tools(self) -> None:
         tools = self._agent._oap_tool_manager.get_tool_list()
@@ -186,6 +206,7 @@ class _ShellState:
         self.first_invoke = True
         self.thread_id: str | None = "default"
         self.confirm_dangerous = True
+        self.foreground_agent_name: str = "default"
 
 
 def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
@@ -261,7 +282,7 @@ def _before_llm(runner: Any, ctx: Any, state: _ShellState) -> None:
 
 
 def _peteos_worker(
-    agent: AgenticObject,
+    agents: dict[str, AgenticObject],
     prompt_queue: queue.Queue[str | None],
     result_queue: queue.Queue[Any],
     state: _ShellState,
@@ -277,6 +298,8 @@ def _peteos_worker(
         if not prompt:
             result_queue.put(None)
             continue
+
+        agent = agents[state.foreground_agent_name]
 
         async def _run_invoke() -> Any:
             return await agent.invoke_agent(
@@ -310,21 +333,22 @@ def _main() -> None:
     parser.add_argument("--agent", default=None, help="Fully qualified class path")
     args = parser.parse_args()
 
+    agents: dict[str, AgenticObject] = {}
     if args.agent:
         module_path, class_name = args.agent.rsplit(".", 1)
         mod = importlib.import_module(module_path)
-        agent = getattr(mod, class_name)()
+        agents["default"] = getattr(mod, class_name)()
     else:
-        agent = _DemoAgent()
+        agents["default"] = _DemoAgent()
 
     prompt_queue: queue.Queue[str | None] = queue.Queue()
     result_queue: queue.Queue[Any] = queue.Queue()
     state = _ShellState()
 
-    worker = threading.Thread(target=_peteos_worker, args=(agent, prompt_queue, result_queue, state), daemon=True)
+    worker = threading.Thread(target=_peteos_worker, args=(agents, prompt_queue, result_queue, state), daemon=True)
     worker.start()
 
-    shell = PSH(agent=agent, prompt_queue=prompt_queue, result_queue=result_queue, state=state)
+    shell = PSH(agents=agents, prompt_queue=prompt_queue, result_queue=result_queue, state=state)
     shell.run_shell()
 
     prompt_queue.put(None)
