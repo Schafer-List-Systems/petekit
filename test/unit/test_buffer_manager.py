@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, "/home/frygge/projects/AIOS/peteos-kit")
 sys.path.insert(0, "/home/frygge/projects/private/petekit/src/peteos/peteos")
 
-from peteos_kit.buffer_manager import BufferManager, BufferEntry
+from petekit.buffer_manager import BufferManager, BufferEntry
 
 
 class TestBufferManagerBasics(unittest.TestCase):
@@ -81,7 +81,7 @@ class TestEditBufferTimestampSemantics(unittest.TestCase):
             ts = timestamps[i] if timestamps and i < len(timestamps) else now
             entries.append(BufferEntry(data=line, timestamp=ts, seen=True))
         self.bm._buffers["t"] = __import__(
-            "peteos_kit.buffer_manager", fromlist=["Buffer"]
+            "petekit.buffer_manager", fromlist=["Buffer"]
         ).Buffer(
             lines=entries,
             created_at=now,
@@ -176,7 +176,7 @@ class TestEditBufferTimestampSemantics(unittest.TestCase):
 
     def test_empty_buffer_replace(self):
         self.bm._buffers["t"] = __import__(
-            "peteos_kit.buffer_manager", fromlist=["Buffer"]
+            "petekit.buffer_manager", fromlist=["Buffer"]
         ).Buffer(
             lines=[],
             created_at=0.0,

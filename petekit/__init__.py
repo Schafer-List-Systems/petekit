@@ -1,5 +1,5 @@
-from peteos_kit.text import TextEditor, WebNavigator
-from peteos_kit.stream import (
+from petekit.text import TextEditor, WebNavigator
+from petekit.stream import (
     StreamBufferManager,
     StreamObserver,
     StreamForwarder,
@@ -8,7 +8,7 @@ from peteos_kit.stream import (
     Connector,
     SandboxedBasher,
 )
-from peteos_kit.image import (
+from petekit.image import (
     ImageBufferManager,
     CameraObserver,
     Screenshooter,

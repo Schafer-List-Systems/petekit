@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build_backend = "setuptools.build_meta"
 
 [project]
-name = "peteos_kit"
+name = "petekit"
 version = "0.1.0-nightly"
 description = "PeteOS Kit — agentic building blocks for streams, text, and images"
 requires-python = ">=3.10"

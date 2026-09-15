@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 import cv2
 import numpy as np
 
-from peteos_kit.utils.camera_driver.camera_driver import CameraDriver
+from petekit.utils.camera_driver.camera_driver import CameraDriver
 
 if TYPE_CHECKING:
     pass
