@@ -7,7 +7,7 @@ import cv2
 from peteos import AgenticObject
 from peteos.oap.decorators import tool
 
-from .camera_driver import V4L2CameraDriver
+from peteos_kit.camera_driver import V4L2CameraDriver
 from .image_buffer_manager import ImageBufferManager
 
 

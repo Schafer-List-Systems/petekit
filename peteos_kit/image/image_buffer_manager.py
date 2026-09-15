@@ -6,7 +6,7 @@ import cv2
 
 from peteos import AgenticObject, tool
 
-from .numpy_buffer_manager import NumPyBufferManager
+from peteos_kit.numpy_buffer_manager import NumPyBufferManager
 
 
 @dataclass

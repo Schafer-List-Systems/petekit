@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import difflib
-from .three_merge import merge
+from ..utils.three_merge import merge
 import os
 
 from dataclasses import dataclass

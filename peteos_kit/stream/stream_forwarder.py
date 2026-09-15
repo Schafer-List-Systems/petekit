@@ -7,7 +7,7 @@ from typing import Any, Coroutine
 
 from peteos import AgenticObject, sandbox
 
-from ..stream_buffer_manager import BufferEntry, Rule, StreamBufferManager
+from .stream_buffer_manager import BufferEntry, Rule, StreamBufferManager
 
 
 class StreamForwarder(StreamBufferManager, AgenticObject):
