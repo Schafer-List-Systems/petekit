@@ -1,10 +1,10 @@
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
-build_backend = "setuptools.build_meta"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "petekit"
-version = "0.1.0-nightly"
+version = "0.1.0a1"
 description = "PeteOS Kit — agentic building blocks for streams, text, and images"
 requires-python = ">=3.10"
 dependencies = [
@@ -18,3 +18,6 @@ dev = ["pytest", "pytest-asyncio"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.setuptools.packages.find]
+where = ["petekit"]
