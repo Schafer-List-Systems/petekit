@@ -92,12 +92,15 @@ class PSH:
     def _agent(self) -> AgenticObject:
         return self._agents[self._state.foreground_agent_name]
 
+    def _prompt_str(self) -> str:
+        return "?> " if self._state.mode == "agent" else "!> "
+
     def run_shell(self) -> str:
         print(f"{self._TITLE}")
         print("Type /help for commands, /quit to exit.")
         while True:
             try:
-                raw = input("> ")
+                raw = input(self._prompt_str())
             except (EOFError, KeyboardInterrupt):
                 print("\n[SHELL] EOF — bye")
                 break
@@ -107,13 +110,39 @@ class PSH:
             if raw.startswith("/"):
                 if self._shell_cmd(raw):
                     break
+            elif raw.startswith("?"):
+                self._invoke_mode(raw)
+            elif raw.startswith("!"):
+                self._code_mode_stub(raw)
             else:
-                self._prompt_queue.put(raw)
-                try:
-                    self._result_queue.get(timeout=300)
-                except queue.Empty:
-                    print(_c("ERROR", "Timed out waiting for agent response"))
+                if self._state.mode == "agent":
+                    self._prompt_queue.put(raw)
+                    try:
+                        self._result_queue.get(timeout=300)
+                    except queue.Empty:
+                        print(_c("ERROR", "Timed out waiting for agent response"))
+                else:
+                    print(_c("SHELL", "Unknown input. Use ? for agent mode, ! for code mode."))
         return "Shell closed."
+
+    def _invoke_mode(self, raw: str) -> None:
+        self._state.mode = "agent"
+        if len(raw) < 2:
+            return
+        text = raw[1:]
+        if text.startswith("?"):
+            text = text[1:]
+        if not text:
+            return
+        self._prompt_queue.put(text)
+        try:
+            self._result_queue.get(timeout=300)
+        except queue.Empty:
+            print(_c("ERROR", "Timed out waiting for agent response"))
+
+    def _code_mode_stub(self, raw: str) -> None:
+        self._state.mode = "code"
+        print(_c("SHELL", "Code mode not yet implemented."))
 
     def _shell_cmd(self, raw: str) -> bool:
         parts = raw.lstrip("/").split()
@@ -146,7 +175,9 @@ class PSH:
                 "  /agent <name>  switch to agent <name>\n"
                 "  /dangerous  toggle dangerous tool confirmation\n"
                 "  /help   this message\n"
-                "  <text>  send to agent\n"
+                "  ?<text>  invoke agent (escape ?? for literal ?)\n"
+                "  !<code>  code mode (not yet implemented)\n"
+                "  <text>  in agent mode: invoke agent (if no prefix)\n"
                 ))
         else:
             print(_c("SHELL", f"Unknown command: /{cmd}"))
@@ -207,6 +238,7 @@ class _ShellState:
         self.thread_id: str | None = "default"
         self.confirm_dangerous = True
         self.foreground_agent_name: str = "default"
+        self.mode: str = "agent"
 
 
 def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
