@@ -110,10 +110,14 @@ class PSH:
             if raw.startswith("/"):
                 if self._shell_cmd(raw):
                     break
+            elif raw == "?":
+                self._state.mode = "agent"
+            elif raw == "!":
+                self._state.mode = "code"
             elif raw.startswith("?"):
-                self._invoke_mode(raw)
+                self._invoke_once(raw)
             elif raw.startswith("!"):
-                self._code_mode_stub(raw)
+                self._code_once(raw)
             else:
                 if self._state.mode == "agent":
                     self._prompt_queue.put(raw)
@@ -122,16 +126,15 @@ class PSH:
                     except queue.Empty:
                         print(_c("ERROR", "Timed out waiting for agent response"))
                 else:
-                    print(_c("SHELL", "Unknown input. Use ? for agent mode, ! for code mode."))
+                    self._code_once_raw(raw)
         return "Shell closed."
 
-    def _invoke_mode(self, raw: str) -> None:
-        self._state.mode = "agent"
+    def _invoke_once(self, raw: str) -> None:
         if len(raw) < 2:
             return
         text = raw[1:]
-        if text.startswith("?"):
-            text = text[1:]
+        while text.startswith("??"):
+            text = "?" + text[2:]
         if not text:
             return
         self._prompt_queue.put(text)
@@ -140,9 +143,27 @@ class PSH:
         except queue.Empty:
             print(_c("ERROR", "Timed out waiting for agent response"))
 
-    def _code_mode_stub(self, raw: str) -> None:
-        self._state.mode = "code"
-        print(_c("SHELL", "Code mode not yet implemented."))
+    def _code_once(self, raw: str) -> None:
+        if len(raw) < 2:
+            return
+        self._run_code(raw[1:])
+
+    def _code_once_raw(self, raw: str) -> None:
+        self._run_code(raw)
+
+    def _run_code(self, code: str) -> None:
+        try:
+            compiled = compile(code, "<shell>", "exec")
+        except SyntaxError as e:
+            print(_c("ERROR", f"SyntaxError: {e}"))
+            return
+        try:
+            exec(compiled, self._state.code_globals)
+        except Exception:
+            import traceback
+            tb = traceback.format_exc()
+            for line in tb.splitlines():
+                print(_c("ERROR", line))
 
     def _shell_cmd(self, raw: str) -> bool:
         parts = raw.lstrip("/").split()
@@ -175,9 +196,29 @@ class PSH:
                 "  /agent <name>  switch to agent <name>\n"
                 "  /dangerous  toggle dangerous tool confirmation\n"
                 "  /help   this message\n"
-                "  ?<text>  invoke agent (escape ?? for literal ?)\n"
-                "  !<code>  code mode (not yet implemented)\n"
-                "  <text>  in agent mode: invoke agent (if no prefix)\n"
+                "\n"
+                "  MODES\n"
+                "  Agent mode  (prompt: ?> )  — talk to the foreground agent.\n"
+                "  Code mode   (prompt: !> )  — execute Python in a sandbox with agents.\n"
+                "  ?  alone → switch to agent mode.  !  alone → switch to code mode.\n"
+                "  ?<text>  in any mode: briefly invoke agent, stay in current mode.\n"
+                "  !<code>  in any mode: briefly execute code, stay in current mode.\n"
+                "\n"
+                "  AGENT MODE  (prompt: ?> )\n"
+                "  ?<text>  invoke agent (escape leading ?? for literal ? at start)\n"
+                "  <text>  invoke agent (shorthand, same as ?)\n"
+                "\n"
+                "  CODE MODE  (prompt: !> )\n"
+                "  !<code>  execute Python code\n"
+                "  <code>  execute Python code (shorthand, same as !)\n"
+                "  Available in code mode:\n"
+                "    spawn(name, cls_or_obj)  spawn/register an agent\n"
+                "    terminate(name)         remove agent from registry\n"
+                "    list_classes()          list known agentic classes\n"
+                "    agents                 dict of live agent instances\n"
+                "    print, len, range, list, dict, str, int, float, bool\n"
+                "    type, isinstance, open, map, filter, sorted, zip\n"
+                "    + all standard literals and operators\n"
                 ))
         else:
             print(_c("SHELL", f"Unknown command: /{cmd}"))
@@ -239,6 +280,80 @@ class _ShellState:
         self.confirm_dangerous = True
         self.foreground_agent_name: str = "default"
         self.mode: str = "agent"
+        self.code_globals: dict[str, Any] = {}
+
+
+def _spawn(name: str, agent_or_cls: Any, agents: dict[str, Any]) -> None:
+    if isinstance(agent_or_cls, str):
+        import importlib
+        module_path, class_name = agent_or_cls.rsplit(".", 1)
+        mod = importlib.import_module(module_path)
+        agent_or_cls = getattr(mod, class_name)()
+    if hasattr(agent_or_cls, "invoke_agent"):
+        agents[name] = agent_or_cls
+        print(_c("AGENT", f"Spawned agent {name!r}"))
+    else:
+        raise TypeError(f"{name!r} is not an AgenticObject (has no invoke_agent)")
+
+
+def _terminate(name: str, agents: dict[str, Any]) -> None:
+    if name in agents:
+        del agents[name]
+        print(_c("AGENT", f"Terminated agent {name!r}"))
+
+
+def _list_classes() -> None:
+    pass
+
+
+def _make_code_globals(agents: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "__builtins__": {
+            "True": True,
+            "False": False,
+            "None": None,
+            "print": print,
+            "len": len,
+            "range": range,
+            "list": list,
+            "dict": dict,
+            "str": str,
+            "int": int,
+            "float": float,
+            "bool": bool,
+            "tuple": tuple,
+            "set": set,
+            "frozenset": frozenset,
+            "type": type,
+            "isinstance": isinstance,
+            "open": open,
+            "enumerate": enumerate,
+            "zip": zip,
+            "map": map,
+            "filter": filter,
+            "sorted": sorted,
+            "reversed": reversed,
+            "abs": abs,
+            "min": min,
+            "max": max,
+            "sum": sum,
+            "round": round,
+            "any": any,
+            "all": all,
+            "Exception": Exception,
+            "ValueError": ValueError,
+            "TypeError": TypeError,
+            "KeyError": KeyError,
+            "IndexError": IndexError,
+            "RuntimeError": RuntimeError,
+            "SystemExit": SystemExit,
+            "__import__": __import__,
+        },
+        "agents": agents,
+        "spawn": lambda name, obj: _spawn(name, obj, agents),
+        "terminate": lambda name: _terminate(name, agents),
+        "list_classes": _list_classes,
+    }
 
 
 def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
@@ -376,6 +491,7 @@ def _main() -> None:
     prompt_queue: queue.Queue[str | None] = queue.Queue()
     result_queue: queue.Queue[Any] = queue.Queue()
     state = _ShellState()
+    state.code_globals = _make_code_globals(agents)
 
     worker = threading.Thread(target=_peteos_worker, args=(agents, prompt_queue, result_queue, state), daemon=True)
     worker.start()
