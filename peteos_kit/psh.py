@@ -85,6 +85,7 @@ class PSH:
         self._running = False
         self._first_invoke = True
         self._thread_id: str | None = "default"
+        self._confirm_dangerous = True
 
     def _h(self, ctx: dict) -> None:
         prompt = ctx.get("prompt", "")
@@ -95,11 +96,21 @@ class PSH:
     def _htc(self, ctx: dict) -> None:
         print(_c("TOOL", ctx.get("tool_name", "?")))
 
-    def _bte(self, tc: Any) -> None:
+    async def _bte(self, tc: Any) -> None:
         n = getattr(tc, "name", "?") if tc else "?"
         raw = getattr(tc, "raw_dict", None)
         args_str = raw.get("arguments", "{}") if raw else "{}"
         print(_c("RUN", f"{n}({_fmt_json(args_str)})"))
+        if not self._confirm_dangerous:
+            return
+        loop = asyncio.get_running_loop()
+        raw_answer = await loop.run_in_executor(
+            None, lambda: input("  allow? [y/n] ").strip().lower()
+        )
+        if raw_answer not in ("y", "yes"):
+            print(_c("DENY", n))
+            return (False, f"Tool '{n}' denied by user.")
+        return None
 
     def _ate(self, *args: Any, **kwargs: Any) -> None:
         runner = args[0]
@@ -211,6 +222,10 @@ class PSH:
             self._list_tools()
         elif cmd == "session":
             self._session_cmd(parts[1:] if len(parts) > 1 else None)
+        elif cmd == "dangerous":
+            self._confirm_dangerous = not self._confirm_dangerous
+            state = "ON" if self._confirm_dangerous else "OFF"
+            print(_c("SHELL", f"Dangerous tool confirmation: {state}"))
         elif cmd == "help":
             print(
                 _c("SHELL",
@@ -221,8 +236,9 @@ class PSH:
                 "  /session  show current session ID\n"
                 "  /session <id>  switch to session <id>\n"
                 "  /session none  anonymous session (no memory)\n"
+                "  /dangerous  toggle dangerous tool confirmation\n"
                 "  /help   this message\n"
-                "  <text>  send to agent"
+                "  <text>  send to agent\n"
                 ))
         else:
             print(_c("SHELL", f"Unknown command: /{cmd}"))
