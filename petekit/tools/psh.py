@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
+import threading
 from typing import Any, Callable
 
 from peteos import AgenticObject, Error, tool
@@ -79,118 +81,19 @@ class PSH:
 
     _TITLE = "=== PSH Context ==="
 
-    def __init__(self, agent: AgenticObject) -> None:
+    def __init__(self, agent: AgenticObject, prompt_queue: queue.Queue[str | None], result_queue: queue.Queue[Any], state: _ShellState) -> None:
         super().__init__()
         self._agent = agent
-        self._running = False
-        self._first_invoke = True
-        self._thread_id: str | None = "default"
-        self._confirm_dangerous = True
+        self._prompt_queue = prompt_queue
+        self._result_queue = result_queue
+        self._state = state
 
-    def _h(self, ctx: dict) -> None:
-        prompt = ctx.get("prompt", "")
-        if isinstance(prompt, list):
-            prompt = " ".join(str(p) for p in prompt)
-        print(_c("INVOKE", f"{prompt!r:.80}", hook="_h(on_invoke)"))
-
-    def _htc(self, ctx: dict) -> None:
-        print(_c("TOOL", ctx.get("tool_name", "?")))
-
-    async def _bte(self, tc: Any) -> None:
-        n = getattr(tc, "name", "?") if tc else "?"
-        raw = getattr(tc, "raw_dict", None)
-        args_str = raw.get("arguments", "{}") if raw else "{}"
-        print(_c("RUN", f"{n}({_fmt_json(args_str)})"))
-        if not self._confirm_dangerous:
-            return
-        loop = asyncio.get_running_loop()
-        raw_answer = await loop.run_in_executor(
-            None, lambda: input("  allow? [y/n] ").strip().lower()
-        )
-        if raw_answer not in ("y", "yes"):
-            print(_c("DENY", n))
-            return (False, f"Tool '{n}' denied by user.")
-        return None
-
-    def _ate(self, *args: Any, **kwargs: Any) -> None:
-        runner = args[0]
-        tc = args[1]
-        res = args[2]
-        ok = args[3]
-        n = getattr(tc, "name", "?") if tc else "?"
-        res_str = str(res) if res else ""
-        if ok:
-            print(_c("RET", f"{n} → {_fmt_json(res_str)}"))
-        else:
-            print(_c("ERR", f"{n}: {_fmt_json(res_str)}"))
-
-    def _mappend(self, runner: Any, msg: Any) -> None:
-        printable = getattr(msg, "printable", None)
-        role = getattr(msg, "role", "?").upper()
-        if printable:
-            text = printable()
-            if text:
-                print(_c(role, text, hook="_mappend"))
-            return
-        raw = getattr(msg, "content", "")
-        if isinstance(raw, list):
-            print(_c(role, repr(raw), hook="_mappend"))
-        elif isinstance(raw, str) and raw:
-            print(_c(role, raw, hook="_mappend"))
-
-    def _done(self, ctx: dict) -> None:
-        r = ctx.get("result")
-        if isinstance(r, Error):
-            print(_c("ERROR", r.message))
-        elif r is not None:
-            print(_c("RESULT", repr(r)))
-        else:
-            print(_c("RESULT", "None"))
-
-    def _before_llm(self, runner: Any, ctx: Any) -> None:
-        if not self._first_invoke:
-            return
-        self._first_invoke = False
-        for msg in ctx.messages:
-            role = getattr(msg, "role", "?").upper()
-            printable = getattr(msg, "printable", None)
-            if printable:
-                text = printable()
-                if text:
-                    print(_c(role, text, hook="_before_llm"))
-                    continue
-            raw = getattr(msg, "content", "")
-            if isinstance(raw, list):
-                print(_c(role, repr(raw), hook="_before_llm"))
-            elif isinstance(raw, str) and raw:
-                print(_c(role, raw, hook="_before_llm"))
-
-    def _base_hooks(self, first: bool = False) -> dict[str, list[Callable]]:
-        if first:
-            return {
-                "before_send_to_chatbot": [self._before_llm],
-                "on_tool_call": [self._htc],
-                "before_tool_execution": [self._bte],
-                "after_tool_execution": [self._ate],
-                "after_message_append": [self._mappend],
-                "on_invoke_complete": [self._done],
-            }
-        return {
-            #"on_invoke": [self._h],  # put this back in to debug the invocation arguments
-            "on_tool_call": [self._htc],
-            "before_tool_execution": [self._bte],
-            "after_tool_execution": [self._ate],
-            "after_message_append": [self._mappend],
-            "on_invoke_complete": [self._done],
-        }
-
-    async def run_shell(self) -> str:
-        from prompt_toolkit.shortcuts import prompt
+    def run_shell(self) -> str:
         print(f"{self._TITLE}")
         print("Type /help for commands, /quit to exit.")
         while True:
             try:
-                raw = await asyncio.get_running_loop().run_in_executor(None, lambda: prompt("> "))
+                raw = input("> ")
             except (EOFError, KeyboardInterrupt):
                 print("\n[SHELL] EOF — bye")
                 break
@@ -201,15 +104,12 @@ class PSH:
                 if self._shell_cmd(raw):
                     break
             else:
-                await self._send(raw)
+                self._prompt_queue.put(raw)
+                try:
+                    self._result_queue.get(timeout=300)
+                except queue.Empty:
+                    print(_c("ERROR", "Timed out waiting for agent response"))
         return "Shell closed."
-
-    async def _send(self, prompt: str) -> None:
-        result = await self._agent.invoke_agent(
-            prompt=prompt,
-            hooks=self._base_hooks(first=self._first_invoke),
-            persistent_thread_id=self._thread_id,
-        )
 
     def _shell_cmd(self, raw: str) -> bool:
         parts = raw.lstrip("/").split()
@@ -223,8 +123,8 @@ class PSH:
         elif cmd == "session":
             self._session_cmd(parts[1:] if len(parts) > 1 else None)
         elif cmd == "dangerous":
-            self._confirm_dangerous = not self._confirm_dangerous
-            state = "ON" if self._confirm_dangerous else "OFF"
+            self._state.confirm_dangerous = not self._state.confirm_dangerous
+            state = "ON" if self._state.confirm_dangerous else "OFF"
             print(_c("SHELL", f"Dangerous tool confirmation: {state}"))
         elif cmd == "help":
             print(
@@ -247,16 +147,16 @@ class PSH:
     def _session_cmd(self, args: list[str] | None) -> None:
         if args:
             if args[0].lower() == "none":
-                self._thread_id = None
-                self._first_invoke = True
+                self._state.thread_id = None
+                self._state.first_invoke = True
                 print(_c("SESSION", "Session: none — anonymous (no memory)"))
             else:
-                self._thread_id = args[0]
-                self._first_invoke = True
-                print(_c("SESSION", f"Switched to session: {self._thread_id}"))
+                self._state.thread_id = args[0]
+                self._state.first_invoke = True
+                print(_c("SESSION", f"Switched to session: {self._state.thread_id}"))
         else:
-            if self._thread_id:
-                print(_c("SESSION", f"Current session: {self._thread_id}"))
+            if self._state.thread_id:
+                print(_c("SESSION", f"Current session: {self._state.thread_id}"))
             else:
                 print(_c("SESSION", "Session: none — anonymous (no memory)"))
 
@@ -281,7 +181,128 @@ class _DemoAgent(AgenticObject):
         return a + b
 
 
-async def _main() -> None:
+class _ShellState:
+    def __init__(self) -> None:
+        self.first_invoke = True
+        self.thread_id: str | None = "default"
+        self.confirm_dangerous = True
+
+
+def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
+    async def _bte(tc: Any) -> None:
+        n = getattr(tc, "name", "?") if tc else "?"
+        raw = getattr(tc, "raw_dict", None)
+        args_str = raw.get("arguments", "{}") if raw else "{}"
+        print(_c("RUN", f"{n}({_fmt_json(args_str)})"))
+        if not state.confirm_dangerous:
+            return
+        loop = asyncio.get_running_loop()
+        raw_answer = await loop.run_in_executor(
+            None, lambda: input("  allow? [y/n] ").strip().lower()
+        )
+        if raw_answer not in ("y", "yes"):
+            print(_c("DENY", n))
+            return (False, f"Tool '{n}' denied by user.")
+        return None
+    return _bte
+
+
+def _ate(runner: Any, tc: Any, res: Any, ok: Any) -> None:
+    n = getattr(tc, "name", "?") if tc else "?"
+    res_str = str(res) if res else ""
+    if ok:
+        print(_c("RET", f"{n} -> {_fmt_json(res_str)}"))
+    else:
+        print(_c("ERR", f"{n}: {_fmt_json(res_str)}"))
+
+
+def _mappend(runner: Any, msg: Any) -> None:
+    printable = getattr(msg, "printable", None)
+    role = getattr(msg, "role", "?").upper()
+    if printable:
+        text = printable()
+        if text:
+            print(_c(role, text, hook="_mappend"))
+            return
+    raw = getattr(msg, "content", "")
+    if isinstance(raw, list):
+        print(_c(role, repr(raw), hook="_mappend"))
+    elif isinstance(raw, str) and raw:
+        print(_c(role, raw, hook="_mappend"))
+
+
+def _done(ctx: dict) -> None:
+    r = ctx.get("result")
+    if isinstance(r, Error):
+        print(_c("ERROR", r.message))
+    elif r is not None:
+        print(_c("RESULT", repr(r)))
+    else:
+        print(_c("RESULT", "None"))
+
+
+def _before_llm(runner: Any, ctx: Any, state: _ShellState) -> None:
+    if not state.first_invoke:
+        return
+    state.first_invoke = False
+    for msg in ctx.messages:
+        role = getattr(msg, "role", "?").upper()
+        printable = getattr(msg, "printable", None)
+        if printable:
+            text = printable()
+            if text:
+                print(_c(role, text, hook="_before_llm"))
+                continue
+        raw = getattr(msg, "content", "")
+        if isinstance(raw, list):
+            print(_c(role, repr(raw), hook="_before_llm"))
+        elif isinstance(raw, str) and raw:
+            print(_c(role, raw, hook="_before_llm"))
+
+
+def _peteos_worker(
+    agent: AgenticObject,
+    prompt_queue: queue.Queue[str | None],
+    result_queue: queue.Queue[Any],
+    state: _ShellState,
+) -> None:
+    while True:
+        try:
+            raw = prompt_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if raw is None:
+            break
+        prompt = raw.strip()
+        if not prompt:
+            result_queue.put(None)
+            continue
+
+        async def _run_invoke() -> Any:
+            return await agent.invoke_agent(
+                prompt=prompt,
+                hooks={
+                    "on_tool_call": [lambda ctx: print(_c("TOOL", ctx.get("tool_name", "?")))],
+                    "before_tool_execution": [_make_bte(state)],
+                    "after_tool_execution": [_ate],
+                    "after_message_append": [_mappend],
+                    "on_invoke_complete": [_done],
+                } if not state.first_invoke else {
+                    "before_send_to_chatbot": [lambda runner, ctx: _before_llm(runner, ctx, state)],
+                    "on_tool_call": [lambda ctx: print(_c("TOOL", ctx.get("tool_name", "?")))],
+                    "before_tool_execution": [_make_bte(state)],
+                    "after_tool_execution": [_ate],
+                    "after_message_append": [_mappend],
+                    "on_invoke_complete": [_done],
+                },
+                persistent_thread_id=state.thread_id,
+            )
+        result = asyncio.run(_run_invoke())
+        state.first_invoke = False
+        result_queue.put(result)
+
+
+def _main() -> None:
     import argparse
     import importlib
 
@@ -296,9 +317,19 @@ async def _main() -> None:
     else:
         agent = _DemoAgent()
 
-    shell = PSH(agent=agent)
-    await shell.run_shell()
+    prompt_queue: queue.Queue[str | None] = queue.Queue()
+    result_queue: queue.Queue[Any] = queue.Queue()
+    state = _ShellState()
+
+    worker = threading.Thread(target=_peteos_worker, args=(agent, prompt_queue, result_queue, state), daemon=True)
+    worker.start()
+
+    shell = PSH(agent=agent, prompt_queue=prompt_queue, result_queue=result_queue, state=state)
+    shell.run_shell()
+
+    prompt_queue.put(None)
+    worker.join(timeout=5.0)
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    _main()
