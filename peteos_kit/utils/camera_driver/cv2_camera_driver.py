@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import cv2
 import numpy as np
 
-from peteos_kit.camera_driver.camera_driver import CameraDriver
+from peteos_kit.utils.camera_driver.camera_driver import CameraDriver
 
 _logger = logging.getLogger(__name__)
 if not _logger.handlers and not logging.getLogger().handlers:
