@@ -173,13 +173,13 @@ class PSH:
             "on_invoke_complete": [self._done],
         }
 
-    def run_shell(self) -> str:
+    async def run_shell(self) -> str:
         from prompt_toolkit.shortcuts import prompt
         print(f"{self._TITLE}")
         print("Type /help for commands, /quit to exit.")
         while True:
             try:
-                raw = prompt("> ")
+                raw = await asyncio.get_running_loop().run_in_executor(None, lambda: prompt("> "))
             except (EOFError, KeyboardInterrupt):
                 print("\n[SHELL] EOF — bye")
                 break
@@ -190,7 +190,7 @@ class PSH:
                 if self._shell_cmd(raw):
                     break
             else:
-                asyncio.run(self._send(raw))
+                await self._send(raw)
         return "Shell closed."
 
     async def _send(self, prompt: str) -> None:
@@ -265,7 +265,7 @@ class _DemoAgent(AgenticObject):
         return a + b
 
 
-if __name__ == "__main__":
+async def _main() -> None:
     import argparse
     import importlib
 
@@ -281,4 +281,8 @@ if __name__ == "__main__":
         agent = _DemoAgent()
 
     shell = PSH(agent=agent)
-    shell.run_shell()
+    await shell.run_shell()
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())
