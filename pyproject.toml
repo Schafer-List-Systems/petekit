@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build_backend = "setuptools.build_meta"
+
+[project]
+name = "peteos_kit"
+version = "0.1.0-nightly"
+description = "PeteOS Kit — agentic building blocks for streams, text, and images"
+requires-python = ">=3.10"
+dependencies = [
+    "peteos",
+    "diff-match-patch",
+]
+
+[project.optional-dependencies]
+image = ["opencv-python>=4.8.0", "numpy>=1.24.0", "mss"]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
