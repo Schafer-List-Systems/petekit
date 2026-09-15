@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Coroutine
 
 from peteos.oap.agentic_object import AgenticObject
-from peteos.oap.decorators import tool
+from peteos.oap.decorators import sandbox, tool
 from .buffer_manager import Buffer, BufferEntry, BufferManager
 
 
@@ -165,14 +165,31 @@ class StreamBufferManager(BufferManager, AgenticObject):
             f"Bucket distribution (start-end:chars): {', '.join(bucket_msgs)}."
         )
 
-    def _register_stream_rule(self, stream_buffer: str, name: str, rule: Rule) -> None:
-        """Register a rule by name on a stream. Raises KeyError if the stream doesn't exist or name is already registered."""
+    @sandbox
+    def _register_stream_rule(
+        self,
+        stream_buffer: str,
+        rule_name: str,
+        condition: Callable[[BufferEntry, Buffer], None | dict],
+        action: Callable[..., Coroutine[Any, Any, None]] | None = None,
+    ) -> str:
+        """Register a rule on a stream with the given condition and action. Callable from agent-written Python."""
         if stream_buffer not in self._stream_buffer_rules:
-            raise KeyError(f"No stream named '{stream_buffer}'. Create it with _create_stream first.")
+            return {"ok": False, "error": f"no stream named '{stream_buffer}'", "rule_name": rule_name, "stream_buffer": stream_buffer}
         br = self._stream_buffer_rules[stream_buffer]
-        if name in br.rules:
-            raise KeyError(f"Rule '{name}' already registered on '{stream_buffer}'.")
-        br.rules[name] = rule
+        if rule_name in br.rules:
+            return {"ok": False, "error": f"rule '{rule_name}' already registered", "rule_name": rule_name, "stream_buffer": stream_buffer}
+        br.rules[rule_name] = Rule(condition=condition, action=action)
+        return {"ok": True, "rule_name": rule_name, "stream_buffer": stream_buffer}
+
+    def _get_stream_rule(self, stream_buffer: str, rule_name: str) -> Rule:
+        """Get a rule by stream and name. Raises KeyError if not found."""
+        if stream_buffer not in self._stream_buffer_rules:
+            raise KeyError(f"No stream named '{stream_buffer}'.")
+        br = self._stream_buffer_rules[stream_buffer]
+        if rule_name not in br.rules:
+            raise KeyError(f"Rule '{rule_name}' not found on '{stream_buffer}'.")
+        return br.rules[rule_name]
 
     def _exchange_stream_fallback_rule(self, stream_buffer: str, fallback: Rule) -> Rule | None:
         """Exchange the fallback rule on a stream. Returns the previous fallback (or None)."""
