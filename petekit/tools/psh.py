@@ -208,6 +208,20 @@ class PSH:
             tb = traceback.format_exc()
             for line in tb.splitlines():
                 print(_c("ERROR", line))
+            return
+        for key, val in self._state.code_globals.items():
+            if key.startswith("_"):
+                continue
+            if key in self._state._func_seen:
+                continue
+            if not callable(val):
+                continue
+            if key in ("spawn", "terminate", "list_classes", "agents", "call"):
+                continue
+            self._state._func_registry[key] = val
+            self._state._func_seen.add(key)
+            doc = getattr(val, "__doc__", None) or ""
+            print(_c("SHELL", f"Registered /{key} — {doc.strip().split(chr(10))[0]}"))
 
     def _shell_cmd(self, raw: str) -> bool:
         parts = raw.lstrip("/").split()
@@ -239,6 +253,7 @@ class PSH:
                 "  /agent  show current agent name\n"
                 "  /agent <name>  switch to agent <name>\n"
                 "  /dangerous  toggle dangerous tool confirmation\n"
+                "  /funcs  list registered functions\n"
                 "  /help   this message\n"
                 "\n"
                 "  MODES\n"
@@ -263,7 +278,36 @@ class PSH:
                 "    print, len, range, list, dict, str, int, float, bool\n"
                 "    type, isinstance, open, map, filter, sorted, zip\n"
                 "    + all standard literals and operators\n"
+                "\n"
+                "  Functions defined in code mode (no leading _) are registered\n"
+                "  as slash commands and run in the worker thread.\n"
                 ))
+        elif cmd == "funcs":
+            if not self._state._func_registry:
+                print(_c("SHELL", "No registered functions yet (define in code mode)"))
+            else:
+                print(_c("SHELL", f"{len(self._state._func_registry)} registered function(s):"))
+                for fname in self._state._func_registry:
+                    f = self._state._func_registry[fname]
+                    doc = getattr(f, "__doc__", None) or ""
+                    print(f"  /{fname}  — {doc.strip().split(chr(10))[0]}")
+        elif cmd in self._state._func_registry:
+            fname = cmd
+            raw_args = parts[1:] if len(parts) > 1 else []
+            self._state.func_queue.put((fname, tuple(raw_args), {}))
+            try:
+                rfname, stdout_val, err_msg, result = self._state.func_result_queue.get(timeout=30)
+            except queue.Empty:
+                print(_c("ERROR", f"Timed out waiting for /{fname}"))
+            else:
+                display = f"{fname}{raw_args if raw_args else '()'}"
+                print(_c("RUN", display), end="")
+                if stdout_val:
+                    print(stdout_val, end="")
+                if err_msg:
+                    print(_c("ERR", err_msg))
+                else:
+                    print(_c("RET", result if isinstance(result, str) else repr(result)))
         else:
             print(_c("SHELL", f"Unknown command: /{cmd}"))
         return False
@@ -325,6 +369,12 @@ class _ShellState:
         self.foreground_agent_name: str = "default"
         self.mode: str = "agent"
         self.code_globals: dict[str, Any] = {}
+        self.prompt_queue: queue.Queue[str | None] = queue.Queue()
+        self.result_queue: queue.Queue[Any] = queue.Queue()
+        self.func_queue: queue.Queue[tuple[str, tuple, dict]] = queue.Queue()
+        self.func_result_queue: queue.Queue[Any] = queue.Queue()
+        self._func_registry: dict[str, Callable] = {}
+        self._func_seen: set[str] = set()
 
 
 def _spawn(name: str, agent_or_cls: Any, agents: dict[str, Any]) -> None:
@@ -478,7 +528,52 @@ def _peteos_worker(
     result_queue: queue.Queue[Any],
     state: _ShellState,
 ) -> None:
+    import io
+    import sys
+
+    def _capture_call(func: Callable, args: tuple, kwargs: dict) -> tuple[str, Any]:
+        captured_out = io.StringIO()
+        captured_err = io.StringIO()
+        old_out = sys.stdout
+        old_err = sys.stderr
+        sys.stdout = captured_out
+        sys.stderr = captured_err
+        result = None
+        err_msg = ""
+        try:
+            result = func(*args, **kwargs)
+        except Exception:
+            import traceback
+            err_msg = traceback.format_exc()
+        finally:
+            sys.stdout = old_out
+            sys.stderr = old_err
+        stdout_val = captured_out.getvalue()
+        return stdout_val, (err_msg, result)
+
     while True:
+        func_call = None
+        try:
+            func_call = state.func_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if func_call is not None:
+            fname, fargs, fkwargs = func_call
+            func = state._func_registry.get(fname)
+            stdout_val = ""
+            err_msg = ""
+            result = None
+            if func is not None:
+                try:
+                    stdout_val, (err_msg, result) = _capture_call(func, fargs, fkwargs)
+                except Exception:
+                    import traceback
+                    err_msg = traceback.format_exc()
+                state.func_result_queue.put((fname, stdout_val, err_msg, result))
+            else:
+                state.func_result_queue.put((fname, "", f"Unknown function: {fname}", None))
+            continue
+
         try:
             raw = prompt_queue.get(timeout=1.0)
         except queue.Empty:
