@@ -44,3 +44,6 @@ _Pete = type("Pete", tuple(_leaves) + (AgenticObject,), {
 })
 
 spawn("pete", _Pete())
+agent("pete")
+ask_confirmation(True)
+

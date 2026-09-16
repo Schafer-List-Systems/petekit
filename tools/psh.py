@@ -234,10 +234,10 @@ class PSH:
             self._list_tools()
         elif cmd == "session":
             self._session_cmd(parts[1:] if len(parts) > 1 else None)
-        elif cmd == "dangerous":
-            self._state.confirm_dangerous = not self._state.confirm_dangerous
-            state = "ON" if self._state.confirm_dangerous else "OFF"
-            print(_c("SHELL", f"Dangerous tool confirmation: {state}"))
+        elif cmd == "ask_confirmation":
+            self._state.ask_confirmation = not self._state.ask_confirmation
+            state = "ON" if self._state.ask_confirmation else "OFF"
+            print(_c("SHELL", f"Ask for tool confirmation: {state}"))
         elif cmd == "agent":
             self._agent_cmd(parts[1:] if len(parts) > 1 else None)
         elif cmd == "help":
@@ -252,7 +252,7 @@ class PSH:
                 "  /session none  anonymous session (no memory)\n"
                 "  /agent  show current agent name\n"
                 "  /agent <name>  switch to agent <name>\n"
-                "  /dangerous  toggle dangerous tool confirmation\n"
+                "  /ask_confirmation  toggle tool confirmation\n"
                 "  /funcs  list registered functions\n"
                 "  /help   this message\n"
                 "\n"
@@ -365,7 +365,7 @@ class _ShellState:
     def __init__(self) -> None:
         self.first_invoke = True
         self.thread_id: str | None = "default"
-        self.confirm_dangerous = True
+        self.ask_confirmation = True
         self.foreground_agent_name: str = "default"
         self.mode: str = "agent"
         self.code_globals: dict[str, Any] = {}
@@ -400,7 +400,7 @@ def _list_classes() -> None:
     pass
 
 
-def _make_code_globals(agents: dict[str, Any]) -> dict[str, Any]:
+def _make_code_globals(agents: dict[str, Any], state) -> dict[str, Any]:
     import builtins as _b
     return {
         "__builtins__": {
@@ -411,6 +411,9 @@ def _make_code_globals(agents: dict[str, Any]) -> dict[str, Any]:
         "spawn": lambda name, obj: _spawn(name, obj, agents),
         "terminate": lambda name: _terminate(name, agents),
         "list_classes": _list_classes,
+        "ask_confirmation": lambda on: setattr(state, "ask_confirmation", bool(on)),
+        "agent": lambda name: setattr(state, "foreground_agent_name", name),
+        "session": lambda name: setattr(state, "thread_id", name if name else None),
     }
 
 
@@ -420,7 +423,7 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
         raw = getattr(tc, "raw_dict", None)
         args_str = raw.get("arguments", "{}") if raw else "{}"
         print(_c("RUN", f"{n}({_fmt_json(args_str)})"))
-        if not state.confirm_dangerous:
+        if not state.ask_confirmation:
             return
         loop = asyncio.get_running_loop()
         raw_answer = await loop.run_in_executor(
@@ -594,7 +597,7 @@ def _main() -> None:
     prompt_queue: queue.Queue[str | None] = queue.Queue()
     result_queue: queue.Queue[Any] = queue.Queue()
     state = _ShellState()
-    state.code_globals = _make_code_globals(agents)
+    state.code_globals = _make_code_globals(agents, state)
     state._func_seen = set()
     state._func_registry = {}
     state.code_queue = queue.Queue()
