@@ -631,11 +631,28 @@ def _main() -> None:
     result_queue: queue.Queue[Any] = queue.Queue()
     state = _ShellState()
     state.code_globals = _make_code_globals(agents)
+    state._func_seen = set()
+    state._func_registry = {}
+    state.code_queue = queue.Queue()
+    state.code_result_queue = queue.Queue()
 
     worker = threading.Thread(target=_peteos_worker, args=(agents, prompt_queue, result_queue, state), daemon=True)
     worker.start()
 
     shell = PSH(agents=agents, prompt_queue=prompt_queue, result_queue=result_queue, state=state)
+
+    rc_candidates = [
+        os.path.join(os.getcwd(), ".pshrc"),
+        os.path.expanduser("~/.pshrc"),
+    ]
+    for rc_path in rc_candidates:
+        if os.path.isfile(rc_path):
+            print(_c("SHELL", f"Loading rc from {rc_path}"))
+            with open(rc_path) as f:
+                rc_content = f.read()
+            shell._run_code(rc_content)
+            break
+
     shell.run_shell()
 
     prompt_queue.put(None)
