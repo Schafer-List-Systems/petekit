@@ -582,64 +582,92 @@ def _peteos_worker(
         stdout_val = captured_out.getvalue()
         return stdout_val, (err_msg, result)
 
-    while True:
-        func_call = None
-        try:
-            func_call = state.func_queue.get_nowait()
-        except queue.Empty:
-            pass
-        if func_call is not None:
-            fname, fargs, fkwargs = func_call
-            func = state._func_registry.get(fname)
-            stdout_val = ""
-            err_msg = ""
-            result = None
-            if func is not None:
-                try:
-                    stdout_val, (err_msg, result) = _capture_call(func, fargs, fkwargs)
-                except Exception:
-                    import traceback
-                    err_msg = traceback.format_exc()
-                state.func_result_queue.put((fname, stdout_val, err_msg, result))
-            else:
-                state.func_result_queue.put((fname, "", f"Unknown function: {fname}", None))
-            continue
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-        try:
-            raw = prompt_queue.get(timeout=1.0)
-        except queue.Empty:
-            continue
-        if raw is None:
-            break
-        prompt = raw.strip()
-        if not prompt:
-            result_queue.put(None)
-            continue
+    async def _collect_func_calls() -> tuple[str, tuple, dict] | None:
+        def _get():
+            try:
+                return state.func_queue.get_nowait()
+            except queue.Empty:
+                return None
+        return await asyncio.get_event_loop().run_in_executor(None, _get)
 
-        agent = agents[state.foreground_agent_name]
+    async def _get_prompt_with_timeout(self_timeout: float) -> str | None:
+        def _blocking_get():
+            try:
+                return prompt_queue.get(timeout=self_timeout)
+            except queue.Empty:
+                return None
+        return await asyncio.get_event_loop().run_in_executor(None, _blocking_get)
 
-        async def _run_invoke() -> Any:
-            return await agent.invoke_agent(
-                prompt=prompt,
-                hooks={
-                    "on_tool_call": [lambda ctx: print(_c("TOOL", ctx.get("tool_name", "?"))) if state.output_flags.get("TOOL", True) else None],
-                    "before_tool_execution": [_make_bte(state)],
-                    "after_tool_execution": [_make_ate(state)],
-                    "after_message_append": [_make_mappend(state)],
-                    "on_invoke_complete": [_make_done(state)],
-                } if not state.first_invoke else {
-                    "before_send_to_chatbot": [lambda runner, ctx: _before_llm(runner, ctx, state)],
-                    "on_tool_call": [lambda ctx: print(_c("TOOL", ctx.get("tool_name", "?"))) if state.output_flags.get("TOOL", True) else None],
-                    "before_tool_execution": [_make_bte(state)],
-                    "after_tool_execution": [_make_ate(state)],
-                    "after_message_append": [_make_mappend(state)],
-                    "on_invoke_complete": [_make_done(state)],
-                },
-                persistent_thread_id=state.thread_id,
-            )
-        result = asyncio.run(_run_invoke())
-        state.first_invoke = False
-        result_queue.put(result)
+    async def _do_invoke(agent: AgenticObject, prompt: str) -> Any:
+        return await agent.invoke_agent(
+            prompt=prompt,
+            hooks={
+                "on_tool_call": [lambda ctx: print(_c("TOOL", ctx.get("tool_name", "?"))) if state.output_flags.get("TOOL", True) else None],
+                "before_tool_execution": [_make_bte(state)],
+                "after_tool_execution": [_make_ate(state)],
+                "after_message_append": [_make_mappend(state)],
+                "on_invoke_complete": [_make_done(state)],
+            } if not state.first_invoke else {
+                "before_send_to_chatbot": [lambda runner, ctx: _before_llm(runner, ctx, state)],
+                "on_tool_call": [lambda ctx: print(_c("TOOL", ctx.get("tool_name", "?"))) if state.output_flags.get("TOOL", True) else None],
+                "before_tool_execution": [_make_bte(state)],
+                "after_tool_execution": [_make_ate(state)],
+                "after_message_append": [_make_mappend(state)],
+                "on_invoke_complete": [_make_done(state)],
+            },
+            persistent_thread_id=state.thread_id,
+        )
+
+    async def _run_loop() -> None:
+        while True:
+            func_call = await _collect_func_calls()
+            if func_call is not None:
+                fname, fargs, fkwargs = func_call
+                func = state._func_registry.get(fname)
+                stdout_val = ""
+                err_msg = ""
+                result = None
+                if func is not None:
+                    try:
+                        stdout_val, (err_msg, result) = _capture_call(func, fargs, fkwargs)
+                    except Exception:
+                        import traceback
+                        err_msg = traceback.format_exc()
+                    state.func_result_queue.put((fname, stdout_val, err_msg, result))
+                else:
+                    state.func_result_queue.put((fname, "", f"Unknown function: {fname}", None))
+                continue
+
+            raw = await _get_prompt_with_timeout(1.0)
+            if raw is None:
+                continue
+            if raw is None:
+                break
+            prompt = raw.strip()
+            if not prompt:
+                result_queue.put(None)
+                continue
+
+            agent = agents[state.foreground_agent_name]
+
+            try:
+                result = await _do_invoke(agent, prompt)
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                for line in tb.splitlines():
+                    print(_c("ERROR", line))
+                result = None
+            state.first_invoke = False
+            result_queue.put(result)
+
+    try:
+        loop.run_until_complete(_run_loop())
+    finally:
+        loop.close()
 
 
 def _main() -> None:
