@@ -104,7 +104,7 @@ class Basher(StreamBufferManager, AgenticObject):
             stderr_buffer=stderr_buffer,
         )
         self._processes[process_id] = handle
-        handle.task = asyncio.create_task(self._bash_read_loop(process_id, handle))
+        handle.task = asyncio.create_task(self._bash_read_loop(handle))
         return (
             f"Started process [{process_id}] '{title}': {command}. "
             f"Streams created at {now}. "
@@ -184,7 +184,7 @@ class Basher(StreamBufferManager, AgenticObject):
             f"Use drop_buffer to remove them."
         )
 
-    async def _bash_read_loop(self, process_id: int, handle: BashHandle) -> None:
+    async def _bash_read_loop(self, handle: BashHandle) -> None:
         """Continuously read stdout and stderr from the process using concurrent tasks."""
         stdout = handle.process.stdout
         stderr = handle.process.stderr
