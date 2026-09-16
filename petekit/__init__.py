@@ -12,6 +12,7 @@ from petekit.image import (
     ImageBufferManager,
     CameraObserver,
     Screenshooter,
+    DiskImageLoader,
 )
 __all__ = [
     "TextEditor",
@@ -26,4 +27,5 @@ __all__ = [
     "ImageBufferManager",
     "CameraObserver",
     "Screenshooter",
+    "DiskImageLoader",
 ]
