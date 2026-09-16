@@ -91,6 +91,10 @@ classDiagram
         <<AgenticObject>>
     }
 
+    class DiskImageLoader {
+        <<AgenticObject>>
+    }
+
     %% Base hierarchy
     BufferManager <|-- StreamBufferManager
     StreamBufferManager <|-- StreamObserver
@@ -107,11 +111,13 @@ classDiagram
     %% Text agents
     BufferManager <|-- TextEditor
     BufferManager <|-- WebNavigator
+    ImageBufferManager <|-- WebNavigator
 
     %% Image agents
     NumPyBufferManager <|-- ImageBufferManager
     ImageBufferManager <|-- CameraObserver
     ImageBufferManager <|-- Screenshooter
+    ImageBufferManager <|-- DiskImageLoader
 ```
 
 - **`BufferManager`** — in-memory text buffers with search, diff, and edit
@@ -123,6 +129,7 @@ classDiagram
 - **`ImageBufferManager`** — numpy-backed image buffers
 - **`CameraObserver`** — multi-camera observation with buffer management
 - **`Screenshooter`** — screen capture into image buffers
+- **`DiskImageLoader`** — load and save image buffers to and from disk
 - **`Basher`** / **`SandboxedBasher`** — shell execution with buffer integration
 
 ## Installation
