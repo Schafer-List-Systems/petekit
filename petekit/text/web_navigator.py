@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import time as time_mod
@@ -103,22 +104,6 @@ def _format_for_buffer(content: str) -> str:
     return content
 
 
-def _extract_links(html: str) -> list[dict]:
-    """Extract all links from HTML. Returns list of dicts with title and href."""
-    soup = BeautifulSoup(html, "lxml")
-    links = []
-    for a in soup.find_all("a", href=True):
-        title = (a.get_text(strip=True) or a.get("title", "") or a["href"])[:100]
-        links.append({"title": title, "href": a["href"]})
-    return links
-
-
-def _extract_images(html: str) -> list[str]:
-    """Extract all image src URLs from HTML."""
-    soup = BeautifulSoup(html, "lxml")
-    return [img.get("src", "") or img.get("data-src", "") or "" for img in soup.find_all("img", src=True)]
-
-
 def _extract_by_selector(html: str, selector: str) -> list[str]:
     """Extract text content from HTML elements matching the CSS selector."""
     soup = BeautifulSoup(html, "lxml")
@@ -130,6 +115,39 @@ def _extract_by_selector(html: str, selector: str) -> list[str]:
                 results.append(text)
     except Exception:
         return []
+    return results
+
+
+def _format_scrape_output(records: list[dict]) -> str:
+    """Format a list of dicts as a line-by-line JSON array."""
+    if not records:
+        return "[]"
+    json_lines = [json.dumps(r) for r in records]
+    return "[\n" + ",\n".join(json_lines) + "\n]"
+
+
+def _web_scrape(html: str, tag: str, attr: str | list[str] | None = None) -> list[dict]:
+    """Extract structured data from HTML using a tag name and optional attribute specifier.
+
+    Args:
+        html: raw HTML string
+        tag: HTML tag name to match (e.g. "a", "img", "div")
+        attr: None -> extract text content of each element as {"text": ...}
+              str -> extract that attribute as {attr: value}
+              list[str] -> extract multiple attributes as {a: v1, b: v2, ...}
+
+    Returns:
+        List of dicts, one per matched tag.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    results = []
+    for elem in soup.find_all(tag):
+        if attr is None:
+            results.append({"text": elem.get_text(strip=True)})
+        elif isinstance(attr, list):
+            results.append({a: elem.get(a, "") for a in attr})
+        else:
+            results.append({attr: elem.get(attr, "")})
     return results
 
 
@@ -152,8 +170,12 @@ class WebNavigator(BufferManager, AgenticObject):
             self._temp_dir = Path(tempfile.mkdtemp(prefix="web_navigator_"))
         return self._temp_dir
 
+    ################################################################################
+    # Retrievers
+    ################################################################################
+
     @tool(description="Fetch a URL and store its extracted text content in a buffer keyed by the URL.")
-    def load_url(self, url: str, timeout: int = 15) -> str:
+    def web_load_raw(self, url: str, timeout: int = 15) -> str:
         """Fetch a URL via HTTP, format for buffer, store in a buffer."""
         if not url.startswith(("http://", "https://")):
             return "Error: URL must start with http:// or https://."
@@ -165,8 +187,8 @@ class WebNavigator(BufferManager, AgenticObject):
         return f"Loaded URL into buffer '{url}' ({result} lines). Read it via `read_buffer`."
 
     @tool(description="Render a URL via headless Chrome and store extracted text in a buffer keyed by the URL.")
-    def render_url(self, url: str, timeout: int = 30) -> str:
-        """Render a URL via headless Chrome, format for buffer, store in a buffer."""
+    def web_render(self, url: str, timeout: int = 30) -> str:
+        """Web render a URL via headless Chrome, format for buffer, store in a buffer."""
         if not url.startswith(("http://", "https://")):
             return "Error: URL must start with http:// or https://."
         html = _render_chrome(url, timeout=timeout)
@@ -176,59 +198,8 @@ class WebNavigator(BufferManager, AgenticObject):
         result = self._create_buffer(url, text=formatted)
         return f"Rendered buffer '{url}' ({result} lines)."
 
-    @tool(description="Extract all links from a URL and store them as lines in a derived buffer (keyed by URL+:links).")
-    def extract_links(self, url: str, timeout: int = 15) -> str:
-        """Fetch a URL, extract links, store in a derived buffer."""
-        if not url.startswith(("http://", "https://")):
-            return "Error: URL must start with http:// or https://."
-        html = _fetch_html(url, timeout=timeout)
-        if html.startswith("Error"):
-            return html
-        links = _extract_links(html)
-        if not links:
-            return f"No links found in '{url}'."
-        lines = [f"{link['title']}\t{link['href']}" for link in links]
-        key = f"{url}:links"
-        text = "\n".join(lines)
-        result = self._create_buffer(key, text=text)
-        return f"Extracted {len(links)} link(s) into buffer '{key}'. Read it via `read_buffer`."
-
-    @tool(description="Extract all image src URLs from a URL and store them as lines in a derived buffer (keyed by URL+:images).")
-    def extract_images(self, url: str, timeout: int = 15) -> str:
-        """Fetch a URL, extract image sources, store in a derived buffer."""
-        if not url.startswith(("http://", "https://")):
-            return "Error: URL must start with http:// or https://."
-        html = _fetch_html(url, timeout=timeout)
-        if html.startswith("Error"):
-            return html
-        images = _extract_images(html)
-        if not images:
-            return f"No images found in '{url}'."
-        key = f"{url}:images"
-        text = "\n".join(images)
-        result = self._create_buffer(key, text=text)
-        return f"Extracted {len(images)} image(s) into buffer '{key}'."
-
-    @tool(description="Extract text content of HTML elements matching the CSS selector. Stores each match as a line in a derived buffer (keyed by URL+:selector:{selector}).")
-    def extract_by_selector(self, url: str, selector: str, timeout: int = 15) -> str:
-        """Fetch a URL, extract elements matching CSS selector, store in a derived buffer."""
-        if not url.startswith(("http://", "https://")):
-            return "Error: URL must start with http:// or https://."
-        if not selector.strip():
-            return "Error: selector must not be empty."
-        html = _fetch_html(url, timeout=timeout)
-        if html.startswith("Error"):
-            return html
-        results = _extract_by_selector(html, selector)
-        if not results:
-            return f"No elements matching selector '{selector}' found in '{url}'."
-        key = f"{url}:selector:{selector}"
-        text = "\n".join(results)
-        self._create_buffer(key, text=text)
-        return f"Extracted {len(results)} element(s) into buffer '{key}'. Read it via `read_buffer`."
-
-    @tool
-    def take_screenshot(self, url: str, output_file: str | None = None, timeout: int = 30) -> str:
+    @tool(description="Capture a screenshot of a web page using headless Chrome.")
+    def web_snapshot(self, url: str, output_file: str | None = None, timeout: int = 30) -> str:
         """Capture a screenshot of a web page using headless Chrome."""
         if not url.startswith(("http://", "https://")):
             return "Error: URL must start with http:// or https://."
@@ -269,4 +240,39 @@ class WebNavigator(BufferManager, AgenticObject):
         except Exception as e:
             return f"Error capturing screenshot: {type(e).__name__}: {e}"
 
+    ################################################################################
+    # Parsers
+    ################################################################################
 
+    @tool(description="Web scrape structured data from a buffered HTML page. Pass a tag name (e.g. a, img, div) and optionally an attribute name or list of attribute names to extract. Stores results as line-by-line JSON in a derived buffer.")
+    def web_scrape(self, url: str, tag: str, attr: str | list[str] | None = None) -> str:
+        """Extract structured data from an HTML buffer using a tag name and optional attribute specifier."""
+        if url not in self._buffers:
+            return f"Error: no buffer named '{url}'. Use web_load_raw to load it first."
+        if not tag.strip():
+            return "Error: tag must not be empty."
+        buffer = self._buffers[url]
+        html = "\n".join(entry.data for entry in buffer.lines)
+        records = _web_scrape(html, tag, attr)
+        if not records:
+            return f"No <{tag}> elements found in buffer '{url}'."
+        key = f"{url}:scrape:{tag}"
+        formatted = _format_scrape_output(records)
+        self._create_buffer(key, text=formatted)
+        return f"Extracted {len(records)} <{tag}> element(s) into buffer '{key}'. Read it via `read_buffer`."
+
+    @tool(description="Extract text content of HTML elements matching the CSS selector from a buffered page. Stores each match as a line in a derived buffer (keyed by buffer_name+:selector:{selector}).")
+    def web_extract_by_selector(self, url: str, selector: str) -> str:
+        """Extract elements by CSS selector from an HTML buffer already loaded via web_load_raw."""
+        if url not in self._buffers:
+            return f"Error: no buffer named '{url}'. Use web_load_raw to load it first."
+        if not selector.strip():
+            return "Error: selector must not be empty."
+        buf = self._buffers[url]
+        html = "\n".join(entry.data for entry in buf.lines)
+        results = _extract_by_selector(html, selector)
+        if not results:
+            return f"No elements matching selector '{selector}' found in buffer '{url}'."
+        key = f"{url}:selector:{selector}"
+        self._create_buffer(key, text="\n".join(results))
+        return f"Extracted {len(results)} element(s) into buffer '{key}'. Read it via `read_buffer`."

@@ -16,7 +16,7 @@ class Screenshooter(ImageBufferManager, AgenticObject):
     - You can call the take_screenshoot tool to take a screenshoot and store it into a numby buffer.
     """
 
-    @tool(description="")
+    @tool
     def take_screenshot(self, name: str, region: ImageRegion | None = None) -> str:
         """
         Take a screenshot and store it into a numby buffer.
