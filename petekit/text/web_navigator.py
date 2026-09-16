@@ -261,8 +261,8 @@ class WebNavigator(BufferManager, AgenticObject):
         self._create_buffer(key, text=formatted)
         return f"Extracted {len(records)} <{tag}> element(s) into buffer '{key}'. Read it via `read_buffer`."
 
-    @tool(description="Extract text content of HTML elements matching the CSS selector from a buffered page. Stores each match as a line in a derived buffer (keyed by buffer_name+:selector:{selector}).")
-    def web_extract_by_selector(self, url: str, selector: str) -> str:
+    @tool(description="Extract structured data from HTML elements matching a CSS selector from a buffered page. Pass a CSS selector (e.g. a[href], div.contact) and optionally an attribute name or list of attribute names to extract from each matched element. Stores results as line-by-line JSON in a derived buffer (keyed by buffer_name+:selector:{selector}).")
+    def web_select_css(self, url: str, selector: str, attr: str | list[str] | None = None) -> str:
         """Extract elements by CSS selector from an HTML buffer already loaded via web_load_raw."""
         if url not in self._buffers:
             return f"Error: no buffer named '{url}'. Use web_load_raw to load it first."
@@ -270,9 +270,22 @@ class WebNavigator(BufferManager, AgenticObject):
             return "Error: selector must not be empty."
         buf = self._buffers[url]
         html = "\n".join(entry.data for entry in buf.lines)
-        results = _extract_by_selector(html, selector)
-        if not results:
+        soup = BeautifulSoup(html, "lxml")
+        try:
+            elements = soup.select(selector)
+        except Exception:
+            return f"Error: invalid CSS selector '{selector}'."
+        if not elements:
             return f"No elements matching selector '{selector}' found in buffer '{url}'."
+        records = []
+        for elem in elements:
+            if attr is None:
+                records.append({"text": elem.get_text(strip=True)})
+            elif isinstance(attr, list):
+                records.append({a: elem.get(a, "") for a in attr})
+            else:
+                records.append({attr: elem.get(attr, "")})
         key = f"{url}:selector:{selector}"
-        self._create_buffer(key, text="\n".join(results))
-        return f"Extracted {len(results)} element(s) into buffer '{key}'. Read it via `read_buffer`."
+        formatted = _format_scrape_output(records)
+        self._create_buffer(key, text=formatted)
+        return f"Extracted {len(records)} element(s) into buffer '{key}'. Read it via `read_buffer`."
