@@ -1,4 +1,4 @@
-from petekit.text import TextEditor, WebNavigator
+from petekit.text import TextEditor, WebScraper
 from petekit.stream import (
     StreamBufferManager,
     StreamObserver,
@@ -13,10 +13,12 @@ from petekit.image import (
     CameraObserver,
     Screenshooter,
     DiskImageLoader,
+    WebCapture,
 )
+
 __all__ = [
     "TextEditor",
-    "WebNavigator",
+    "WebScraper",
     "StreamBufferManager",
     "StreamObserver",
     "StreamForwarder",
@@ -28,4 +30,5 @@ __all__ = [
     "CameraObserver",
     "Screenshooter",
     "DiskImageLoader",
+    "WebCapture",
 ]
