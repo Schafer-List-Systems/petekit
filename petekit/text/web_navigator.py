@@ -162,7 +162,7 @@ class WebNavigator(BufferManager, AgenticObject):
             return html
         formatted = _format_for_buffer(html)
         result = self._create_buffer(url, text=formatted)
-        return f"Loaded buffer '{url}' ({result} lines)."
+        return f"Loaded URL into buffer '{url}' ({result} lines). Read it via `read_buffer`."
 
     @tool(description="Render a URL via headless Chrome and store extracted text in a buffer keyed by the URL.")
     def render_url(self, url: str, timeout: int = 30) -> str:
@@ -191,7 +191,7 @@ class WebNavigator(BufferManager, AgenticObject):
         key = f"{url}:links"
         text = "\n".join(lines)
         result = self._create_buffer(key, text=text)
-        return f"Extracted {len(links)} link(s) into buffer '{key}'."
+        return f"Extracted {len(links)} link(s) into buffer '{key}'. Read it via `read_buffer`."
 
     @tool(description="Extract all image src URLs from a URL and store them as lines in a derived buffer (keyed by URL+:images).")
     def extract_images(self, url: str, timeout: int = 15) -> str:
@@ -225,7 +225,7 @@ class WebNavigator(BufferManager, AgenticObject):
         key = f"{url}:selector:{selector}"
         text = "\n".join(results)
         self._create_buffer(key, text=text)
-        return f"Extracted {len(results)} element(s) into buffer '{key}'."
+        return f"Extracted {len(results)} element(s) into buffer '{key}'. Read it via `read_buffer`."
 
     @tool
     def take_screenshot(self, url: str, output_file: str | None = None, timeout: int = 30) -> str:
