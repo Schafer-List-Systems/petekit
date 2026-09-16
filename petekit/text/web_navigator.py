@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import cv2
 import json
 import subprocess
 import tempfile
@@ -13,7 +14,8 @@ from bs4 import BeautifulSoup
 from peteos.oap.agentic_object import AgenticObject
 from peteos.oap.decorators import tool
 
-from .buffer_manager import Buffer, BufferManager
+from .buffer_manager import BufferManager
+from petekit.image.image_buffer_manager import ImageBufferManager
 
 
 def _find_chrome() -> str:
@@ -151,7 +153,7 @@ def _web_scrape(html: str, tag: str, attr: str | list[str] | None = None) -> lis
     return results
 
 
-class WebNavigator(BufferManager, AgenticObject):
+class WebNavigator(BufferManager, ImageBufferManager, AgenticObject):
     """You are a web navigator. You fetch and render web pages into memory buffers.
 
     Workflow:
@@ -169,6 +171,10 @@ class WebNavigator(BufferManager, AgenticObject):
         if self._temp_dir is None:
             self._temp_dir = Path(tempfile.mkdtemp(prefix="web_navigator_"))
         return self._temp_dir
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._temp_dir: Path | None = None
 
     ################################################################################
     # Retrievers
@@ -198,21 +204,13 @@ class WebNavigator(BufferManager, AgenticObject):
         result = self._create_buffer(url, text=formatted)
         return f"Rendered buffer '{url}' ({result} lines)."
 
-    @tool(description="Capture a screenshot of a web page using headless Chrome.")
-    def web_snapshot(self, url: str, output_file: str | None = None, timeout: int = 30) -> str:
-        """Capture a screenshot of a web page using headless Chrome."""
+    @tool(description="Capture a screenshot of a web page using headless Chrome and store it in an image buffer. Pass width and height to override the default 1280x800 viewport size (useful for testing responsive layouts).")
+    def web_snapshot(self, url: str, width: int = 1280, height: int = 800, timeout: int = 30) -> str:
+        """Capture a screenshot of a web page and store it in an image buffer."""
         if not url.startswith(("http://", "https://")):
             return "Error: URL must start with http:// or https://."
 
-        if output_file is None:
-            output_path = self.temp_dir / f"Screenshot_{Path(url).name}.png"
-        else:
-            output_path = Path(output_file).resolve()
-            try:
-                output_path.relative_to(self.temp_dir.resolve() if output_file.startswith("..") else output_path.parent)
-            except ValueError:
-                return f"Error: Output path '{output_file}' is outside the allowed workspace."
-
+        output_path = self.temp_dir / f"Snapshot_{Path(url).name}_{time_mod.time_ns()}.png"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -222,7 +220,7 @@ class WebNavigator(BufferManager, AgenticObject):
                     "--headless=new",
                     "--no-sandbox",
                     f"--screenshot={output_path}",
-                    "--window-size=1280,800",
+                    f"--window-size={width},{height}",
                     "--disable-gpu",
                     f"--timeout-ms={timeout * 1000}",
                     url,
@@ -234,7 +232,13 @@ class WebNavigator(BufferManager, AgenticObject):
             if proc.returncode != 0 or not output_path.is_file():
                 error_detail = (proc.stderr or "Chrome exited unexpectedly").strip()
                 return f"Error capturing screenshot: {error_detail}"
-            return f"Screenshot saved to: {output_path}"
+            image_array = cv2.imread(str(output_path))
+            output_path.unlink()
+            if image_array is None:
+                return f"Error: failed to read screenshot for '{url}'."
+            buffer_name = f"image:snapshot:{url}"
+            self._store_np_buffer(buffer_name, image_array)
+            return f"Stored screenshot for '{url}' in image buffer '{buffer_name}'. Use read_np_buffer to view it."
         except subprocess.TimeoutExpired:
             return f"Error: Screenshot timed out after {timeout} seconds."
         except Exception as e:
