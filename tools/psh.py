@@ -238,6 +238,18 @@ class PSH:
             self._state.ask_confirmation = not self._state.ask_confirmation
             state = "ON" if self._state.ask_confirmation else "OFF"
             print(_c("SHELL", f"Ask for tool confirmation: {state}"))
+        elif cmd == "set_output":
+            if len(parts) < 3:
+                flags = ", ".join(f"{k}={v}" for k, v in self._state.output_flags.items())
+                print(_c("SHELL", f"Output flags: {flags}"))
+            else:
+                key = parts[1].upper()
+                val = parts[2].lower() in ("1", "true", "yes", "on")
+                if key in self._state.output_flags:
+                    self._state.output_flags[key] = val
+                    print(_c("SHELL", f"Output {key}={val}"))
+                else:
+                    print(_c("ERROR", f"Unknown output key: {key}"))
         elif cmd == "agent":
             self._agent_cmd(parts[1:] if len(parts) > 1 else None)
         elif cmd == "help":
@@ -253,6 +265,8 @@ class PSH:
                 "  /agent  show current agent name\n"
                 "  /agent <name>  switch to agent <name>\n"
                 "  /ask_confirmation  toggle tool confirmation\n"
+                "  /set_output  show all output flags\n"
+                "  /set_output <key> <on>  set output flag (on: 1/true/yes/on, off: 0/false/no/off)\n"
                 "  /funcs  list registered functions\n"
                 "  /help   this message\n"
                 "\n"
@@ -375,6 +389,18 @@ class _ShellState:
         self.func_result_queue: queue.Queue[Any] = queue.Queue()
         self._func_registry: dict[str, Callable] = {}
         self._func_seen: set[str] = set()
+        self.output_flags: dict[str, bool] = {
+            "RUN": True,
+            "TOOL": True,
+            "DENY": True,
+            "SESSION": True,
+            "AGENT": True,
+            "SHELL": True,
+            "ERROR": True,
+            "TOOLS": True,
+            "RESULT": True,
+            "READ": True,
+        }
 
 
 def _spawn(name: str, agent_or_cls: Any, agents: dict[str, Any]) -> None:
@@ -414,6 +440,7 @@ def _make_code_globals(agents: dict[str, Any], state) -> dict[str, Any]:
         "ask_confirmation": lambda on: setattr(state, "ask_confirmation", bool(on)),
         "agent": lambda name: setattr(state, "foreground_agent_name", name),
         "session": lambda name: setattr(state, "thread_id", name if name else None),
+        "set_output": lambda key, on: state.output_flags.update({key: bool(on)}),
     }
 
 
@@ -422,7 +449,8 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
         n = getattr(tc, "name", "?") if tc else "?"
         raw = getattr(tc, "raw_dict", None)
         args_str = raw.get("arguments", "{}") if raw else "{}"
-        print(_c("RUN", f"{n}({_fmt_json(args_str)})"))
+        if state.output_flags.get("RUN", True):
+            print(_c("RUN", f"{n}({_fmt_json(args_str)})"))
         if not state.ask_confirmation:
             return
         loop = asyncio.get_running_loop()
@@ -430,19 +458,55 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
             None, lambda: input("  allow? [y/n] ").strip().lower()
         )
         if raw_answer not in ("y", "yes"):
-            print(_c("DENY", n))
+            if state.output_flags.get("DENY", True):
+                print(_c("DENY", n))
             return (False, f"Tool '{n}' denied by user.")
         return None
     return _bte
 
 
-def _ate(runner: Any, tc: Any, res: Any, ok: Any) -> None:
-    n = getattr(tc, "name", "?") if tc else "?"
-    res_str = str(res) if res else ""
-    if ok:
-        print(_c("RET", f"{n} -> {_fmt_json(res_str)}"))
-    else:
-        print(_c("ERR", f"{n}: {_fmt_json(res_str)}"))
+def _make_ate(state: _ShellState) -> Callable[[Any, Any, Any, bool], None]:
+    def _hook(res: Any, tc: Any, s: Any, ok: bool) -> None:
+        n = getattr(tc, "name", "?") if tc else "?"
+        res_str = str(res) if res else ""
+        prefix = "RET" if ok else "ERR"
+        if state.output_flags.get(prefix, True):
+            print(_c(prefix, f"{n} -> {_fmt_json(res_str)}"))
+    return _hook
+
+
+def _make_mappend(state: _ShellState) -> Callable[[Any, Any], None]:
+    def _hook(runner: Any, msg: Any) -> None:
+        printable = getattr(msg, "printable", None)
+        role = getattr(msg, "role", "?").upper()
+        if printable:
+            text = printable()
+            if text and state.output_flags.get("READ", True):
+                print(_c(role, text))
+                return
+        raw = getattr(msg, "content", "")
+        if isinstance(raw, list):
+            if state.output_flags.get("READ", True):
+                print(_c(role, repr(raw)))
+        elif isinstance(raw, str) and raw:
+            if state.output_flags.get("READ", True):
+                print(_c(role, raw))
+    return _hook
+
+
+def _make_done(state: _ShellState) -> Callable[[dict], None]:
+    def _hook(ctx: dict) -> None:
+        r = ctx.get("result")
+        if isinstance(r, Error):
+            if state.output_flags.get("ERROR", True):
+                print(_c("ERROR", r.message))
+        elif r is not None:
+            if state.output_flags.get("RESULT", True):
+                print(_c("RESULT", r if isinstance(r, str) else repr(r)))
+        else:
+            if state.output_flags.get("RESULT", True):
+                print(_c("RESULT", "None"))
+    return _hook
 
 
 def _mappend(runner: Any, msg: Any) -> None:
@@ -558,18 +622,18 @@ def _peteos_worker(
             return await agent.invoke_agent(
                 prompt=prompt,
                 hooks={
-                    "on_tool_call": [lambda ctx: print(_c("TOOL", ctx.get("tool_name", "?")))],
+                    "on_tool_call": [lambda ctx: print(_c("TOOL", ctx.get("tool_name", "?"))) if state.output_flags.get("TOOL", True) else None],
                     "before_tool_execution": [_make_bte(state)],
-                    "after_tool_execution": [_ate],
-                    "after_message_append": [_mappend],
-                    "on_invoke_complete": [_done],
+                    "after_tool_execution": [_make_ate(state)],
+                    "after_message_append": [_make_mappend(state)],
+                    "on_invoke_complete": [_make_done(state)],
                 } if not state.first_invoke else {
                     "before_send_to_chatbot": [lambda runner, ctx: _before_llm(runner, ctx, state)],
-                    "on_tool_call": [lambda ctx: print(_c("TOOL", ctx.get("tool_name", "?")))],
+                    "on_tool_call": [lambda ctx: print(_c("TOOL", ctx.get("tool_name", "?"))) if state.output_flags.get("TOOL", True) else None],
                     "before_tool_execution": [_make_bte(state)],
-                    "after_tool_execution": [_ate],
-                    "after_message_append": [_mappend],
-                    "on_invoke_complete": [_done],
+                    "after_tool_execution": [_make_ate(state)],
+                    "after_message_append": [_make_mappend(state)],
+                    "on_invoke_complete": [_make_done(state)],
                 },
                 persistent_thread_id=state.thread_id,
             )
