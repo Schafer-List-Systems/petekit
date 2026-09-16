@@ -9,6 +9,8 @@ import queue
 import threading
 from typing import Any, Callable
 
+from dataclasses import dataclass
+
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
@@ -37,6 +39,18 @@ TAG_COLORS: dict[str, str] = {
     "SESSION": "\033[96m",
     "HINT": "\033[90m",
 }
+
+
+@dataclass
+class _PromptMsg:
+    text: str
+
+
+@dataclass
+class _FuncCallMsg:
+    fname: str
+    fargs: tuple
+    fkwargs: dict
 
 
 def _c(tag: str, text: str, hook: str = "") -> str:
@@ -102,10 +116,10 @@ class PSH:
         "agents", "spawn", "terminate", "call",
     ], ignore_case=True)
 
-    def __init__(self, agents: dict[str, AgenticObject], prompt_queue: queue.Queue[str | None], result_queue: queue.Queue[Any], state: _ShellState) -> None:
+    def __init__(self, agents: dict[str, AgenticObject], message_queue: queue.Queue, result_queue: queue.Queue[Any], state: _ShellState) -> None:
         super().__init__()
         self._agents = agents
-        self._prompt_queue = prompt_queue
+        self._message_queue = message_queue
         self._result_queue = result_queue
         self._state = state
         self._session = PromptSession(
@@ -164,7 +178,7 @@ class PSH:
                 self._code_once(raw)
             else:
                 if self._state.mode == "agent":
-                    self._prompt_queue.put(raw)
+                    self._message_queue.put(_PromptMsg(raw))
                     try:
                         self._result_queue.get(timeout=300)
                     except queue.Empty:
@@ -181,7 +195,7 @@ class PSH:
             text = "?" + text[2:]
         if not text:
             return
-        self._prompt_queue.put(text)
+        self._message_queue.put(_PromptMsg(text))
         try:
             self._result_queue.get(timeout=300)
         except queue.Empty:
@@ -308,7 +322,7 @@ class PSH:
         elif cmd in self._state._func_registry:
             fname = cmd
             raw_args = parts[1:] if len(parts) > 1 else []
-            self._state.func_queue.put((fname, tuple(raw_args), {}))
+            self._message_queue.put(_FuncCallMsg(fname, tuple(raw_args), {}))
             try:
                 rfname, stdout_val, err_msg, result = self._state.func_result_queue.get(timeout=30)
             except queue.Empty:
@@ -385,7 +399,6 @@ class _ShellState:
         self.code_globals: dict[str, Any] = {}
         self.prompt_queue: queue.Queue[str | None] = queue.Queue()
         self.result_queue: queue.Queue[Any] = queue.Queue()
-        self.func_queue: queue.Queue[tuple[str, tuple, dict]] = queue.Queue()
         self.func_result_queue: queue.Queue[Any] = queue.Queue()
         self._func_registry: dict[str, Callable] = {}
         self._func_seen: set[str] = set()
@@ -555,7 +568,7 @@ def _before_llm(runner: Any, ctx: Any, state: _ShellState) -> None:
 
 def _peteos_worker(
     agents: dict[str, AgenticObject],
-    prompt_queue: queue.Queue[str | None],
+    message_queue: queue.Queue,
     result_queue: queue.Queue[Any],
     state: _ShellState,
 ) -> None:
@@ -582,24 +595,8 @@ def _peteos_worker(
         stdout_val = captured_out.getvalue()
         return stdout_val, (err_msg, result)
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    async def _collect_func_calls() -> tuple[str, tuple, dict] | None:
-        def _get():
-            try:
-                return state.func_queue.get_nowait()
-            except queue.Empty:
-                return None
-        return await asyncio.get_event_loop().run_in_executor(None, _get)
-
-    async def _get_prompt_with_timeout(self_timeout: float) -> str | None:
-        def _blocking_get():
-            try:
-                return prompt_queue.get(timeout=self_timeout)
-            except queue.Empty:
-                return None
-        return await asyncio.get_event_loop().run_in_executor(None, _blocking_get)
+    worker_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(worker_loop)
 
     async def _do_invoke(agent: AgenticObject, prompt: str) -> Any:
         return await agent.invoke_agent(
@@ -623,51 +620,46 @@ def _peteos_worker(
 
     async def _run_loop() -> None:
         while True:
-            func_call = await _collect_func_calls()
-            if func_call is not None:
-                fname, fargs, fkwargs = func_call
-                func = state._func_registry.get(fname)
+            msg = message_queue.get()
+            if msg is None:
+                break  # None = shutdown sentinel, exit loop
+
+            if isinstance(msg, _FuncCallMsg):
+                func = state._func_registry.get(msg.fname)
                 stdout_val = ""
                 err_msg = ""
                 result = None
                 if func is not None:
                     try:
-                        stdout_val, (err_msg, result) = _capture_call(func, fargs, fkwargs)
+                        stdout_val, (err_msg, result) = func(*msg.fargs, **msg.fkwargs)
                     except Exception:
                         import traceback
                         err_msg = traceback.format_exc()
-                    state.func_result_queue.put((fname, stdout_val, err_msg, result))
+                    state.func_result_queue.put((msg.fname, stdout_val, err_msg, result))
                 else:
-                    state.func_result_queue.put((fname, "", f"Unknown function: {fname}", None))
-                continue
+                    state.func_result_queue.put((msg.fname, "", f"Unknown function: {msg.fname}", None))
 
-            raw = await _get_prompt_with_timeout(1.0)
-            if raw is None:
-                continue
-            if raw is None:
-                break
-            prompt = raw.strip()
-            if not prompt:
-                result_queue.put(None)
-                continue
-
-            agent = agents[state.foreground_agent_name]
-
-            try:
-                result = await _do_invoke(agent, prompt)
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                for line in tb.splitlines():
-                    print(_c("ERROR", line))
-                result = None
-            state.first_invoke = False
-            result_queue.put(result)
+            elif isinstance(msg, _PromptMsg):
+                prompt = msg.text.strip()
+                if not prompt:
+                    result_queue.put(None)
+                    continue
+                agent = agents[state.foreground_agent_name]
+                try:
+                    result = await _do_invoke(agent, prompt)
+                except Exception as e:
+                    import traceback
+                    tb = traceback.format_exc()
+                    for line in tb.splitlines():
+                        print(_c("ERROR", line))
+                    result = None
+                state.first_invoke = False
+                result_queue.put(result)
 
     try:
-        loop.run_until_complete(_run_loop())
+        worker_loop.run_until_complete(_run_loop())
     finally:
-        loop.close()
+        worker_loop.close()
 
 
 def _main() -> None:
@@ -686,7 +678,7 @@ def _main() -> None:
     else:
         agents["default"] = _DemoAgent()
 
-    prompt_queue: queue.Queue[str | None] = queue.Queue()
+    message_queue: queue.Queue = queue.Queue()
     result_queue: queue.Queue[Any] = queue.Queue()
     state = _ShellState()
     state.code_globals = _make_code_globals(agents, state)
@@ -695,10 +687,10 @@ def _main() -> None:
     state.code_queue = queue.Queue()
     state.code_result_queue = queue.Queue()
 
-    worker = threading.Thread(target=_peteos_worker, args=(agents, prompt_queue, result_queue, state), daemon=True)
+    worker = threading.Thread(target=_peteos_worker, args=(agents, message_queue, result_queue, state), daemon=True)
     worker.start()
 
-    shell = PSH(agents=agents, prompt_queue=prompt_queue, result_queue=result_queue, state=state)
+    shell = PSH(agents=agents, message_queue=message_queue, result_queue=result_queue, state=state)
 
     rc_candidates = [
         os.path.join(os.getcwd(), ".pshrc"),
@@ -714,7 +706,7 @@ def _main() -> None:
 
     shell.run_shell()
 
-    prompt_queue.put(None)
+    message_queue.put(None)
     worker.join(timeout=5.0)
 
 
