@@ -112,6 +112,10 @@ class PSH:
             history=FileHistory(os.path.join(os.getcwd(), ".psh_history")),
             auto_suggest=AutoSuggestFromHistory(),
         )
+        self._agent_session = PromptSession(
+            history=FileHistory(os.path.join(os.getcwd(), ".psh_agent_history")),
+            auto_suggest=AutoSuggestFromHistory(),
+        )
 
     @property
     def _agent(self) -> AgenticObject:
@@ -120,8 +124,11 @@ class PSH:
     def _prompt_str(self) -> str:
         return "?> " if self._state.mode == "agent" else "!> "
 
+    def _session_for(self, mode: str) -> PromptSession:
+        return self._session if mode == "code" else self._agent_session
+
     def _get_prompt_args(self, mode: str) -> dict[str, Any]:
-        base = {"message": self._prompt_str()}
+        base: dict[str, Any] = {"message": self._prompt_str()}
         if mode == "code":
             base["multiline"] = True
             base["completer"] = self._PYTHON_COMPLETER
@@ -133,9 +140,10 @@ class PSH:
         print(f"{self._TITLE}")
         print("Type /help for commands, /quit to exit.")
         while True:
+            session = self._session_for(self._state.mode)
             args = self._get_prompt_args(self._state.mode)
             try:
-                raw = self._session.prompt(**args)
+                raw = session.prompt(**args)
             except (EOFError, KeyboardInterrupt):
                 print("\n[SHELL] EOF — bye")
                 break
@@ -149,7 +157,7 @@ class PSH:
                 self._state.mode = "agent"
             elif raw == "!":
                 self._state.mode = "code"
-                print(_c("HINT", "Code mode: multiline input — Meta+Enter to execute, Enter for new line"))
+                print(_c("HINT", "Code mode: Enter=newline, Meta+Enter=execute, Alt+F/→=accept word, Ctrl+E=accept full"))
             elif raw.startswith("?"):
                 self._invoke_once(raw)
             elif raw.startswith("!"):
