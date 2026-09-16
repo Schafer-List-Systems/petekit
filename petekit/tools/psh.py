@@ -404,7 +404,7 @@ def _done(ctx: dict) -> None:
     if isinstance(r, Error):
         print(_c("ERROR", r.message))
     elif r is not None:
-        print(_c("RESULT", repr(r)))
+        print(_c("RESULT", r if isinstance(r, str) else repr(r)))
     else:
         print(_c("RESULT", "None"))
 
