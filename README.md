@@ -71,7 +71,11 @@ classDiagram
         <<AgenticObject>>
     }
 
-    class WebNavigator {
+    class WebScraper {
+        <<AgenticObject>>
+    }
+
+    class WebCapture {
         <<AgenticObject>>
     }
 
@@ -110,14 +114,14 @@ classDiagram
 
     %% Text agents
     BufferManager <|-- TextEditor
-    BufferManager <|-- WebNavigator
-    ImageBufferManager <|-- WebNavigator
+    BufferManager <|-- WebScraper
 
     %% Image agents
     NumPyBufferManager <|-- ImageBufferManager
     ImageBufferManager <|-- CameraObserver
     ImageBufferManager <|-- Screenshooter
     ImageBufferManager <|-- DiskImageLoader
+    ImageBufferManager <|-- WebCapture
 ```
 
 - **`BufferManager`** — in-memory text buffers with search, diff, and edit
@@ -125,11 +129,12 @@ classDiagram
 - **`StreamObserver`** — observes streams and surfaces unexpected entries to the agent
 - **`RegexStreamObserver`** — regex-based pattern matchers as conditions for stream rules
 - **`TextEditor`** — file editing backed by a multi-file buffer
-- **`WebNavigator`** — web navigation backed by a buffer
+- **`WebScraper`** — web scraping: fetch and parse web pages into structured buffers
 - **`ImageBufferManager`** — numpy-backed image buffers
 - **`CameraObserver`** — multi-camera observation with buffer management
 - **`Screenshooter`** — screen capture into image buffers
 - **`DiskImageLoader`** — load and save image buffers to and from disk
+- **`WebCapture`** — capture web pages as images and load web images into image buffers
 - **`Basher`** / **`SandboxedBasher`** — shell execution with buffer integration
 
 ## Installation
