@@ -619,8 +619,11 @@ def _peteos_worker(
         )
 
     async def _run_loop() -> None:
+        def _blocking_get():
+            return message_queue.get()
+
         while True:
-            msg = message_queue.get()
+            msg = await asyncio.get_event_loop().run_in_executor(None, _blocking_get)
             if msg is None:
                 break  # None = shutdown sentinel, exit loop
 

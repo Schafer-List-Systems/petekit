@@ -230,5 +230,6 @@ class StreamBufferManager(BufferManager, AgenticObject):
                 if rule.action is not None:
                     await rule.action(entry, name, signal)
         if not any_matched and br.fallback is not None:
-            if br.fallback.action is not None:
-                await br.fallback.action(entry, stream_buffer, {})
+            signal = br.fallback.condition(entry, buf)
+            if signal is not None and br.fallback.action is not None:
+                await br.fallback.action(entry, stream_buffer, signal)
