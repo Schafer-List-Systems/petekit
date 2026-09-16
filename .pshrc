@@ -1,0 +1,46 @@
+"""
+PSHRC -- PeteOS shell boot script.
+Spawns 'Pete', a universal agent composed from all AgenticObject subclasses in petekit.
+"""
+
+from peteos import *
+from petekit import *
+
+# Base classes to skip during composition.
+# These are intermediate or redundant -- the leaf-pruning loop below removes their
+# parent classes from the inheritance set, keeping only the deepest derived classes.
+_BASE_CLASS_BLACKLIST = {"AgenticObject", "AdaptiveObject", "Error", "SandboxedBasher"}
+
+
+def _is_leaf(cls, pool):
+    for other in pool:
+        if cls is other:
+            continue
+        if issubclass(other, cls):
+            return False
+    return True
+
+
+# Collect every AgenticObject subclass exported by the petekit package.
+# Skips items that are not classes (functions, builtins) and the blacklist above.
+_all_agents = [c for _, c in locals().items() if isinstance(c, type) and issubclass(c, AgenticObject) and c.__name__ not in _BASE_CLASS_BLACKLIST]
+
+# Leaf pruning: repeatedly discard any class that is a strict base class of another
+# class in the set. When no class has another class as descendant, only the
+# deepest (leaf) classes remain. These are safe to inherit together without MRO
+# conflicts. The loop converges when no class can be removed anymore.
+_leaves = _all_agents[:]
+while True:
+    _reduced = [c for c in _leaves if _is_leaf(c, _leaves)]
+    if len(_reduced) == len(_leaves):
+        break
+    _leaves = _reduced
+
+# Dynamically create the Pete class from the resolved leaf classes and spawn it.
+# type("Pete", bases, dict) is equivalent to `class Pete(bases): pass`.
+# spawn("pete", Pete()) registers the instance with the shell's agent registry.
+_Pete = type("Pete", tuple(_leaves) + (AgenticObject,), {
+    "__doc__": "Your name is Pete! You are a cautious and concise agent.",
+})
+
+spawn("pete", _Pete())
