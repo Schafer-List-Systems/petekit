@@ -466,7 +466,7 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
 
 
 def _make_ate(state: _ShellState) -> Callable[[Any, Any, Any, bool], None]:
-    def _hook(res: Any, tc: Any, s: Any, ok: bool) -> None:
+    def _hook(runner: Any, tc: Any, res: Any, ok: bool) -> None:
         n = getattr(tc, "name", "?") if tc else "?"
         res_str = str(res) if res else ""
         prefix = "RET" if ok else "ERR"
