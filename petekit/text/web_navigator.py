@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import cv2
 import json
+import numpy as np
 import subprocess
 import tempfile
 import time as time_mod
@@ -243,6 +244,27 @@ class WebNavigator(BufferManager, ImageBufferManager, AgenticObject):
             return f"Error: Screenshot timed out after {timeout} seconds."
         except Exception as e:
             return f"Error capturing screenshot: {type(e).__name__}: {e}"
+
+    @tool(description="Web load an image from a URL into the ImageBufferManager. Fetches the image via HTTP and stores it in an image buffer (keyed by image:url:{url}).")
+    async def web_load_image(self, url: str, runner) -> str:
+        if not url.startswith(("http://", "https://")):
+            return "Error: URL must start with http:// or https://."
+        try:
+            import httpx
+        except ImportError:
+            return "Error: httpx not available."
+        try:
+            resp = httpx.get(url, timeout=10.0)
+            resp.raise_for_status()
+        except Exception as e:
+            return f"Error: failed to fetch '{url}': {e}"
+        nparr = np.frombuffer(resp.content, dtype=np.uint8)
+        arr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if arr is None or arr.size == 0:
+            return f"Error: failed to decode image from '{url}'."
+        buffer_name = f"image:url:{url}"
+        self._store_np_buffer(buffer_name, arr)
+        return f"Loaded image from '{url}' ({arr.shape[1]}x{arr.shape[0]}) into buffer '{buffer_name}'. Use read_np_buffer to view it."
 
     ################################################################################
     # Parsers

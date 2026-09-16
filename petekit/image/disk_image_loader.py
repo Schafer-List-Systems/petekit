@@ -45,21 +45,3 @@ class DiskImageLoader(ImageBufferManager, AgenticObject):
         if not ok:
             return f"Error: cv2.imwrite failed for '{path}'."
         return f"OK: buffer '{buffer_name}' ({array.shape[1]}x{array.shape[0]}) saved to '{path}'."
-
-    @tool(description="Load an image from a URL into the ImageBufferManager as a named buffer. Fetches the image via HTTP, then stores it.")
-    async def load_url_image(self, url: str, buffer_name: str, runner) -> str:
-        try:
-            import httpx
-        except ImportError:
-            return "Error: httpx not available. Install it with: pip install httpx"
-        try:
-            resp = httpx.get(url, timeout=10.0)
-            resp.raise_for_status()
-        except Exception as e:
-            return f"Error: failed to fetch '{url}': {e}"
-        nparr = np.frombuffer(resp.bytes(), dtype=np.uint8)
-        arr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if arr is None or arr.size == 0:
-            return f"Error: failed to decode image from '{url}'."
-        self._store_np_buffer(buffer_name, arr)
-        return f"OK: loaded '{url}' ({arr.shape[1]}x{arr.shape[0]}) into buffer '{buffer_name}'."
