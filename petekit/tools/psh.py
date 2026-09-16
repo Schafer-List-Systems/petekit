@@ -1,12 +1,18 @@
-"""PSH Simple - a line-by-line shell for agentic objects, no prompt_toolkit."""
+"""PSH Simple - a line-by-line shell for agentic objects with prompt_toolkit."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import queue
 import threading
 from typing import Any, Callable
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.history import FileHistory
 
 from peteos import AgenticObject, Error, tool
 
@@ -29,6 +35,7 @@ TAG_COLORS: dict[str, str] = {
     "SYSTEM": "\033[97m",
     "FUNC": "\033[96m",
     "SESSION": "\033[96m",
+    "HINT": "\033[90m",
 }
 
 
@@ -81,12 +88,30 @@ class PSH:
 
     _TITLE = "=== PSH Context ==="
 
+    _PYTHON_COMPLETER = WordCompleter([
+        "and", "as", "assert", "async", "await", "break", "class", "continue",
+        "def", "del", "elif", "else", "except", "finally", "for", "from",
+        "global", "if", "import", "in", "is", "lambda", "not", "or", "pass",
+        "raise", "return", "try", "while", "with", "yield",
+        "True", "False", "None",
+        "print", "len", "range", "list", "dict", "str", "int", "float", "bool",
+        "tuple", "set", "type", "isinstance", "open", "enumerate", "zip",
+        "map", "filter", "sorted", "reversed", "abs", "min", "max", "sum",
+        "any", "all", "round", "getattr", "hasattr", "setattr", "delattr",
+        "exec", "compile", "eval", "dir", "vars", "help", "id", "repr",
+        "agents", "spawn", "terminate", "call",
+    ], ignore_case=True)
+
     def __init__(self, agents: dict[str, AgenticObject], prompt_queue: queue.Queue[str | None], result_queue: queue.Queue[Any], state: _ShellState) -> None:
         super().__init__()
         self._agents = agents
         self._prompt_queue = prompt_queue
         self._result_queue = result_queue
         self._state = state
+        self._session = PromptSession(
+            history=FileHistory(os.path.join(os.getcwd(), ".psh_history")),
+            auto_suggest=AutoSuggestFromHistory(),
+        )
 
     @property
     def _agent(self) -> AgenticObject:
@@ -95,12 +120,22 @@ class PSH:
     def _prompt_str(self) -> str:
         return "?> " if self._state.mode == "agent" else "!> "
 
+    def _get_prompt_args(self, mode: str) -> dict[str, Any]:
+        base = {"message": self._prompt_str()}
+        if mode == "code":
+            base["multiline"] = True
+            base["completer"] = self._PYTHON_COMPLETER
+            base["complete_while_typing"] = True
+            base["prompt_continuation"] = lambda width, ln, soft: ".  "
+        return base
+
     def run_shell(self) -> str:
         print(f"{self._TITLE}")
         print("Type /help for commands, /quit to exit.")
         while True:
+            args = self._get_prompt_args(self._state.mode)
             try:
-                raw = input(self._prompt_str())
+                raw = self._session.prompt(**args)
             except (EOFError, KeyboardInterrupt):
                 print("\n[SHELL] EOF — bye")
                 break
@@ -114,6 +149,7 @@ class PSH:
                 self._state.mode = "agent"
             elif raw == "!":
                 self._state.mode = "code"
+                print(_c("HINT", "Code mode: multiline input — Meta+Enter to execute, Enter for new line"))
             elif raw.startswith("?"):
                 self._invoke_once(raw)
             elif raw.startswith("!"):
