@@ -42,11 +42,12 @@ class StreamObserver(StreamBufferManager, AgenticObject):
         if interval is None or interval <= 0:
             return
 
+        loop = asyncio.get_running_loop()
+
         def _timer_tick() -> None:
             try:
-                loop = asyncio.get_event_loop()
                 loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self._fallback_action(None, stream, {})))
-            except RuntimeError:
+            except Exception:
                 pass
 
         cfg._timer = threading.Timer(interval, _timer_tick)
