@@ -20,7 +20,8 @@ class ReflectionCatalog:
 
 
 class SelfReflector(BufferManager, AgenticObject):
-    """You maintain two buffers listing every member method you can call on self.
+    """You maintain two buffers listing every member method you can call on self,
+    i.e. for each definition `f(...)` in that list, you can call `self.f(...)` from within python.
     - docs:reflect:sandbox — hardcoded @sandbox and @tool methods. Always present. Parse with json.loads.
     - docs:reflect:dynamic — runtime-defined methods. Only present when the define_functions tool is available.
     Consult these buffers before writing Python code so you know which methods are available on self."""
