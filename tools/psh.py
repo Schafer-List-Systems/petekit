@@ -80,6 +80,47 @@ def _fmt_json(s: str) -> str:
         return s
 
 
+def _fmt_tool_args(args_str: str) -> str:
+    """Format tool call arguments with nested JSON in string values expanded.
+
+    Outer layer: JSON object (dict) parsed and formatted as key = value pairs.
+    Nested layer: string values that are themselves valid JSON are parsed and
+    pretty-printed as sub-blocks.
+    String values that are not JSON are shown raw.
+    """
+    try:
+        args = json.loads(args_str)
+    except (json.JSONDecodeError, TypeError):
+        return args_str
+
+    if not isinstance(args, dict):
+        return json.dumps(args, ensure_ascii=False, indent=2)
+
+    if not args:
+        return "()"
+
+    lines: list[str] = []
+    for key, val in args.items():
+        if isinstance(val, str):
+            try:
+                nested = json.loads(val)
+                nested_str = json.dumps(nested, ensure_ascii=False, indent=4)
+                indented = "\n".join("      " + ln for ln in nested_str.splitlines())
+                lines.append(f"  {key} =\n{indented}")
+            except (json.JSONDecodeError, TypeError):
+                if "\n" in val:
+                    indented = "\n".join("      " + ln for ln in val.splitlines())
+                    lines.append(f"  {key} =\n{indented}")
+                else:
+                    lines.append(f"  {key} = {val}")
+        else:
+            formatted = json.dumps(val, ensure_ascii=False, indent=2)
+            indented = "\n".join("      " + ln for ln in formatted.splitlines())
+            lines.append(f"  {key} =\n{indented}")
+
+    return "(\n" + "\n".join(lines) + "\n)"
+
+
 class PSH:
     """A simple line-by-line shell wrapping a Peteos AgenticObject.
 
@@ -457,7 +498,7 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
         raw = getattr(tc, "raw_dict", None)
         args_str = raw.get("arguments", "{}") if raw else "{}"
         if state.output_flags.get("RUN", True):
-            print(_c("RUN", f"{n}({_fmt_json(args_str)})"))
+            print(_c("RUN", f"{n}{_fmt_tool_args(args_str)}"))
         if not state.ask_confirmation:
             return
         loop = asyncio.get_running_loop()
@@ -478,7 +519,7 @@ def _make_ate(state: _ShellState) -> Callable[[Any, Any, Any, bool], None]:
         res_str = str(res) if res else ""
         prefix = "RET" if ok else "ERR"
         if state.output_flags.get(prefix, True):
-            print(_c(prefix, f"{n} -> {_fmt_json(res_str)}"))
+            print(_c(prefix, f"{n} -> {_fmt_tool_args(res_str)}"))
     return _hook
 
 
