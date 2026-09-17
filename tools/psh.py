@@ -179,10 +179,7 @@ class PSH:
             else:
                 if self._state.mode == "agent":
                     self._message_queue.put(_PromptMsg(raw))
-                    try:
-                        self._result_queue.get(timeout=300)
-                    except queue.Empty:
-                        print(_c("ERROR", "Timed out waiting for agent response"))
+                    self._result_queue.get()
                 else:
                     self._code_once_raw(raw)
         return "Shell closed."
@@ -196,10 +193,7 @@ class PSH:
         if not text:
             return
         self._message_queue.put(_PromptMsg(text))
-        try:
-            self._result_queue.get(timeout=300)
-        except queue.Empty:
-            print(_c("ERROR", "Timed out waiting for agent response"))
+        self._result_queue.get()
 
     def _code_once(self, raw: str) -> None:
         if len(raw) < 2:
