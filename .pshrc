@@ -39,11 +39,21 @@ while True:
 # Dynamically create the Pete class from the resolved leaf classes and spawn it.
 # type("Pete", bases, dict) is equivalent to `class Pete(bases): pass`.
 # spawn("pete", Pete()) registers the instance with the shell's agent registry.
-_Pete = type("Pete", tuple(_leaves) + (AgenticObject,), {
-    "__doc__": "Your name is Pete! You are a cautious and concise agent.",
-})
+_Pete = agentic_object(invoke_sub_agents=True, allow_code_execution=True, define_functions=True)(
+    type("Pete", tuple(_leaves) + (AdaptiveObject,), {
+        "__doc__": "Your name is Pete! You are a cautious and concise agent.",
+    })
+)
 
+# make the agent available in the AGENT mode
 spawn("pete", _Pete())
+
+# switch to the pete agent
 agent("pete")
+
+# make sure to ask for confirmation
 ask_confirmation(True)
+
+# this is shown in the RUN output, anyway
+set_output("TOOL", False)
 
