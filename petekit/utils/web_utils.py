@@ -8,6 +8,8 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
+from petekit.utils.text_formatters import format_dict_list_for_buffer
+
 
 def _find_chrome() -> str:
     for binary in ("google-chrome", "chromium-browser", "chromium"):
@@ -98,14 +100,6 @@ def _format_for_buffer(content: str) -> str:
         pass
 
     return content
-
-
-def _format_scrape_output(records: list[dict]) -> str:
-    """Format a list of dicts as a line-by-line JSON array."""
-    if not records:
-        return "[]"
-    json_lines = [json.dumps(r) for r in records]
-    return "[\n" + ",\n".join(json_lines) + "\n]"
 
 
 def _web_scrape(html: str, tag: str, attr: str | list[str] | None = None) -> list[dict]:

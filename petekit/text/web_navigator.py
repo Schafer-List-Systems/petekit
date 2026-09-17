@@ -12,10 +12,10 @@ from peteos.oap.decorators import tool
 from petekit.utils.web_utils import (
     _fetch_html,
     _format_for_buffer,
-    _format_scrape_output,
     _render_chrome,
     _web_scrape,
 )
+from petekit.utils.text_formatters import format_dict_list_for_buffer
 
 from .buffer_manager import BufferManager
 
@@ -78,7 +78,7 @@ class WebScraper(BufferManager, AgenticObject):
         if not records:
             return f"No <{tag}> elements found in buffer '{url}'."
         key = f"{url}:scrape:{tag}"
-        formatted = _format_scrape_output(records)
+        formatted = format_dict_list_for_buffer(records)
         self._create_buffer(key, text=formatted)
         return f"Extracted {len(records)} <{tag}> element(s) into buffer '{key}'. Read it via `read_buffer`."
 
@@ -107,6 +107,6 @@ class WebScraper(BufferManager, AgenticObject):
             else:
                 records.append({attr: elem.get(attr, "")})
         key = f"{url}:selector:{selector}"
-        formatted = _format_scrape_output(records)
+        formatted = format_dict_list_for_buffer(records)
         self._create_buffer(key, text=formatted)
         return f"Extracted {len(records)} element(s) into buffer '{key}'. Read it via `read_buffer`."
