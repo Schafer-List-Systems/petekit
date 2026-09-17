@@ -15,6 +15,7 @@ from petekit.image import (
     DiskImageLoader,
     WebCapture,
 )
+from petekit.reflection import SelfReflector
 
 __all__ = [
     "TextEditor",
@@ -31,4 +32,5 @@ __all__ = [
     "Screenshooter",
     "DiskImageLoader",
     "WebCapture",
+    "SelfReflector",
 ]
