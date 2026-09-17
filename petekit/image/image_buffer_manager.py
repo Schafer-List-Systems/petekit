@@ -46,9 +46,9 @@ class ImageBufferManager(NumPyBufferManager, AgenticObject):
         self, name: str, runner, region: ImageRegion | None = None, auto_zoom: bool = True
     ) -> str:
         """Read a buffer (or region) and send it to the LLM. Returns a hint; the LLM sees the image directly."""
-        if name not in self._buffers:
+        if name not in self._numpy_buffers:
             return f"Error: no buffer named '{name}'. Use copy_np_buffer or an inheriting agent to create it."
-        buf = self._buffers[name]
+        buf = self._numpy_buffers[name]
         array = buf.array
 
         if region is None:

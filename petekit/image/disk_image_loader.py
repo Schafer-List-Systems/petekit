@@ -35,9 +35,9 @@ class DiskImageLoader(ImageBufferManager, AgenticObject):
 
     @tool(description="Save a named image buffer from the ImageBufferManager to a disk file. Pass the buffer name and the full destination path. Overwrites the file if it exists.")
     def save_image(self, buffer_name: str, path: str) -> str:
-        if buffer_name not in self._buffers:
+        if buffer_name not in self._numpy_buffers:
             return f"Error: no buffer named '{buffer_name}'. Use list_np_buffers to see available buffers."
-        array = self._buffers[buffer_name].array
+        array = self._numpy_buffers[buffer_name].array
         p = Path(path)
         if p.suffix.lower() not in self._SUPPORTED_EXTENSIONS:
             return f"Error: unsupported format '{p.suffix}'. Supported: {', '.join(sorted(self._SUPPORTED_EXTENSIONS))}"
