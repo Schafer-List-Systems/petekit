@@ -82,13 +82,7 @@ class BufferManager(AgenticObject):
     def _refresh_buffers_buffer(self) -> None:
         records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
         text = format_dict_list_for_buffer(records)
-        if "system:list:buffers" not in self._buffers:
-            self._create_buffer("system:list:buffers", text=text)
-        else:
-            self._buffers["system:list:buffers"].lines = [
-                BufferEntry(data=line, timestamp=time.time(), seen=True) for line in text.splitlines()
-            ]
-            self._buffers["system:list:buffers"].modified_at = time.time()
+        self._create_buffer("system:list:buffers", text=text, overwrite=True)
 
     def _create_buffer(self, name: str, text: str | None = None, modified_at: float | None = None, overwrite: bool = False) -> int | None:
         """Internal buffer creation. Returns number of lines stored, or None if buffer exists and overwrite=False."""

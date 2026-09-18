@@ -8,9 +8,8 @@ import time
 from dataclasses import dataclass
 
 from peteos.oap.agentic_object import AgenticObject
-from peteos.oap.decorators import tool
-
-from .stream_buffer_manager import StreamBufferManager
+from peteos.oap.decorators import sandbox, tool
+from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buffer
 
 
 @dataclass
@@ -46,6 +45,7 @@ class Basher(StreamBufferManager, AgenticObject):
         super().__init__(**kwargs)
         self._processes: dict[int, BashHandle] = {}
         self._bash_buffer_counter: int = 0
+        self._refresh_bash_processes_buffer()
 
     def _next_buffer_name(self) -> str:
         self._bash_buffer_counter += 1
@@ -54,6 +54,26 @@ class Basher(StreamBufferManager, AgenticObject):
     def _next_process_id(self) -> int:
         self._bash_buffer_counter += 1
         return self._bash_buffer_counter
+
+    def _refresh_bash_processes_buffer(self) -> None:
+        records = self.list_processes()
+        text = format_dict_list_for_buffer(records)
+        self.create_buffer("system:list:bash_processes", text=text, overwrite=True)
+
+    @sandbox
+    def list_processes(self) -> list[dict]:
+        """List all running processes with their details."""
+        return [
+            {
+                "process_id": process_id,
+                "title": h.title,
+                "command": h.command,
+                "cwd": h.cwd,
+                "running": not h.closed,
+                "exit_code": h.exit_code,
+            }
+            for process_id, h in sorted(self._processes.items())
+        ]
 
     @tool
     async def exec(self, title: str, command: str, cwd: str | None = None) -> str:
@@ -75,9 +95,9 @@ class Basher(StreamBufferManager, AgenticObject):
         stdin_buffer = f"stream:bash:stdin:{process_id}"
         stdout_buffer = f"stream:bash:stdout:{process_id}"
         stderr_buffer = f"stream:bash:stderr:{process_id}"
-        self._create_stream(stdin_buffer)
-        self._create_stream(stdout_buffer)
-        self._create_stream(stderr_buffer)
+        self.create_buffer(stdin_buffer, stream=True)
+        self.create_buffer(stdout_buffer, stream=True)
+        self.create_buffer(stderr_buffer, stream=True)
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -88,9 +108,9 @@ class Basher(StreamBufferManager, AgenticObject):
                 cwd=cwd,
             )
         except Exception as e:
-            self._drop_stream(stdin_buffer)
-            self._drop_stream(stdout_buffer)
-            self._drop_stream(stderr_buffer)
+            self.drop_buffer(stdin_buffer)
+            self.drop_buffer(stdout_buffer)
+            self.drop_buffer(stderr_buffer)
             raise RuntimeError(f"Failed to start process: {e}") from e
 
         handle = BashHandle(
@@ -105,27 +125,13 @@ class Basher(StreamBufferManager, AgenticObject):
         )
         self._processes[process_id] = handle
         handle.task = asyncio.create_task(self._bash_read_loop(handle))
+        self._refresh_bash_processes_buffer()
         return (
             f"Started process [{process_id}] '{title}': {command}. "
             f"Streams created at {now}. "
             f"stdin='{stdin_buffer}', stdout='{stdout_buffer}', stderr='{stderr_buffer}'. "
             f"Use list_processes to track, terminate to stop."
         )
-
-    @tool
-    def list_processes(self) -> list[dict]:
-        """List all running processes with their details."""
-        return [
-            {
-                "process_id": process_id,
-                "title": h.title,
-                "command": h.command,
-                "cwd": h.cwd,
-                "running": not h.closed,
-                "exit_code": h.exit_code,
-            }
-            for process_id, h in sorted(self._processes.items())
-        ]
 
     @tool
     async def bash_send(self, process_id: int, text: str = "", flush: bool = False, trailing_newline: bool = False) -> str:
@@ -157,6 +163,7 @@ class Basher(StreamBufferManager, AgenticObject):
         if process_id not in self._processes:
             raise KeyError(f"No process with id '{process_id}'.")
         handle = self._processes.pop(process_id)
+        self._refresh_bash_processes_buffer()
         if handle.task:
             handle.task.cancel()
         if handle.process and handle.process.returncode is None:
@@ -170,9 +177,9 @@ class Basher(StreamBufferManager, AgenticObject):
         handle.closed = True
         handle.exit_code = handle.process.returncode if handle.process else None
         if drop_buffers:
-            self._drop_stream(handle.stdin_buffer)
-            self._drop_stream(handle.stdout_buffer)
-            self._drop_stream(handle.stderr_buffer)
+            self.drop_buffer(handle.stdin_buffer)
+            self.drop_buffer(handle.stdout_buffer)
+            self.drop_buffer(handle.stderr_buffer)
             return (
                 f"Terminated process [{handle.process_id}] '{handle.title}': {handle.command} "
                 f"(exit_code={handle.exit_code}). Dropped buffers."
