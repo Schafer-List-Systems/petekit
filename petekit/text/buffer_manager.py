@@ -64,7 +64,7 @@ class BufferManager(AgenticObject):
     - Read the "system:list:buffers" buffer to see what exists. Drop unused buffers when it becomes messy!
     - Line indices are 0-based, just like Python array indexing.
       Example: buf[0] is the first line, buf[-1] is the last line, buf[0:5] is the first 5 lines.
-    - Ranges use [start, end) semantics: start is included, end is excluded. end=None means "to the end".
+    - Ranges use [start, end) semantics: start is included, end is excluded. Omit end to read to the end of the buffer.
     - Use (?i) at the start of a grep pattern for case-insensitive matching.
     - Always prefer read_buffer with start/end over reading entire buffers when working with large content.
     - All timestamps are rounded to 6 decimals.
@@ -126,7 +126,7 @@ class BufferManager(AgenticObject):
         """Overwrite the text in the range [start, end) of a buffer.
         To overwrite the whole buffer, pass start=0.
         To insert at line N: pass start=N and end=N.
-        To append: pass start=None and end=None — appends after the last line.
+        Omit both start and end to append after the last line.
         """
         if name not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{name}'. Use create_buffer first."}

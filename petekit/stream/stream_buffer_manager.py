@@ -193,7 +193,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         """Overwrite the text in the range [start, end) of a buffer.
         To overwrite the whole buffer, pass start=0.
         To insert at line N: pass start=N and end=N.
-        To append: pass start=None and end=None — appends after the last line.
+        Omit both start and end to append after the last line.
         Write-mode for streams is append-only.
         After appending, all registered hooks are fired once per batch."""
         
@@ -228,7 +228,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         hook: Callable[[str, str, dict[str, Any]], None] | Callable[[str, str, dict[str, Any]], Coroutine[Any, Any, None]] | None = None,
         priority: int = 0,
     ) -> dict[str, Any]:
-        """Set or remove a named hook on a stream. Set hook to a callable to register; pass hook=None to remove the named hook. The hook is called with (stream_buffer, text, metadata) after every write. Higher priority fires first. Both async and sync callables are supported."""
+        """Set or remove a named hook on a stream. Set hook to a callable to register; omit hook to remove the named hook. The hook is called with (stream_buffer, text, metadata) after every write. Higher priority fires first. Both async and sync callables are supported."""
         if stream_buffer not in self.stream_buffer_configs:
             return {"ok": False, "error": f"no stream named '{stream_buffer}'", "stream_buffer": stream_buffer}
         if hook is None:
