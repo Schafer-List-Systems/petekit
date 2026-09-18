@@ -56,10 +56,10 @@ def _fmt_ts(ts: float, round_up: bool = False) -> str:
 
 
 class StreamBufferManager(BufferManager, AgenticObject):
-    """
-    - You can read buffers via read_buffer with int (line-based) or float (time-based) start/end.
-      - Float start/end values trigger time-based reading on stream buffers.
-      - Timestamps in skip/bucket messages are rounded to 6 decimal places.
+    """Some of you buffers are special: they are streams.
+    - You can access stream buffers with float (time-based) start/end arguments. Naturally, writing is append-only.
+    - Float start/end values trigger time-based reading on stream buffers. Example: start=-10.0 means to see the last 10 seconds.
+    - Timestamps in skip/bucket messages are rounded to 6 decimal places.
     - The buffers "system:list:stream_buffers" and "system:list:stream_buffer_hooks"
       are always up to date with all current stream buffers and their hooks including metadata.
     - Hooks in "system:list:stream_buffer_hooks" are grouped by stream and fire in the order they appear (priority descending, highest first).
@@ -155,7 +155,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         """Read a range of lines from a buffer.
         Float values trigger time-based reading on stream buffers (int for line-based).
         Negative floats (e.g. -60.0) are relative to the last entry: -60.0 means '60s ago'.
-        Set show_timestamps=True to prefix each line with its unix timestamp.
+        Set show_timestamps=True to prefix each line with its timestamp.
         Returns a dict with ok/error or ok/content on success.
         Set raw=True to get the raw string instead of a dict — errors always return dict."""
         time_based = isinstance(start, float) or isinstance(end, float)

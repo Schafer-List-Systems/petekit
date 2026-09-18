@@ -23,7 +23,8 @@ class ConnectionHandle:
 
 
 class Connector(StreamBufferManager, AgenticObject):
-    """You manage network connections.
+    """You manage long standing TCP/IP sockets. As usual: communication via stream buffers.
+    - Use connect and disconnect to open / close a connection.
     - The buffer "system:list:connections" is always up to date with all current connections."""
 
     def __init__(self, **kwargs) -> None:
