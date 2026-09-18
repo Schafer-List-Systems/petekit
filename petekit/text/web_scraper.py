@@ -48,7 +48,7 @@ class WebScraper(BufferManager, AgenticObject):
         if html.startswith("Error"):
             return {"ok": False, "error": html}
         formatted = _format_for_buffer(html)
-        result = self._create_buffer(url, text=formatted)
+        result = self.create_buffer(url, text=formatted)
         return {"ok": True, "buffer": url, "lines": result}
 
     @tool(description="Render a URL via headless Chrome and store extracted text in a buffer keyed by the URL.")
@@ -60,7 +60,7 @@ class WebScraper(BufferManager, AgenticObject):
         if html.startswith("Error"):
             return {"ok": False, "error": html}
         formatted = _format_for_buffer(html)
-        result = self._create_buffer(url, text=formatted)
+        result = self.create_buffer(url, text=formatted)
         return {"ok": True, "buffer": url, "lines": result}
 
     ################################################################################
@@ -81,7 +81,7 @@ class WebScraper(BufferManager, AgenticObject):
             return {"ok": True, "found": False, "buffer": url, "tag": tag}
         key = f"{url}:scrape:{tag}"
         formatted = format_dict_list_for_buffer(records)
-        self._create_buffer(key, text=formatted)
+        self.create_buffer(key, text=formatted)
         return {"ok": True, "buffer": key, "count": len(records), "tag": tag}
 
     @tool(description="Extract structured data from HTML elements matching a CSS selector from a buffered page. Pass a CSS selector (e.g. a[href], div.contact) and optionally an attribute name or list of attribute names to extract from each matched element. Stores results as line-by-line JSON in a derived buffer (keyed by buffer_name+:selector:{selector}).")
@@ -110,5 +110,5 @@ class WebScraper(BufferManager, AgenticObject):
                 records.append({attr: elem.get(attr, "")})
         key = f"{url}:selector:{selector}"
         formatted = format_dict_list_for_buffer(records)
-        self._create_buffer(key, text=formatted)
+        self.create_buffer(key, text=formatted)
         return {"ok": True, "buffer": key, "count": len(records), "selector": selector}

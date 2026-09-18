@@ -124,7 +124,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
     def _refresh_stream_buffers_buffer(self) -> None:
         """Refresh the system:list:stream_buffers buffer, one JSON dict per line."""
         text = format_dict_list_for_buffer(self.list_stream_buffers())
-        self._create_buffer("system:list:stream_buffers", text=text, overwrite=True)
+        self.create_buffer("system:list:stream_buffers", text=text, overwrite=True)
 
     def _refresh_stream_buffer_hooks(self) -> None:
         """Refresh the system:list:stream_buffer_hooks buffer with all hook states."""
@@ -141,7 +141,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         ]
         records.sort(key=lambda r: (r["stream"], -r["priority"]))
         text = format_dict_list_for_buffer(records)
-        self._create_buffer("system:list:stream_buffer_hooks", text=text, overwrite=True)
+        self.create_buffer("system:list:stream_buffer_hooks", text=text, overwrite=True)
 
     def _resolve_time(self, ts: float, anchor: float) -> float:
         """Resolve a relative (negative) or absolute float timestamp to an absolute one.

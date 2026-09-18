@@ -48,10 +48,10 @@ class TextEditor(BufferManager, AgenticObject):
             mtime = os.path.getmtime(abs_path)
             self.expected_file_state[abs_path] = ExpectedFileData(mtime=mtime, content=content.splitlines())
             key = f"file:{abs_path}"
-            count = self._create_buffer(key, text=content, modified_at=mtime, overwrite=overwrite_internal_buffer)
-            if count is None:
-                return {"ok": False, "error": f"Buffer 'file:{abs_path}' already exists. Use overwrite_internal_buffer=True to replace it."}
-            return {"ok": True, "buffer": key, "lines": count}
+            result = self.create_buffer(key, text=content, overwrite=overwrite_internal_buffer)
+            if not result.get("ok"):
+                return result
+            return {"ok": True, "buffer": key, "lines": result.get("lines", 0)}
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -191,5 +191,5 @@ class TextEditor(BufferManager, AgenticObject):
         import time as time_mod
         now = time_mod.time()
         diff_text = "\n".join(diff_lines)
-        self._create_buffer(diff_name, text=diff_text, modified_at=now)
+        self.create_buffer(diff_name, text=diff_text)
         return {"ok": True, "diff_buffer": diff_name, "lines": len(diff_lines)}

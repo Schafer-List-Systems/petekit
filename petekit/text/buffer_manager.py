@@ -82,19 +82,7 @@ class BufferManager(AgenticObject):
     def _refresh_buffers_buffer(self) -> None:
         records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
         text = format_dict_list_for_buffer(records)
-        self._create_buffer("system:list:buffers", text=text, overwrite=True)
-
-    def _create_buffer(self, name: str, text: str | None = None, modified_at: float | None = None, overwrite: bool = False) -> int | None:
-        """Internal buffer creation. Returns number of lines stored, or None if buffer exists and overwrite=False."""
-        ts = modified_at if modified_at is not None else time.time()
-        if name in self._buffers:
-            if not overwrite:
-                return None
-        self._buffers[name] = Buffer(lines=[], created_at=ts, modified_at=ts)
-        if text is None:
-            return 0
-        self._buffers[name].lines = [BufferEntry(data=line, timestamp=ts, seen=True) for line in text.splitlines()]
-        return len(self._buffers[name].lines)
+        self.create_buffer("system:list:buffers", text=text, overwrite=True)
 
     @tool
     def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False) -> dict[str, Any]:
@@ -102,15 +90,18 @@ class BufferManager(AgenticObject):
         Optionally provide initial text.
         Use overwrite=True to replace an existing buffer.
         """
-        existed = name in self._buffers
-        result = self._create_buffer(name, text, overwrite=overwrite)
-        if result is None:
+        if name in self._buffers and not overwrite:
             return {"ok": False, "error": f"Buffer '{name}' already exists. Use overwrite=True to replace it."}
+        ts = time.time()
+        existed = name in self._buffers
+        self._buffers[name] = Buffer(lines=[], created_at=ts, modified_at=ts)
+        lines = 0
+        if text:
+            self._buffers[name].lines = [BufferEntry(data=line, timestamp=ts, seen=True) for line in text.splitlines()]
+            lines = len(self._buffers[name].lines)
         if name != "system:list:buffers":
             self._refresh_buffers_buffer()
-        if existed:
-            return {"ok": True, "overwritten": True, "lines": result}
-        return {"ok": True, "created": True, "lines": result}
+        return {"ok": True, "created": not existed, "overwritten": existed, "lines": lines}
 
     @tool
     def copy_buffer(self, source_name: str, target_name: str, overwrite: bool = False) -> dict[str, Any]:

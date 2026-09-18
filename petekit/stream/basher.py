@@ -59,7 +59,7 @@ class Basher(StreamBufferManager, AgenticObject):
     def _refresh_bash_processes_buffer(self) -> None:
         records = self.list_processes()
         text = format_dict_list_for_buffer(records)
-        self._create_buffer("system:list:bash_processes", text=text, overwrite=True)
+        self.create_buffer("system:list:bash_processes", text=text, overwrite=True)
 
     @sandbox
     def list_processes(self) -> list[dict]:

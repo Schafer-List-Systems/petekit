@@ -34,7 +34,7 @@ class Connector(StreamBufferManager, AgenticObject):
     def _refresh_connections_buffer(self) -> None:
         records = self.list_connections()
         text = format_dict_list_for_buffer(records)
-        self._create_buffer("system:list:connections", text=text, overwrite=True)
+        self.create_buffer("system:list:connections", text=text, overwrite=True)
 
     @tool
     async def connect(self, name: str, host: str, port: int, ssl: bool = False) -> dict[str, Any]:
