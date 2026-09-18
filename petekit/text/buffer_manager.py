@@ -59,7 +59,6 @@ class Buffer:
 
 class BufferManager(AgenticObject):
     """You are a buffer manager. You hold multiple named buffers, each a list of lines in memory.
-
     - You can create, write, search, read ranges from, and edit any named buffer.
     - Read the "system:list:buffers" buffer to see what exists. Drop unused buffers when it becomes messy!
     - Line indices are 0-based, just like Python array indexing.

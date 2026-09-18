@@ -14,7 +14,6 @@ from .image_buffer_manager import ImageBufferManager
 
 class DiskImageLoader(ImageBufferManager, AgenticObject):
     """You are a disk image loader. You load images from disk into the ImageBufferManager and save buffers to disk.
-
     Only use this when you need to read from disk or write to disk.
     """
 

@@ -18,7 +18,6 @@ from petekit.utils.web_utils import _CHROME_BIN
 
 class WebCapture(ImageBufferManager, AgenticObject):
     """You are a web capture agent. You capture web pages as images and load web images into image buffers.
-
     Use web_snapshot to take a screenshot of a URL.
     Use web_load_image to load an image from a URL into an image buffer.
     """

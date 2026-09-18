@@ -24,7 +24,6 @@ class ExpectedFileData:
 
 class TextEditor(BufferManager, AgenticObject):
     """You are a text editor. You load files into memory, edit them, and write them back.
-
     Workflow:
       1. load_text(file_path) — load a file into a buffer (keyed by its path)
       2. read_buffer(...) — read a line range

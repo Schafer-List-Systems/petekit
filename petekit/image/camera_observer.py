@@ -13,9 +13,8 @@ from .image_buffer_manager import ImageBufferManager
 
 class CameraObserver(ImageBufferManager, AgenticObject):
     """You are an observer with access to cameras.
-
-    Only one camera can be open at a time. grab_image stores frames in ImageBufferManager.
-    Use read_np_buffer to send a captured frame to the LLM for reasoning.
+    - Only one camera can be open at a time. grab_image stores frames in ImageBufferManager.
+    - Use read_np_buffer to send a captured frame to the LLM for reasoning.
     """
 
     def __init__(

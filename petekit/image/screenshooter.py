@@ -12,8 +12,7 @@ from .image_buffer_manager import ImageBufferManager, ImageRegion
 
 
 class Screenshooter(ImageBufferManager, AgenticObject):
-    """
-    - You can call the take_screenshoot tool to take a screenshoot and store it into a numby buffer.
+    """You can call the take_screenshoot tool to take a screenshoot and store it into a numby buffer.
     """
 
     @tool

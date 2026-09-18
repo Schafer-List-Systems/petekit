@@ -19,7 +19,6 @@ class NumPyBuffer:
 
 class NumPyBufferManager(AgenticObject):
     """You are a NumPy buffer manager. You hold multiple named buffers, each a NumPy array in memory.
-
     - You can list, copy, and drop any named buffer.
     - Use list_np_buffers to see what exists.
     - All buffers are stored as true NumPy arrays with no copy-by-reference risk.

@@ -31,15 +31,13 @@ class BashHandle:
 
 class Basher(StreamBufferManager, AgenticObject):
     """You are a bash agent with access to the filesystem and shell commands.
+    - Commands are executed in the current working directory.
+      Output from bash commands is stored in stream buffers and must be retrieved with
+      read_buffer or read_stream_buffer.
 
-    Commands are executed in the current working directory. Output from
-    bash commands is stored in stream buffers and must be retrieved with
-    read_buffer or read_stream_buffer.
-
-    Use exec to run a command in the background with live stream buffers.
-    Use bash_exec for one-shot synchronous command execution.
-    Use put_file to stage a file into a buffer, then write it to disk.
-    Use get_file to read file contents back.
+    - Use bash_exec to run a command in the background with live stream buffers.
+    - Use put_file to stage a file into a buffer, then write it to disk.
+    - Use get_file to read file contents back.
     """
 
     def __init__(self, **kwargs) -> None:
@@ -77,7 +75,7 @@ class Basher(StreamBufferManager, AgenticObject):
         ]
 
     @tool
-    async def exec(self, title: str, command: str, cwd: str | None = None) -> dict[str, Any]:
+    async def bash_exec(self, title: str, command: str, cwd: str | None = None) -> dict[str, Any]:
         """Start a command in the background, creating live in/out stream buffers.
 
         Args:
