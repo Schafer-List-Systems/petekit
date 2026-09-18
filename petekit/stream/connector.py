@@ -2,8 +2,8 @@ import asyncio
 import time
 from dataclasses import dataclass
 
-from peteos import AgenticObject, tool
-from .stream_buffer_manager import StreamBufferManager
+from peteos import AgenticObject, sandbox, tool
+from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buffer
 
 
 @dataclass
@@ -22,11 +22,18 @@ class ConnectionHandle:
 
 
 class Connector(StreamBufferManager, AgenticObject):
-    """You manage network connections."""
+    """You manage network connections.
+    - The buffer "system:list:connections" is always up to date with all current connections."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.connections: dict[str, ConnectionHandle] = {}
+        self._refresh_connections_buffer()
+
+    def _refresh_connections_buffer(self) -> None:
+        records = self.list_connections()
+        text = format_dict_list_for_buffer(records)
+        self._create_buffer("system:list:connections", text=text, overwrite=True)
 
     @tool
     async def connect(self, name: str, host: str, port: int, ssl: bool = False) -> str:
@@ -49,6 +56,11 @@ class Connector(StreamBufferManager, AgenticObject):
         except KeyError:
             self.drop_buffer(in_buffer)
             raise
+        self._set_stream_on_append_hook(
+            out_buffer,
+            name="connection_send",
+            hook=lambda s, t, m: self._connection_send_hook(name, t),
+        )
 
         try:
             reader, writer = await asyncio.open_connection(host, port, ssl=ssl)
@@ -65,13 +77,14 @@ class Connector(StreamBufferManager, AgenticObject):
         )
         self.connections[name] = handle
         handle.task = asyncio.create_task(self._read_loop(name, handle))
+        self._refresh_connections_buffer()
         return (
             f"Connected to {host}:{port} (ssl={ssl}) as '{name}'. "
             f"Streams created at {now}. "
             f"Receiving data into '{in_buffer}', sending data into '{out_buffer}'."
         )
 
-    @tool
+    @sandbox
     def list_connections(self) -> list[dict]:
         """List all connections with their details."""
         return [
@@ -95,6 +108,7 @@ class Connector(StreamBufferManager, AgenticObject):
             handle.task.cancel()
             handle.writer.close()
         reason = f"({handle.close_reason})" if handle.closed else ""
+        self._refresh_connections_buffer()
         if drop_buffers:
             self.drop_buffer(handle.in_buffer)
             self.drop_buffer(handle.out_buffer)
@@ -108,8 +122,7 @@ class Connector(StreamBufferManager, AgenticObject):
             f"— drop them with drop_buffer before reconnecting."
         )
 
-    @tool
-    async def send(self, name: str, text: str, flush: bool = False, fix_crlf: bool = False) -> str:
+    async def _connection_send_hook(self, name: str, text: str, flush: bool = False, fix_crlf: bool = False) -> str:
         """Send text over the named connection. Pass flush=True to drain the write buffer without sending new data. Pass fix_crlf=True to replace LF (\\n) with CRLF (\\r\\n) as required by protocols such as HTTP."""
         if name not in self.connections:
             raise KeyError(f"No connection named '{name}'.")
