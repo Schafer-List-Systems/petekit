@@ -82,7 +82,7 @@ class TestStreamBufferReadBufferTimeBased(unittest.TestCase):
         entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
         self.sbm._buffers[name] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
         self.sbm.stream_buffer_configs[name] = self.sbm.stream_buffer_configs.get(
-            name, type("C", (), {"hooks": [], "created_at": ts[0]})()
+            name, type("C", (), {"hooks": {}, "created_at": ts[0]})()
         )
 
     def test_absolute_range_inclusive(self):
@@ -141,7 +141,7 @@ class TestStreamBufferReadBufferRelativeTime(unittest.TestCase):
     def _make_stream(self, name: str, ts: list[float], data: list[str]) -> None:
         entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
         self.sbm._buffers[name] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
-        self.sbm.stream_buffer_configs[name] = type("C", (), {"hooks": [], "created_at": ts[0]})()
+        self.sbm.stream_buffer_configs[name] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
 
     def test_negative_start_relative_to_last_entry(self):
         result = self.sbm.read_buffer("stream:t", start=-20.0)
@@ -194,7 +194,7 @@ class TestStreamBufferReadBufferLineBased(unittest.TestCase):
     def _make_stream(self, name: str, ts: list[float], data: list[str]) -> None:
         entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
         self.sbm._buffers[name] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
-        self.sbm.stream_buffer_configs[name] = type("C", (), {"hooks": [], "created_at": ts[0]})()
+        self.sbm.stream_buffer_configs[name] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
 
     def test_read_all_with_timestamps(self):
         result = self.sbm.read_buffer("stream:t", show_timestamps=True)
@@ -229,26 +229,22 @@ class TestStreamBufferHookBehavior(unittest.TestCase):
         self.sbm = StreamBufferManager()
         self.fired = []
         self.sbm._buffers["stream:t"] = Buffer(lines=[], created_at=0.0, modified_at=0.0)
-        self.sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": [], "created_at": 0.0})()
+        self.sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": 0.0})()
 
     async def _append_and_collect(self, data: str) -> None:
         await self.sbm._append_stream_entry("stream:t", data)
         self.fired.append(data)
 
     def test_hook_receives_entry_and_stream_name(self):
-        async def run():
-            hook_called = []
-            async def capture(entry, sb):
-                hook_called.append((entry.data, sb))
-            self.sbm.stream_buffer_configs["stream:t"].hooks.append(
-                StreamBufferHook(callable_=capture, priority=0)
-            )
-            await self.sbm._append_stream_entry("stream:t", "hello")
-            return hook_called
-
-        result = asyncio.run(run())
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0], ("hello", "stream:t"))
+        hook_called = []
+        async def capture(entry, sb):
+            hook_called.append((entry.data, sb))
+        self.sbm.stream_buffer_configs["stream:t"].hooks["capture"] = StreamBufferHook(
+            callable_=capture, priority=0
+        )
+        asyncio.run(self.sbm._append_stream_entry("stream:t", "hello"))
+        self.assertEqual(len(hook_called), 1)
+        self.assertEqual(hook_called[0], ("hello", "stream:t"))
 
     def test_hooks_fire_in_priority_order(self):
         order = []
@@ -260,44 +256,37 @@ class TestStreamBufferHookBehavior(unittest.TestCase):
         async def cb_mid(entry, sb):
             order.append("mid")
 
-        self.sbm.stream_buffer_configs["stream:t"].hooks = [
-            StreamBufferHook(callable_=cb_low, priority=10),
-            StreamBufferHook(callable_=cb_high, priority=100),
-            StreamBufferHook(callable_=cb_mid, priority=50),
-        ]
+        self.sbm.stream_buffer_configs["stream:t"].hooks = {
+            "low": StreamBufferHook(callable_=cb_low, priority=10),
+            "high": StreamBufferHook(callable_=cb_high, priority=100),
+            "mid": StreamBufferHook(callable_=cb_mid, priority=50),
+        }
         asyncio.run(self.sbm._append_stream_entry("stream:t", "x"))
         self.assertEqual(order, ["high", "mid", "low"])
 
     def test_hook_exception_does_not_propagate(self):
-        async def run():
-            async def bad_hook(entry, sb):
-                raise RuntimeError("boom")
-            self.sbm.stream_buffer_configs["stream:t"].hooks.append(
-                StreamBufferHook(callable_=bad_hook, priority=0)
-            )
-            try:
-                await self.sbm._append_stream_entry("stream:t", "x")
-                return "no error"
-            except RuntimeError as e:
-                return str(e)
-
-        result = asyncio.run(run())
-        self.assertEqual(result, "no error")
+        async def bad_hook(entry, sb):
+            raise RuntimeError("boom")
+        self.sbm.stream_buffer_configs["stream:t"].hooks["boom"] = StreamBufferHook(
+            callable_=bad_hook, priority=0
+        )
+        try:
+            asyncio.run(self.sbm._append_stream_entry("stream:t", "x"))
+            caught = False
+        except RuntimeError as e:
+            caught = True
+        self.assertFalse(caught)
 
     def test_hook_error_recorded(self):
-        async def run():
-            async def bad_hook(entry, sb):
-                raise ValueError("boom")
-            self.sbm.stream_buffer_configs["stream:t"].hooks.append(
-                StreamBufferHook(callable_=bad_hook, priority=0)
-            )
-            await self.sbm._append_stream_entry("stream:t", "x")
-            errors = self.sbm.stream_buffer_configs["stream:t"].hooks[0].errors
-            return errors
-
-        result = asyncio.run(run())
-        self.assertEqual(len(result), 1)
-        self.assertIn("boom", result[0].error)
+        async def bad_hook(entry, sb):
+            raise ValueError("boom")
+        self.sbm.stream_buffer_configs["stream:t"].hooks["boom"] = StreamBufferHook(
+            callable_=bad_hook, priority=0
+        )
+        asyncio.run(self.sbm._append_stream_entry("stream:t", "x"))
+        errors = self.sbm.stream_buffer_configs["stream:t"].hooks["boom"].errors
+        self.assertEqual(len(errors), 1)
+        self.assertIn("boom", errors[0].error)
 
 
 class TestListStreamBuffers(unittest.TestCase):
@@ -318,8 +307,8 @@ class TestListStreamBuffers(unittest.TestCase):
         self.sbm.create_buffer("stream:t", stream=True)
         async def dummy(entry, sb):
             pass
-        self.sbm.stream_buffer_configs["stream:t"].hooks.append(
-            StreamBufferHook(callable_=dummy, priority=0)
+        self.sbm.stream_buffer_configs["stream:t"].hooks["dummy"] = StreamBufferHook(
+            callable_=dummy, priority=0
         )
         result = self.sbm.list_stream_buffers()
         entry = next(r for r in result if r["name"] == "stream:t")
@@ -345,7 +334,7 @@ class TestReadBufferReturnValues(unittest.TestCase):
     def _make_stream(self, name: str, ts: list[float], data: list[str]) -> None:
         entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
         self.sbm._buffers[name] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
-        self.sbm.stream_buffer_configs[name] = type("C", (), {"hooks": [], "created_at": ts[0]})()
+        self.sbm.stream_buffer_configs[name] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
 
     def test_content_return_has_ok_and_content_and_line_range(self):
         result = self.sbm.read_buffer("stream:t", start=0.0, end=30.0)

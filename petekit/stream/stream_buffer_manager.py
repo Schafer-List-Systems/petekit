@@ -34,7 +34,7 @@ class StreamBufferHook:
 @dataclass
 class StreamBufferConfig:
     created_at: float = field(default_factory=time.time)  # stream creation timestamp
-    hooks: list[StreamBufferHook] = field(default_factory=list)  # all hooks on this stream
+    hooks: dict[str, StreamBufferHook] = field(default_factory=dict)  # all hooks on this stream, keyed by name
 
 
 def _fmt_ts(ts: float, round_up: bool = False) -> str:
@@ -172,18 +172,26 @@ class StreamBufferManager(BufferManager, AgenticObject):
         return super().read_buffer(name, start=start, end=end, show_timestamps=show_timestamps, raw=raw)
 
     @sandbox
-    async def _register_stream_on_append_hook(
+    async def _set_stream_on_append_hook(
         self,
         stream_buffer: str,
-        hook: Callable[[BufferEntry, str], Coroutine[Any, Any, None]],
+        name: str,
+        hook: Callable[[BufferEntry, str], Coroutine[Any, Any, None]] | None = None,
         priority: int = 0,
     ) -> dict[str, Any]:
-        """Register an async hook on a stream. The hook is called with (entry, stream_buffer) after every append. Higher priority fires first."""
+        """Set or remove a named hook on a stream. Set hook to a callable to register; pass hook=None to remove the named hook. Hook is called with (entry, stream_buffer) after every append. Higher priority fires first."""
         if stream_buffer not in self.stream_buffer_configs:
             return {"ok": False, "error": f"no stream named '{stream_buffer}'", "stream_buffer": stream_buffer}
-        entry = StreamBufferHook(callable_=hook, priority=priority)
-        self.stream_buffer_configs[stream_buffer].hooks.append(entry)
-        return {"ok": True, "hook_count": len(self.stream_buffer_configs[stream_buffer].hooks), "stream_buffer": stream_buffer}
+        if hook is None:
+            if name in self.stream_buffer_configs[stream_buffer].hooks:
+                del self.stream_buffer_configs[stream_buffer].hooks[name]
+                return {"ok": True, "removed": name, "stream_buffer": stream_buffer}
+            return {"ok": False, "error": f"no hook named '{name}' on '{stream_buffer}'", "stream_buffer": stream_buffer}
+        self.stream_buffer_configs[stream_buffer].hooks[name] = StreamBufferHook(
+            callable_=hook,
+            priority=priority,
+        )
+        return {"ok": True, "hook_count": len(self.stream_buffer_configs[stream_buffer].hooks), "name": name, "stream_buffer": stream_buffer}
 
     async def _append_stream_entry(self, stream_buffer: str, data: str) -> None:
         """
@@ -204,7 +212,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         buf.lines.append(entry)
         cfg = self.stream_buffer_configs.get(stream_buffer)
         if cfg:
-            ordered = sorted(cfg.hooks, key=lambda h: h.priority, reverse=True)
+            ordered = sorted(cfg.hooks.values(), key=lambda h: h.priority, reverse=True)
             for sh in ordered:
                 try:
                     await sh.callable_(entry, stream_buffer)
