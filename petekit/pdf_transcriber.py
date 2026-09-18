@@ -11,7 +11,7 @@ from pathlib import Path
 
 from peteos.oap.agentic_object import AgenticObject, tool, Error
 
-from .buffer_manager import Buffer, BufferManager
+from .buffer_manager import BufferManager
 
 
 class PdfTranscriber(BufferManager, AgenticObject):
@@ -71,7 +71,7 @@ class PdfTranscriber(BufferManager, AgenticObject):
             f"=== Page {i+1} ===\n{text}\n### Image Description: {desc}"
             for i, (text, desc) in enumerate(results)
         ])
-        self._create_buffer(buffer_name, text=text)
+        self.create_buffer(buffer_name, text=text)
         return (
             f"Transcribed {len(results)} page(s) from '{pdf_path}' into buffer '{buffer_name}'. "
             f"Use read_buffer to access the content."

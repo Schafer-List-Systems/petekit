@@ -99,11 +99,16 @@ class Basher(StreamBufferManager, AgenticObject):
         self.create_buffer(stdin_buffer, stream=True)
         self.create_buffer(stdout_buffer, stream=True)
         self.create_buffer(stderr_buffer, stream=True)
-        self._set_stream_on_append_hook(
+        hook_result = await self._set_stream_on_append_hook(
             stdin_buffer,
             name="bash_send",
             hook=lambda stream, text, metadata: self._bash_send_hook(process_id, text),
         )
+        if not hook_result.get("ok"):
+            self.drop_buffer(stdin_buffer)
+            self.drop_buffer(stdout_buffer)
+            self.drop_buffer(stderr_buffer)
+            return {"ok": False, "error": f"failed to register bash_send hook: {hook_result.get('error')}"}
 
         try:
             process = await asyncio.create_subprocess_exec(
