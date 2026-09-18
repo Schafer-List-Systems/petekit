@@ -163,7 +163,6 @@ class Basher(StreamBufferManager, AgenticObject):
         if process_id not in self._processes:
             raise KeyError(f"No process with id '{process_id}'.")
         handle = self._processes.pop(process_id)
-        self._refresh_bash_processes_buffer()
         if handle.task:
             handle.task.cancel()
         if handle.process and handle.process.returncode is None:
@@ -176,6 +175,7 @@ class Basher(StreamBufferManager, AgenticObject):
                 handle.process.kill()
         handle.closed = True
         handle.exit_code = handle.process.returncode if handle.process else None
+        self._refresh_bash_processes_buffer()
         if drop_buffers:
             self.drop_buffer(handle.stdin_buffer)
             self.drop_buffer(handle.stdout_buffer)
@@ -240,3 +240,4 @@ class Basher(StreamBufferManager, AgenticObject):
                     pass
             else:
                 handle.exit_code = None
+            self._refresh_bash_processes_buffer()
