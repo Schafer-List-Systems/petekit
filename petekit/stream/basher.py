@@ -6,6 +6,7 @@ import asyncio
 import subprocess
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos.oap.decorators import sandbox, tool
@@ -76,7 +77,7 @@ class Basher(StreamBufferManager, AgenticObject):
         ]
 
     @tool
-    async def exec(self, title: str, command: str, cwd: str | None = None) -> str:
+    async def exec(self, title: str, command: str, cwd: str | None = None) -> dict[str, Any]:
         """Start a command in the background, creating live in/out stream buffers.
 
         Args:
@@ -88,7 +89,7 @@ class Basher(StreamBufferManager, AgenticObject):
             Confirmation with stream buffer names.
         """
         if not command.strip():
-            raise ValueError("Empty command.")
+            return {"ok": False, "error": "Empty command."}
 
         now = time.time()
         process_id = self._next_process_id()
@@ -116,7 +117,7 @@ class Basher(StreamBufferManager, AgenticObject):
             self.drop_buffer(stdin_buffer)
             self.drop_buffer(stdout_buffer)
             self.drop_buffer(stderr_buffer)
-            raise RuntimeError(f"Failed to start process: {e}") from e
+            return {"ok": False, "error": f"Failed to start process: {e}"}
 
         handle = BashHandle(
             process_id=process_id,
@@ -131,12 +132,8 @@ class Basher(StreamBufferManager, AgenticObject):
         self._processes[process_id] = handle
         handle.task = asyncio.create_task(self._bash_read_loop(handle))
         self._refresh_bash_processes_buffer()
-        return (
-            f"Started process [{process_id}] '{title}': {command}. "
-            f"Streams created at {now}. "
-            f"stdin='{stdin_buffer}', stdout='{stdout_buffer}', stderr='{stderr_buffer}'. "
-            f"Use list_processes to track, terminate to stop."
-        )
+        message = f"Started process [{process_id}] '{title}': {command}. Streams created at {now}. stdin='{stdin_buffer}', stdout='{stdout_buffer}', stderr='{stderr_buffer}'. Use list_processes to track, terminate to stop."
+        return {"ok": True, "process_id": process_id, "title": title, "stdin_buffer": stdin_buffer, "stdout_buffer": stdout_buffer, "stderr_buffer": stderr_buffer, "message": message}
 
     async def _bash_send_hook(self, process_id: int, text: str = "", flush: bool = False, trailing_newline: bool = False) -> str:
         """Send text to a running process's stdin. Pass flush=True to drain the write buffer without closing. Pass trailing_newline=True to append a trailing newline (as if pressing Enter)."""
@@ -160,10 +157,10 @@ class Basher(StreamBufferManager, AgenticObject):
         return f"Sent {len(text)} chars to process '{handle.title}'."
 
     @tool
-    async def terminate(self, process_id: int, drop_buffers: bool = True) -> str:
+    async def terminate(self, process_id: int, drop_buffers: bool = True) -> dict[str, Any]:
         """Terminate a running process. Pass drop_buffers=False to keep streams for analysis."""
         if process_id not in self._processes:
-            raise KeyError(f"No process with id '{process_id}'.")
+            return {"ok": False, "error": f"No process with id '{process_id}'."}
         handle = self._processes.pop(process_id)
         if handle.task:
             handle.task.cancel()
@@ -182,16 +179,10 @@ class Basher(StreamBufferManager, AgenticObject):
             self.drop_buffer(handle.stdin_buffer)
             self.drop_buffer(handle.stdout_buffer)
             self.drop_buffer(handle.stderr_buffer)
-            return (
-                f"Terminated process [{handle.process_id}] '{handle.title}': {handle.command} "
-                f"(exit_code={handle.exit_code}). Dropped buffers."
-            )
-        return (
-            f"Terminated process [{handle.process_id}] '{handle.title}': {handle.command} "
-            f"(exit_code={handle.exit_code}). "
-            f"Buffers '{handle.stdin_buffer}', '{handle.stdout_buffer}', '{handle.stderr_buffer}' remain. "
-            f"Use drop_buffer to remove them."
-        )
+            message = f"Terminated process [{handle.process_id}] '{handle.title}': {handle.command} (exit_code={handle.exit_code}). Dropped buffers."
+            return {"ok": True, "process_id": handle.process_id, "title": handle.title, "exit_code": handle.exit_code, "dropped_buffers": True, "message": message}
+        message = f"Terminated process [{handle.process_id}] '{handle.title}': {handle.command} (exit_code={handle.exit_code}). Buffers '{handle.stdin_buffer}', '{handle.stdout_buffer}', '{handle.stderr_buffer}' remain. Use drop_buffer to remove them."
+        return {"ok": True, "process_id": handle.process_id, "title": handle.title, "exit_code": handle.exit_code, "dropped_buffers": False, "message": message}
 
     async def _bash_read_loop(self, handle: BashHandle) -> None:
         """Continuously read stdout and stderr from the process using concurrent tasks."""

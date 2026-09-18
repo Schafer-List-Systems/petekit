@@ -1,6 +1,7 @@
 import asyncio
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from peteos import AgenticObject, sandbox, tool
 from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buffer
@@ -36,10 +37,10 @@ class Connector(StreamBufferManager, AgenticObject):
         self._create_buffer("system:list:connections", text=text, overwrite=True)
 
     @tool
-    async def connect(self, name: str, host: str, port: int, ssl: bool = False) -> str:
+    async def connect(self, name: str, host: str, port: int, ssl: bool = False) -> dict[str, Any]:
         """Establish a connection to a host on the given port."""
         if name in self.connections:
-            raise KeyError(f"Connection '{name}' already exists.")
+            return {"ok": False, "error": f"Connection '{name}' already exists."}
 
         # Prepare stream buffers for incoming and outgoing data
         now = time.time()
@@ -78,11 +79,8 @@ class Connector(StreamBufferManager, AgenticObject):
         self.connections[name] = handle
         handle.task = asyncio.create_task(self._read_loop(name, handle))
         self._refresh_connections_buffer()
-        return (
-            f"Connected to {host}:{port} (ssl={ssl}) as '{name}'. "
-            f"Streams created at {now}. "
-            f"Receiving data into '{in_buffer}', sending data into '{out_buffer}'."
-        )
+        message = f"Connected to {host}:{port} (ssl={ssl}) as '{name}'. Streams created at {now}. Receiving data into '{in_buffer}', sending data into '{out_buffer}'."
+        return {"ok": True, "name": name, "in_buffer": in_buffer, "out_buffer": out_buffer, "message": message}
 
     @sandbox
     def list_connections(self) -> list[dict]:
@@ -99,10 +97,10 @@ class Connector(StreamBufferManager, AgenticObject):
         ]
 
     @tool
-    async def disconnect(self, name: str, drop_buffers: bool = True) -> str:
+    async def disconnect(self, name: str, drop_buffers: bool = True) -> dict[str, Any]:
         """Close the named connection. Pass drop_buffers=True (default) to also drop stream buffers."""
         if name not in self.connections:
-            raise KeyError(f"No connection named '{name}'.")
+            return {"ok": False, "error": f"No connection named '{name}'."}
         handle = self.connections.pop(name)
         if not handle.closed:
             handle.task.cancel()
@@ -112,15 +110,10 @@ class Connector(StreamBufferManager, AgenticObject):
         if drop_buffers:
             self.drop_buffer(handle.in_buffer)
             self.drop_buffer(handle.out_buffer)
-            return (
-                f"Disconnected '{name}'. {reason}\n"
-                f"Cleaned up stream buffers."
-            )
-        return (
-            f"Disconnected '{name}'. {reason}\n"
-            f"Stream buffers '{handle.in_buffer}', '{handle.out_buffer}' still exist for analysis. "
-            f"— drop them with drop_buffer before reconnecting."
-        )
+            message = f"Disconnected '{name}'. {reason}\nCleaned up stream buffers."
+            return {"ok": True, "name": name, "dropped_buffers": True, "message": message}
+        message = f"Disconnected '{name}'. {reason}\nStream buffers '{handle.in_buffer}', '{handle.out_buffer}' still exist for analysis. — drop them with drop_buffer before reconnecting."
+        return {"ok": True, "name": name, "dropped_buffers": False, "message": message}
 
     async def _connection_send_hook(self, name: str, text: str, flush: bool = False, fix_crlf: bool = False) -> str:
         """Send text over the named connection. Pass flush=True to drain the write buffer without sending new data. Pass fix_crlf=True to replace LF (\\n) with CRLF (\\r\\n) as required by protocols such as HTTP."""
