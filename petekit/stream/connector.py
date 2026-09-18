@@ -40,22 +40,21 @@ class Connector(StreamBufferManager, AgenticObject):
         out_buffer = f"stream:out:{name}"
         for buf in (in_buffer, out_buffer):
             try:
-                self._drop_stream(buf)
+                self.drop_buffer(buf)
             except KeyError:
                 pass
-        self._create_stream(in_buffer)
+        self.create_buffer(in_buffer, stream=True)
         try:
-            self._create_stream(out_buffer)
+            self.create_buffer(out_buffer, stream=True)
         except KeyError:
-            self._drop_stream(in_buffer)
+            self.drop_buffer(in_buffer)
             raise
 
         try:
             reader, writer = await asyncio.open_connection(host, port, ssl=ssl)
         except Exception as e:
-            # Connection failed — roll back stream buffers before propagating
-            self._drop_stream(in_buffer)
-            self._drop_stream(out_buffer)
+            self.drop_buffer(in_buffer)
+            self.drop_buffer(out_buffer)
             raise
 
         handle = ConnectionHandle(
@@ -97,8 +96,8 @@ class Connector(StreamBufferManager, AgenticObject):
             handle.writer.close()
         reason = f"({handle.close_reason})" if handle.closed else ""
         if drop_buffers:
-            self._drop_stream(handle.in_buffer)
-            self._drop_stream(handle.out_buffer)
+            self.drop_buffer(handle.in_buffer)
+            self.drop_buffer(handle.out_buffer)
             return (
                 f"Disconnected '{name}'. {reason}\n"
                 f"Cleaned up stream buffers."
@@ -129,9 +128,7 @@ class Connector(StreamBufferManager, AgenticObject):
         except Exception as e:
             hint = await self.disconnect(name, cleanup=False)
             raise ConnectionError(f"Send error ({e}) — connection closed. {hint}")
-        if text:
-            for line in text.splitlines():
-                await self._append_stream_entry(handle.out_buffer, line)
+
         if text and flush:
             return f"Sent {len(text)} chars to '{name}'. "
         if flush:
@@ -151,6 +148,6 @@ class Connector(StreamBufferManager, AgenticObject):
                     handle.writer.close()
                     break
                 line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
-                await self._append_stream_entry(handle.in_buffer, line)
+                await self.write_buffer(handle.in_buffer, line)
         except asyncio.CancelledError:
             pass
