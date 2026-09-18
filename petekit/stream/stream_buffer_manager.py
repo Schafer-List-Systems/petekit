@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import bisect
 import time
 from collections.abc import Callable
@@ -59,8 +60,9 @@ class StreamBufferManager(BufferManager, AgenticObject):
     - You can read buffers via read_buffer with int (line-based) or float (time-based) start/end.
       - Float start/end values trigger time-based reading on stream buffers.
       - Timestamps in skip/bucket messages are rounded to 6 decimal places.
-    - The buffer "list:stream_buffers" is always up to date with all current stream buffers.
-      Read it to get a JSON array of {name, created_at, hook_count} for each stream.
+    - The buffers "system:list:stream_buffers" and "system:list:stream_buffer_hooks"
+      are always up to date with all current stream buffers and their hooks including metadata.
+    - Hooks in "system:list:stream_buffer_hooks" are grouped by stream and fire in the order they appear (priority descending, highest first).
     """
 
     # DESIGN: window_size (rolling trim) is deferred — buffers grow indefinitely for now.
@@ -69,6 +71,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         super().__init__(**kwargs)
         self.stream_buffer_configs: dict[str, StreamBufferConfig] = {}
         self._refresh_stream_buffers_buffer()
+        self._refresh_stream_buffer_hooks()
 
     @tool
     def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False, stream: bool = False) -> dict[str, Any]:
@@ -119,12 +122,32 @@ class StreamBufferManager(BufferManager, AgenticObject):
         ]
 
     def _refresh_stream_buffers_buffer(self) -> None:
-        """Refresh the list:stream_buffers buffer, one JSON dict per line."""
+        """Refresh the system:list:stream_buffers buffer, one JSON dict per line."""
         text = format_dict_list_for_buffer(self.list_stream_buffers())
-        if "list:stream_buffers" not in self._buffers:
-            self._create_buffer("list:stream_buffers", text=text)
+        if "system:list:stream_buffers" not in self._buffers:
+            self._create_buffer("system:list:stream_buffers", text=text)
         else:
-            self.write_buffer("list:stream_buffers", text)
+            self.write_buffer("system:list:stream_buffers", text)
+
+    def _refresh_stream_buffer_hooks(self) -> None:
+        """Refresh the system:list:stream_buffer_hooks buffer with all hook states."""
+        records = [
+            {
+                "stream": stream_name,
+                "name": hook_name,
+                "priority": hook.priority,
+                "fire_count": hook.fire_count,
+                "errors": [{"ts": e.timestamp, "msg": e.error} for e in hook.errors],
+            }
+            for stream_name, cfg in self.stream_buffer_configs.items()
+            for hook_name, hook in cfg.hooks.items()
+        ]
+        records.sort(key=lambda r: (r["stream"], -r["priority"]))
+        text = format_dict_list_for_buffer(records)
+        if "system:list:stream_buffer_hooks" not in self._buffers:
+            self._create_buffer("system:list:stream_buffer_hooks", text=text)
+        else:
+            self.write_buffer("system:list:stream_buffer_hooks", text)
 
     def _resolve_time(self, ts: float, anchor: float) -> float:
         """Resolve a relative (negative) or absolute float timestamp to an absolute one.
@@ -176,21 +199,23 @@ class StreamBufferManager(BufferManager, AgenticObject):
         self,
         stream_buffer: str,
         name: str,
-        hook: Callable[[BufferEntry, str], Coroutine[Any, Any, None]] | None = None,
+        hook: Callable[[str, Any], None] | Callable[[str, Any], Coroutine[Any, Any, None]] | None = None,
         priority: int = 0,
     ) -> dict[str, Any]:
-        """Set or remove a named hook on a stream. Set hook to a callable to register; pass hook=None to remove the named hook. Hook is called with (entry, stream_buffer) after every append. Higher priority fires first."""
+        """Set or remove a named hook on a stream. Set hook to a callable to register; pass hook=None to remove the named hook. The hook is called with (stream_buffer, entry) after every append. Higher priority fires first. Both async and sync callables are supported."""
         if stream_buffer not in self.stream_buffer_configs:
             return {"ok": False, "error": f"no stream named '{stream_buffer}'", "stream_buffer": stream_buffer}
         if hook is None:
             if name in self.stream_buffer_configs[stream_buffer].hooks:
                 del self.stream_buffer_configs[stream_buffer].hooks[name]
+                self._refresh_stream_buffer_hooks()
                 return {"ok": True, "removed": name, "stream_buffer": stream_buffer}
             return {"ok": False, "error": f"no hook named '{name}' on '{stream_buffer}'", "stream_buffer": stream_buffer}
         self.stream_buffer_configs[stream_buffer].hooks[name] = StreamBufferHook(
             callable_=hook,
             priority=priority,
         )
+        self._refresh_stream_buffer_hooks()
         return {"ok": True, "hook_count": len(self.stream_buffer_configs[stream_buffer].hooks), "name": name, "stream_buffer": stream_buffer}
 
     async def _append_stream_entry(self, stream_buffer: str, data: str) -> None:
@@ -215,7 +240,9 @@ class StreamBufferManager(BufferManager, AgenticObject):
             ordered = sorted(cfg.hooks.values(), key=lambda h: h.priority, reverse=True)
             for sh in ordered:
                 try:
-                    await sh.callable_(entry, stream_buffer)
+                    result = sh.callable_(stream_buffer, entry)
+                    if asyncio.iscoroutine(result):
+                        await result
                     sh.fire_count += 1
                 except Exception as e:
                     sh.errors.append(StreamBufferHookError(timestamp=time.time(), error=str(e)))

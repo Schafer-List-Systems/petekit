@@ -237,14 +237,14 @@ class TestStreamBufferHookBehavior(unittest.TestCase):
 
     def test_hook_receives_entry_and_stream_name(self):
         hook_called = []
-        async def capture(entry, sb):
-            hook_called.append((entry.data, sb))
+        async def capture(sb, entry):
+            hook_called.append((sb, entry.data))
         self.sbm.stream_buffer_configs["stream:t"].hooks["capture"] = StreamBufferHook(
             callable_=capture, priority=0
         )
         asyncio.run(self.sbm._append_stream_entry("stream:t", "hello"))
         self.assertEqual(len(hook_called), 1)
-        self.assertEqual(hook_called[0], ("hello", "stream:t"))
+        self.assertEqual(hook_called[0], ("stream:t", "hello"))
 
     def test_hooks_fire_in_priority_order(self):
         order = []
