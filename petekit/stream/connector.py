@@ -57,11 +57,15 @@ class Connector(StreamBufferManager, AgenticObject):
         except KeyError:
             self.drop_buffer(in_buffer)
             raise
-        self._set_stream_on_append_hook(
+        hook_result = await self._set_stream_on_append_hook(
             out_buffer,
             name="connection_send",
             hook=lambda s, t, m: self._connection_send_hook(name, t),
         )
+        if not hook_result.get("ok"):
+            self.drop_buffer(in_buffer)
+            self.drop_buffer(out_buffer)
+            raise ConnectionError(f"failed to register connection_send hook: {hook_result.get('error')}")
 
         try:
             reader, writer = await asyncio.open_connection(host, port, ssl=ssl)
