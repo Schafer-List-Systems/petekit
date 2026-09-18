@@ -58,7 +58,7 @@ class Basher(StreamBufferManager, AgenticObject):
     def _refresh_bash_processes_buffer(self) -> None:
         records = self.list_processes()
         text = format_dict_list_for_buffer(records)
-        self.create_buffer("system:list:bash_processes", text=text, overwrite=True)
+        self._create_buffer("system:list:bash_processes", text=text, overwrite=True)
 
     @sandbox
     def list_processes(self) -> list[dict]:
@@ -98,6 +98,11 @@ class Basher(StreamBufferManager, AgenticObject):
         self.create_buffer(stdin_buffer, stream=True)
         self.create_buffer(stdout_buffer, stream=True)
         self.create_buffer(stderr_buffer, stream=True)
+        self._set_stream_on_append_hook(
+            stdin_buffer,
+            name="bash_send",
+            hook=lambda stream, text, metadata: self._bash_send_hook(process_id, text),
+        )
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -133,8 +138,7 @@ class Basher(StreamBufferManager, AgenticObject):
             f"Use list_processes to track, terminate to stop."
         )
 
-    @tool
-    async def bash_send(self, process_id: int, text: str = "", flush: bool = False, trailing_newline: bool = False) -> str:
+    async def _bash_send_hook(self, process_id: int, text: str = "", flush: bool = False, trailing_newline: bool = False) -> str:
         """Send text to a running process's stdin. Pass flush=True to drain the write buffer without closing. Pass trailing_newline=True to append a trailing newline (as if pressing Enter)."""
         if process_id not in self._processes:
             raise KeyError(f"No process with id '{process_id}'.")
@@ -153,8 +157,6 @@ class Basher(StreamBufferManager, AgenticObject):
                 await handle.process.stdin.drain()
         except Exception as e:
             raise ConnectionError(f"Send error: {e}")
-        for line in text.splitlines():
-            await self._append_stream_entry(handle.stdin_buffer, line)
         return f"Sent {len(text)} chars to process '{handle.title}'."
 
     @tool
@@ -205,7 +207,7 @@ class Basher(StreamBufferManager, AgenticObject):
                     if not line_bytes:
                         break
                     line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
-                    await self._append_stream_entry(handle.stdout_buffer, line)
+                    await self.write_buffer(handle.stdout_buffer, line)
             except asyncio.CancelledError:
                 pass
 
@@ -218,7 +220,7 @@ class Basher(StreamBufferManager, AgenticObject):
                     if not line_bytes:
                         break
                     line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
-                    await self._append_stream_entry(handle.stderr_buffer, line)
+                    await self.write_buffer(handle.stderr_buffer, line)
             except asyncio.CancelledError:
                 pass
 

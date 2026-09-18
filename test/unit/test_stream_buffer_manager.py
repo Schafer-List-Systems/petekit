@@ -232,28 +232,28 @@ class TestStreamBufferHookBehavior(unittest.TestCase):
         self.sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": 0.0})()
 
     async def _append_and_collect(self, data: str) -> None:
-        await self.sbm._append_stream_entry("stream:t", data)
+        await self.sbm.write_buffer("stream:t", data)
         self.fired.append(data)
 
     def test_hook_receives_entry_and_stream_name(self):
         hook_called = []
-        async def capture(sb, entry):
-            hook_called.append((sb, entry.data))
+        async def capture(sb, text, metadata):
+            hook_called.append((sb, text))
         self.sbm.stream_buffer_configs["stream:t"].hooks["capture"] = StreamBufferHook(
             callable_=capture, priority=0
         )
-        asyncio.run(self.sbm._append_stream_entry("stream:t", "hello"))
+        asyncio.run(self.sbm.write_buffer("stream:t", "hello"))
         self.assertEqual(len(hook_called), 1)
         self.assertEqual(hook_called[0], ("stream:t", "hello"))
 
     def test_hooks_fire_in_priority_order(self):
         order = []
 
-        async def cb_low(entry, sb):
+        async def cb_low(sb, text, metadata):
             order.append("low")
-        async def cb_high(entry, sb):
+        async def cb_high(sb, text, metadata):
             order.append("high")
-        async def cb_mid(entry, sb):
+        async def cb_mid(sb, text, metadata):
             order.append("mid")
 
         self.sbm.stream_buffer_configs["stream:t"].hooks = {
@@ -261,29 +261,29 @@ class TestStreamBufferHookBehavior(unittest.TestCase):
             "high": StreamBufferHook(callable_=cb_high, priority=100),
             "mid": StreamBufferHook(callable_=cb_mid, priority=50),
         }
-        asyncio.run(self.sbm._append_stream_entry("stream:t", "x"))
+        asyncio.run(self.sbm.write_buffer("stream:t", "x"))
         self.assertEqual(order, ["high", "mid", "low"])
 
     def test_hook_exception_does_not_propagate(self):
-        async def bad_hook(entry, sb):
+        async def bad_hook(sb, text, metadata):
             raise RuntimeError("boom")
         self.sbm.stream_buffer_configs["stream:t"].hooks["boom"] = StreamBufferHook(
             callable_=bad_hook, priority=0
         )
         try:
-            asyncio.run(self.sbm._append_stream_entry("stream:t", "x"))
+            asyncio.run(self.sbm.write_buffer("stream:t", "x"))
             caught = False
         except RuntimeError as e:
             caught = True
         self.assertFalse(caught)
 
     def test_hook_error_recorded(self):
-        async def bad_hook(entry, sb):
+        async def bad_hook(sb, text, metadata):
             raise ValueError("boom")
         self.sbm.stream_buffer_configs["stream:t"].hooks["boom"] = StreamBufferHook(
             callable_=bad_hook, priority=0
         )
-        asyncio.run(self.sbm._append_stream_entry("stream:t", "x"))
+        asyncio.run(self.sbm.write_buffer("stream:t", "x"))
         errors = self.sbm.stream_buffer_configs["stream:t"].hooks["boom"].errors
         self.assertEqual(len(errors), 1)
         self.assertIn("boom", errors[0].error)

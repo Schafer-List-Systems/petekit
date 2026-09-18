@@ -23,8 +23,8 @@ class StreamBufferHookError:
 
 @dataclass
 class StreamBufferHook:
-    # the async hook function, called with (entry, stream_buffer) after append
-    callable_: Callable[[BufferEntry, str], Coroutine[Any, Any, None]]
+    # the hook function, called with (stream_buffer, text, metadata) after each write
+    callable_: Callable[[str, str, dict[str, Any]], None] | Callable[[str, str, dict[str, Any]], Coroutine[Any, Any, None]]
     created_at: float = field(default_factory=time.time)  # registration timestamp
     fire_count: int = 0  # how many times this hook has fired
     errors: list[StreamBufferHookError] = field(default_factory=list)  # errors from fire-and-forget
@@ -188,15 +188,47 @@ class StreamBufferManager(BufferManager, AgenticObject):
 
         return super().read_buffer(name, start=start, end=end, show_timestamps=show_timestamps, raw=raw)
 
+    @tool
+    async def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
+        """Overwrite the text in the range [start, end) of a buffer.
+        To overwrite the whole buffer, pass start=0.
+        To insert at line N: pass start=N and end=N.
+        To append: pass start=None and end=None — appends after the last line.
+        Write-mode for streams is append-only.
+        After appending, all registered hooks are fired once per batch."""
+        
+        # Make sure, streams are append-only
+        if name in self.stream_buffer_configs and (start is not None or end is not None):
+            return {"ok": False, "error": f"Cannot write into the middle of stream '{name}'. Streams are append-only."}
+        
+        # write the data into the buffer
+        result = super().write_buffer(name, text, start, end)
+        if not result.get("ok") or not name in self.stream_buffer_configs:
+            return result
+        
+        cfg = self.stream_buffer_configs.get(name)
+        ordered = sorted(cfg.hooks.values(), key=lambda h: h.priority, reverse=True)
+        for sh in ordered:
+            try:
+                hook_result = sh.callable_(name, text, result)
+                if asyncio.iscoroutine(hook_result):
+                    await hook_result
+                sh.fire_count += 1
+            except Exception as e:
+                sh.errors.append(StreamBufferHookError(timestamp=time.time(), error=str(e)))
+
+        # return the result from the super().write_buffer() call
+        return result
+
     @sandbox
     async def _set_stream_on_append_hook(
         self,
         stream_buffer: str,
         name: str,
-        hook: Callable[[str, Any], None] | Callable[[str, Any], Coroutine[Any, Any, None]] | None = None,
+        hook: Callable[[str, str, dict[str, Any]], None] | Callable[[str, str, dict[str, Any]], Coroutine[Any, Any, None]] | None = None,
         priority: int = 0,
     ) -> dict[str, Any]:
-        """Set or remove a named hook on a stream. Set hook to a callable to register; pass hook=None to remove the named hook. The hook is called with (stream_buffer, entry) after every append. Higher priority fires first. Both async and sync callables are supported."""
+        """Set or remove a named hook on a stream. Set hook to a callable to register; pass hook=None to remove the named hook. The hook is called with (stream_buffer, text, metadata) after every write. Higher priority fires first. Both async and sync callables are supported."""
         if stream_buffer not in self.stream_buffer_configs:
             return {"ok": False, "error": f"no stream named '{stream_buffer}'", "stream_buffer": stream_buffer}
         if hook is None:
@@ -212,31 +244,4 @@ class StreamBufferManager(BufferManager, AgenticObject):
         self._refresh_stream_buffer_hooks()
         return {"ok": True, "hook_count": len(self.stream_buffer_configs[stream_buffer].hooks), "name": name, "stream_buffer": stream_buffer}
 
-    async def _append_stream_entry(self, stream_buffer: str, data: str) -> None:
-        """
-        Append a data entry to the named stream. Raises KeyError if the stream doesn't exist.
 
-        After appending, all registered hooks are fired in priority order (highest first).
-        Each hook receives (entry, stream_buffer) and can perform I/O (write to process,
-        send over socket, etc.). Hooks are fire-and-forget; exceptions are not propagated.
-
-        Design: entry.seen is not set to True here. Consuming an entry (marking it seen)
-        is the responsibility of whatever reads it (e.g. read_buffer).
-        """
-        if stream_buffer not in self.stream_buffer_configs:
-            raise KeyError(f"No stream named '{stream_buffer}'. Create it with create_buffer(..., stream=True) first.")
-        buf = self._buffers[stream_buffer]
-        now = time.time()
-        entry = BufferEntry(timestamp=now, data=data, seen=False)
-        buf.lines.append(entry)
-        cfg = self.stream_buffer_configs.get(stream_buffer)
-        if cfg:
-            ordered = sorted(cfg.hooks.values(), key=lambda h: h.priority, reverse=True)
-            for sh in ordered:
-                try:
-                    result = sh.callable_(stream_buffer, entry)
-                    if asyncio.iscoroutine(result):
-                        await result
-                    sh.fire_count += 1
-                except Exception as e:
-                    sh.errors.append(StreamBufferHookError(timestamp=time.time(), error=str(e)))
