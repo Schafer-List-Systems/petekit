@@ -134,11 +134,13 @@ class StreamBufferManager(BufferManager, AgenticObject):
         return anchor + ts if ts < 0 else ts
 
     @tool
-    def read_buffer(self, name: str, start: int | float | None = 0, end: int | float | None = None, show_timestamps: bool = False) -> dict[str, Any]:
-        """Read a range of lines from a buffer. Pass int for line-based (0-based, inclusive),
-        pass float for time-based read (unix timestamps, stream buffers only).
+    def read_buffer(self, name: str, start: int | float = 0, end: int | float | None = None, show_timestamps: bool = False, raw: bool = False) -> dict[str, Any] | str:
+        """Read a range of lines from a buffer.
+        Float values trigger time-based reading on stream buffers (int for line-based).
         Negative floats (e.g. -60.0) are relative to the last entry: -60.0 means '60s ago'.
-        Set show_timestamps=True to prefix each line with its unix timestamp."""
+        Set show_timestamps=True to prefix each line with its unix timestamp.
+        Returns a dict with ok/error or ok/content on success.
+        Set raw=True to get the raw string instead of a dict — errors always return dict."""
         time_based = isinstance(start, float) or isinstance(end, float)
 
         if time_based and name not in self.stream_buffer_configs:
@@ -167,7 +169,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
 
             show_timestamps = True
 
-        return super().read_buffer(name, start=start, end=end, show_timestamps=show_timestamps)
+        return super().read_buffer(name, start=start, end=end, show_timestamps=show_timestamps, raw=raw)
 
     @sandbox
     async def _register_stream_on_append_hook(
@@ -175,7 +177,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         stream_buffer: str,
         hook: Callable[[BufferEntry, str], Coroutine[Any, Any, None]],
         priority: int = 0,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Register an async hook on a stream. The hook is called with (entry, stream_buffer) after every append. Higher priority fires first."""
         if stream_buffer not in self.stream_buffer_configs:
             return {"ok": False, "error": f"no stream named '{stream_buffer}'", "stream_buffer": stream_buffer}
