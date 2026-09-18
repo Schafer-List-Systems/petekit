@@ -91,7 +91,13 @@ def _fmt_tool_args(args_str: str) -> str:
     try:
         args = json.loads(args_str)
     except (json.JSONDecodeError, TypeError):
-        return args_str
+        try:
+            import ast
+            evaluated = ast.literal_eval(args_str)
+            reserialized = json.dumps(evaluated, ensure_ascii=False, indent=2)
+            return _fmt_tool_args(reserialized)
+        except Exception:
+            return args_str
 
     if not isinstance(args, dict):
         return json.dumps(args, ensure_ascii=False, indent=2)
