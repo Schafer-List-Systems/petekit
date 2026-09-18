@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+from typing import Any
 from ..utils.three_merge import merge
 import os
 
@@ -26,8 +27,8 @@ class TextEditor(BufferManager, AgenticObject):
 
     Workflow:
       1. load_text(file_path) — load a file into a buffer (keyed by its path)
-      2. read_buffer(file_path, start=N, end=M) — read a line range
-      3. edit_buffer(file_path, old, new) — make in-memory changes
+      2. read_buffer(...) — read a line range
+      3. edit_buffer(...) — make in-memory changes
       4. store_text(buffer_name, file_path) — write back to disk (refuses if file was modified externally)
     """
 
@@ -36,11 +37,11 @@ class TextEditor(BufferManager, AgenticObject):
         self.expected_file_state: dict[str, ExpectedFileData] = {}
 
     @tool(description="Load a file from disk into a buffer named 'file:<abs_path>'.")
-    def load_text(self, file_path: str, overwrite_internal_buffer: bool = False) -> str:
+    def load_text(self, file_path: str, overwrite_internal_buffer: bool = False) -> dict[str, Any]:
         """Load a file. Creates it if it does not exist. Sets modified_at from the file's mtime."""
         abs_path = os.path.abspath(file_path)
         if not os.path.isfile(abs_path):
-            return f"Error: file '{abs_path}' does not exist. Cannot load a non-existent file."
+            return {"ok": False, "error": f"File '{abs_path}' does not exist. Cannot load a non-existent file."}
         try:
             with open(abs_path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -49,21 +50,21 @@ class TextEditor(BufferManager, AgenticObject):
             key = f"file:{abs_path}"
             count = self._create_buffer(key, text=content, modified_at=mtime, overwrite=overwrite_internal_buffer)
             if count is None:
-                return f"Error: buffer 'file:{abs_path}' already exists. Use overwrite_internal_buffer=True to replace it."
-            return f"Loaded file to buffer 'file:{abs_path}' ({count} lines)."
+                return {"ok": False, "error": f"Buffer 'file:{abs_path}' already exists. Use overwrite_internal_buffer=True to replace it."}
+            return {"ok": True, "buffer": key, "lines": count}
         except Exception as e:
-            return f"Error: {type(e).__name__}: {e}"
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     @tool(description="Write a buffer to a file on disk. If merge_changes=True, attempts a 3-way merge when the file was modified externally.")
-    def store_text(self, buffer_name: str, file_path: str, merge_changes: bool = False) -> str:
+    def store_text(self, buffer_name: str, file_path: str, merge_changes: bool = False) -> dict[str, Any]:
         """Store buffer to disk, checking mtime guard rail via expected_file_state."""
         if buffer_name not in self._buffers:
-            return f"Error: no buffer named '{buffer_name}'. Use load_text first."
+            return {"ok": False, "error": f"No buffer named '{buffer_name}'. Use load_text first."}
         buf = self._buffers[buffer_name]
         abs_path = os.path.abspath(file_path)
         if os.path.isfile(abs_path):
             if abs_path not in self.expected_file_state:
-                return f"Error: no expected_file_state for '{abs_path}'. Use load_text first."
+                return {"ok": False, "error": f"No expected_file_state for '{abs_path}'. Use load_text first."}
             try:
                 current_mtime = os.path.getmtime(abs_path)
             except FileNotFoundError:
@@ -71,11 +72,14 @@ class TextEditor(BufferManager, AgenticObject):
             else:
                 if current_mtime > self.expected_file_state[abs_path].mtime:
                     if not merge_changes:
-                        return (
-                            f"Error: file '{abs_path}' was modified externally. "
-                            f"Your loaded mtime: {self.expected_file_state[abs_path].mtime}, current mtime: {current_mtime}. "
-                            "Use diff_text to see the external changes, or pass merge_changes=True to store_text to attempt a 3-way merge."
-                        )
+                        return {
+                            "ok": False,
+                            "error": (
+                                f"File '{abs_path}' was modified externally. "
+                                f"Your loaded mtime: {self.expected_file_state[abs_path].mtime}, current mtime: {current_mtime}. "
+                                "Use diff_text to see the external changes, or pass merge_changes=True to store_text to attempt a 3-way merge."
+                            ),
+                        }
                     try:
                         with open(abs_path, "r", encoding="utf-8") as f:
                             disk_content = f.read()
@@ -94,13 +98,17 @@ class TextEditor(BufferManager, AgenticObject):
                         merged_lines = merged_text.splitlines()
                         buf.lines = [BufferEntry(data=line, timestamp=new_mtime, seen=True) for line in merged_lines]
                     except Exception as e:
-                        return f"Error: {type(e).__name__}: {e}"
+                        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
                     if not had_conflicts:
-                        return f"File '{abs_path}': 3-way merge applied cleanly — all changes preserved."
-                    return (
-                        f"File '{abs_path}': 3-way merge applied — unresolved conflicts detected. "
-                        "Use diff_text('{abs_path}') to locate and resolve them."
-                    )
+                        return {"ok": True, "file": abs_path, "merged": True, "conflicts": False, "lines": len(merged_lines)}
+                    return {
+                        "ok": True,
+                        "file": abs_path,
+                        "merged": True,
+                        "conflicts": True,
+                        "lines": len(merged_lines),
+                        "error": "Unresolved conflicts detected. Use diff_text to locate and resolve them.",
+                    }
         try:
             text = "\n".join(entry.data for entry in buf.lines)
             with open(abs_path, "w", encoding="utf-8") as f:
@@ -109,12 +117,12 @@ class TextEditor(BufferManager, AgenticObject):
             buf.modified_at = new_mtime
             buf_content = [entry.data for entry in buf.lines]
             self.expected_file_state[abs_path] = ExpectedFileData(mtime=new_mtime, content=buf_content)
-            return f"Stored {len(buf.lines)} lines to {abs_path}."
+            return {"ok": True, "file": abs_path, "lines": len(buf.lines)}
         except Exception as e:
-            return f"Error: {type(e).__name__}: {e}"
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     @tool
-    def diff_text(self, file_path: str, scope: str = "external", overwrite: bool = False) -> str:
+    def diff_text(self, file_path: str, scope: str = "external", overwrite: bool = False) -> dict[str, Any]:
         """
         Compare buffer and file states based on scope and store the unified diff in a buffer.
 
@@ -134,13 +142,13 @@ class TextEditor(BufferManager, AgenticObject):
         abs_path = os.path.abspath(file_path)
         key = f"file:{abs_path}"
         if key not in self._buffers:
-            return f"Error: no buffer named 'file:{abs_path}'. Use load_text first."
+            return {"ok": False, "error": f"no buffer named 'file:{abs_path}'. Use load_text first."}
         if scope != "buffer_disk":
             if abs_path not in self.expected_file_state:
-                return f"Error: no expected_file_state for '{abs_path}'. Use load_text first."
+                return {"ok": False, "error": f"no expected_file_state for '{abs_path}'. Use load_text first."}
         if scope != "mine":
             if not os.path.isfile(abs_path):
-                return f"Error: file '{abs_path}' no longer exists."
+                return {"ok": False, "error": f"file '{abs_path}' no longer exists."}
         buf = self._buffers[key]
         buf_data_lines = [entry.data for entry in buf.lines]
         base_lines = self.expected_file_state[abs_path].content if abs_path in self.expected_file_state else []
@@ -151,7 +159,7 @@ class TextEditor(BufferManager, AgenticObject):
                     disk_content = f.read()
                 disk_lines = disk_content.splitlines()
             except Exception as e:
-                return f"Error reading file: {type(e).__name__}: {e}"
+                return {"ok": False, "error": f"reading file: {type(e).__name__}: {e}"}
         if scope == "mine":
             left_lines = base_lines
             right_lines = buf_data_lines
@@ -165,14 +173,15 @@ class TextEditor(BufferManager, AgenticObject):
             right_lines = disk_lines
             scope_hint = f"[scope=buffer_disk: buffer vs disk — current divergence]"
         if left_lines == right_lines:
-            return f"No differences ({scope_hint})."
+            return {"ok": True, "identical": True, "scope": scope, "scope_hint": scope_hint}
         diff_name = f"diff:{abs_path}"
         if diff_name in self._buffers and not overwrite:
-            return (
-                f"Buffer '{diff_name}' already exists. "
-                f"To overwrite it, call diff_text again with overwrite=True. "
-                f"Alternatively, drop it first with drop_buffer (but only if you no longer need its content)."
-            )
+            return {
+                "ok": False,
+                "error": f"buffer '{diff_name}' already exists",
+                "diff_buffer": diff_name,
+                "hint": "call diff_text again with overwrite=True, or drop it first with drop_buffer",
+            }
         import difflib
         diff_lines = list(difflib.unified_diff(
             left_lines, right_lines,
@@ -183,4 +192,4 @@ class TextEditor(BufferManager, AgenticObject):
         now = time_mod.time()
         diff_text = "\n".join(diff_lines)
         self._create_buffer(diff_name, text=diff_text, modified_at=now)
-        return f"Diff written to buffer '{diff_name}' ({len(diff_lines)} lines). Use read_buffer to access it."
+        return {"ok": True, "diff_buffer": diff_name, "lines": len(diff_lines)}
