@@ -256,8 +256,76 @@ class TestEditBufferShowTimestamps(unittest.TestCase):
         self.bm.edit_buffer("t", "B", "X")
         result = self.bm.read_buffer("t", show_timestamps=True, raw=True)
         lines = result.strip().split("\n")
-        # first line A should have its original timestamp, not the new one
-        # last line C should have original
-        # middle line X should have new
         for line in lines:
             self.assertRegex(line, r"^\(\d+\.\d+\)")
+
+
+class TestEditBufferScopedRange(unittest.TestCase):
+    """Test edit_buffer with explicit start/end range — only operates within the range."""
+
+    def setUp(self):
+        self.bm = BufferManager()
+
+    def _make(self, text: str, timestamps: list[float] | None = None) -> None:
+        entries = []
+        now = time.time()
+        for i, line in enumerate(text.split("\n")):
+            ts = timestamps[i] if timestamps and i < len(timestamps) else now
+            entries.append(BufferEntry(data=line, timestamp=ts, seen=True))
+        self.bm._buffers["t"] = Buffer(
+            lines=entries,
+            created_at=now,
+            modified_at=now,
+        )
+
+    def _timestamps(self) -> list[float]:
+        return [e.timestamp for e in self.bm._buffers["t"].lines]
+
+    def test_replace_only_within_range_untouched_outside(self):
+        self._make("A\nB\nC\nD\nE", timestamps=[1.0, 2.0, 3.0, 4.0, 5.0])
+        self.bm.edit_buffer("t", "B", "X", start=1, end=4)
+        result = self._timestamps()
+        self.assertEqual(len(result), 5)
+        self.assertAlmostEqual(result[0], 1.0)  # A untouched (before range)
+        self.assertGreater(result[1], 3.0)       # B replaced in range
+        self.assertAlmostEqual(result[2], 3.0)  # C untouched (in range, unchanged)
+        self.assertAlmostEqual(result[3], 4.0)  # D untouched (in range, unchanged)
+        self.assertAlmostEqual(result[4], 5.0)  # E untouched (after range)
+
+    def test_replace_all_within_range_only(self):
+        self._make("A\nB\nA\nB\nA", timestamps=[1.0, 2.0, 3.0, 4.0, 5.0])
+        self.bm.edit_buffer("t", "A", "X", start=1, end=4, replace_all=True)
+        result = self._timestamps()
+        self.assertEqual(len(result), 5)
+        self.assertAlmostEqual(result[0], 1.0)  # A at index 0 outside range, untouched
+        self.assertAlmostEqual(result[1], 2.0)  # B at index 1 outside range, untouched
+        self.assertGreater(result[2], 5.0)  # A at index 2 in range replaced
+        self.assertAlmostEqual(result[3], 4.0)  # B at index 3 outside range, untouched
+        self.assertAlmostEqual(result[4], 5.0)  # A at index 4 outside range, untouched
+
+    def test_replace_expand_within_range(self):
+        self._make("A\nB\nC\nD", timestamps=[1.0, 2.0, 3.0, 4.0])
+        self.bm.edit_buffer("t", "B", "X\nY", start=1, end=3)
+        result = self._timestamps()
+        self.assertEqual(len(result), 5)
+        self.assertAlmostEqual(result[0], 1.0)  # A untouched
+        self.assertGreater(result[1], 2.0)       # X touched
+        self.assertGreater(result[2], 2.0)       # Y touched
+        self.assertAlmostEqual(result[3], 3.0)  # C in range, untouched
+        self.assertAlmostEqual(result[4], 4.0)  # D untouched (after range)
+
+    def test_replace_outside_range_not_found(self):
+        self._make("A\nB\nC", timestamps=[1.0, 2.0, 3.0])
+        result = self.bm.edit_buffer("t", "A", "X", start=2, end=None)
+        self.assertFalse(result["ok"])
+        self.assertIn("not found", result["error"])
+
+    def test_replace_expand_preserves_trailing_untouched(self):
+        self._make("A\nB\nC", timestamps=[1.0, 2.0, 3.0])
+        self.bm.edit_buffer("t", "B", "X\nY", start=1, end=3)
+        result = self._timestamps()
+        self.assertEqual(len(result), 4)
+        self.assertAlmostEqual(result[0], 1.0)  # A untouched
+        self.assertGreater(result[1], 2.0)       # X touched
+        self.assertGreater(result[2], 2.0)       # Y touched
+        self.assertAlmostEqual(result[3], 3.0)  # C untouched (after range)

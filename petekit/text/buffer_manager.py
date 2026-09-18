@@ -301,7 +301,7 @@ class BufferManager(AgenticObject):
     def edit_buffer(self, name: str, old_string: str, new_string: str, start: int = 0, end: int | None = None, replace_all: bool = False) -> dict[str, Any]:
         """Replace old_string with new_string in the buffer content within a [start, end) range.
         Both old_string and new_string can span multiple lines.
-        Use replace_all to replace all occurrences (default False — errors if old_string appears more than once).
+        Use replace_all to replace all occurrences in the given range (default False — errors if old_string appears more than once).
         """
         if name not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{name}'. Use create_buffer first."}
