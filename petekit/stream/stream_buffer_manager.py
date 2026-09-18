@@ -130,11 +130,11 @@ class StreamBufferManager(BufferManager, AgenticObject):
         """Resolve a relative (negative) or absolute float timestamp to an absolute one.
 
         Negative values are offsets from `anchor` (e.g. last entry timestamp or now).
-        Positive values are absolute unix timestamps and are returned unchanged."""
+        Positive values (including 0.0) are absolute unix timestamps and are returned unchanged."""
         return anchor + ts if ts < 0 else ts
 
     @tool
-    def read_buffer(self, name: str, start: int | float | None = None, end: int | float | None = None, show_timestamps: bool = False) -> dict[str, Any]:
+    def read_buffer(self, name: str, start: int | float | None = 0, end: int | float | None = None, show_timestamps: bool = False) -> dict[str, Any]:
         """Read a range of lines from a buffer. Pass int for line-based (0-based, inclusive),
         pass float for time-based read (unix timestamps, stream buffers only).
         Negative floats (e.g. -60.0) are relative to the last entry: -60.0 means '60s ago'.
