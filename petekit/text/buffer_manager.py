@@ -9,6 +9,23 @@ from typing import Literal
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos.oap.decorators import tool
+from petekit.utils.text_formatters import format_dict_list_for_buffer
+
+
+def _resolve_line_range(total: int, start: int | None, end: int | None) -> dict[str, Any] | tuple[int, int]:
+    if start is None:
+        start = total
+    if end is None:
+        end = total
+    if start < -total or start > total:
+        return {"ok": False, "error": f"start={start} is out of range. Valid range: -total to total (i.e. -{total} to {total})."}
+    if end < -total or end > total:
+        return {"ok": False, "error": f"end={end} is out of range. Valid range: -total to total (i.e. -{total} to {total})."}
+    if start < 0:
+        start = total + start
+    if end < 0:
+        end = total + end
+    return (start, end)
 
 
 @dataclass
@@ -16,10 +33,10 @@ class ReadBufferResult:
     """Result of _read_buffer. Signals which branch was taken and carries data for hint construction."""
     kind: Literal["content", "skip", "bucket", "error"]
     content: str | None = None
-    line_range: tuple[int, int] | None = None  # (1-based start, 1-based end)
+    line_range: tuple[int, int] | None = None  # (0-based start, 0-based end, [start, end) semantics)
     total_chars: int = 0
     line_count: int = 0
-    skip_lines: list[tuple[int, int]] | None = None  # (1-based line index, char count)
+    skip_lines: list[tuple[int, int]] | None = None  # (0-based line index, char count)
     bucket_info: list[tuple[int, int, int]] | None = None  # (start, end, chars)
     error: str | None = None
 
@@ -44,9 +61,14 @@ class BufferManager(AgenticObject):
     """You are a buffer manager. You hold multiple named buffers, each a list of lines in memory.
 
     - You can create, write, search, read ranges from, and edit any named buffer.
-    - Use list_buffers to see what exists. Clean up when it becomes messy!
+    - Read the "system:list:buffers" buffer to see what exists. Drop unused buffers when it becomes messy!
+    - Line indices are 0-based, just like Python array indexing.
+      Example: buf[0] is the first line, buf[-1] is the last line, buf[0:5] is the first 5 lines.
+    - Ranges use [start, end) semantics: start is included, end is excluded. end=None means "to the end".
     - Use (?i) at the start of a grep pattern for case-insensitive matching.
     - Always prefer read_buffer with start/end over reading entire buffers when working with large content.
+    - All timestamps are rounded to 6 decimals.
+      Read it to get a JSON array of {name, lines} for each buffer.
     """
 
     _MAX_CHUNK_CHARS = 8000
@@ -55,11 +77,18 @@ class BufferManager(AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._buffers: dict[str, Buffer] = {}
+        self._refresh_buffers_buffer()
 
-    @tool(description="List all existing buffers by name, showing line count for each.")
-    def list_buffers(self) -> dict[str, int]:
-        """List all buffers and their line counts."""
-        return {name: len(buf.lines) for name, buf in self._buffers.items()}
+    def _refresh_buffers_buffer(self) -> None:
+        records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
+        text = format_dict_list_for_buffer(records)
+        if "system:list:buffers" not in self._buffers:
+            self._create_buffer("system:list:buffers", text=text)
+        else:
+            self._buffers["system:list:buffers"].lines = [
+                BufferEntry(data=line, timestamp=time.time(), seen=True) for line in text.splitlines()
+            ]
+            self._buffers["system:list:buffers"].modified_at = time.time()
 
     def _create_buffer(self, name: str, text: str | None = None, modified_at: float | None = None, overwrite: bool = False) -> int | None:
         """Internal buffer creation. Returns number of lines stored, or None if buffer exists and overwrite=False."""
@@ -73,190 +102,259 @@ class BufferManager(AgenticObject):
         self._buffers[name].lines = [BufferEntry(data=line, timestamp=ts, seen=True) for line in text.splitlines()]
         return len(self._buffers[name].lines)
 
-    @tool(description="Create a new buffer with the given name. Optionally provide initial text. Use overwrite=True to replace an existing buffer.")
-    def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False) -> str:
-        """Create a new named buffer, optionally populated with text."""
+    @tool
+    def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False) -> dict[str, Any]:
+        """Create a new buffer with the given name.
+        Optionally provide initial text.
+        Use overwrite=True to replace an existing buffer.
+        """
         existed = name in self._buffers
         result = self._create_buffer(name, text, overwrite=overwrite)
         if result is None:
-            return f"Error: a buffer named '{name}' already exists. Use overwrite=True to replace it."
+            return {"ok": False, "error": f"Buffer '{name}' already exists. Use overwrite=True to replace it."}
+        if name != "system:list:buffers":
+            self._refresh_buffers_buffer()
         if existed:
-            return f"Buffer '{name}' overwritten with {result} lines."
-        return f"Buffer '{name}' created ({result} lines)."
+            return {"ok": True, "overwritten": True, "lines": result}
+        return {"ok": True, "created": True, "lines": result}
 
-    @tool(description="Copy a buffer to a new name. Copies all lines by value. Timestamps of individual lines are preserved. Set overwrite=True to replace an existing target buffer.")
-    def copy_buffer(self, source_name: str, target_name: str, overwrite: bool = False) -> str:
-        """Copy a buffer by value to a new name."""
+    @tool
+    def copy_buffer(self, source_name: str, target_name: str, overwrite: bool = False) -> dict[str, Any]:
+        """Copy a buffer to a new name.
+        Copies all lines by value. Timestamps of individual lines are preserved.
+        Set overwrite=True to replace an existing target buffer.
+        """
         if source_name not in self._buffers:
-            return f"Error: no buffer named '{source_name}'."
+            return {"ok": False, "error": f"No buffer named '{source_name}'."}
         if target_name in self._buffers and not overwrite:
-            return f"Error: buffer '{target_name}' already exists. Use overwrite=True to replace it."
+            return {"ok": False, "error": f"Buffer '{target_name}' already exists. Use overwrite=True to replace it."}
         src = self._buffers[source_name]
         now = time.time()
         new_entries = [BufferEntry(data=e.data, timestamp=e.timestamp, seen=e.seen) for e in src.lines]
         self._buffers[target_name] = Buffer(lines=new_entries, created_at=now, modified_at=now)
-        return f"Buffer '{target_name}' copied from '{source_name}' ({len(new_entries)} lines)."
+        if target_name != "system:list:buffers":
+            self._refresh_buffers_buffer()
+        return {"ok": True, "target": target_name, "source": source_name, "lines": len(new_entries)}
 
-    @tool(description="Fill a buffer with text. Each line in the text becomes one line in the buffer. Replaces existing content. The buffer must already exist.")
-    def write_buffer(self, name: str, text: str) -> str:
-        """Write text into a named buffer, replacing its content."""
+    @tool
+    def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
+        """Overwrite the text in the range [start, end) of a buffer.
+        To overwrite the whole buffer, pass start=0.
+        To insert at line N: pass start=N and end=N.
+        To append: pass start=None and end=None — appends after the last line.
+        """
         if name not in self._buffers:
-            return f"Error: no buffer named '{name}'. Use create_buffer first."
-        result = self._create_buffer(name, text=text, overwrite=True)
-        return f"Wrote {result} lines to buffer '{name}'."
+            return {"ok": False, "error": f"No buffer named '{name}'. Use create_buffer first."}
+        buf = self._buffers[name]
+        total = len(buf.lines)
+        resolved = _resolve_line_range(total, start, end)
+        if isinstance(resolved, dict):
+            return resolved
+        start, end = resolved
+        if start > end:
+            return {"ok": False, "error": f"start ({start}) > end ({end})."}
+        new_entries = [BufferEntry(data=line, timestamp=time.time(), seen=True) for line in text.splitlines()]
+        buf.lines[start:end] = new_entries
+        buf.modified_at = time.time()
+        if name != "system:list:buffers":
+            self._refresh_buffers_buffer()
+        return {"ok": True, "lines_written": len(new_entries), "total_lines": len(buf.lines)}
 
-    @tool(description="Drop (delete) a buffer by name. The buffer and its content are discarded.")
-    def drop_buffer(self, name: str) -> str:
-        """Delete a named buffer."""
+    @tool
+    def drop_buffer(self, name: str) -> dict[str, Any]:
+        """Drop (delete) a buffer by name.
+        The buffer and its content are discarded.
+        """
         if name not in self._buffers:
-            return f"Error: no buffer named '{name}'."
+            return {"ok": False, "error": f"No buffer named '{name}'."}
+        if name == "system:list:buffers":
+            return {"ok": False, "error": "Cannot drop the 'system:list:buffers' buffer."}
         del self._buffers[name]
-        return f"Buffer '{name}' dropped."
+        self._refresh_buffers_buffer()
+        return {"ok": True, "dropped": name}
 
-    @tool(description="Search a buffer for a regex pattern. Returns a list of (start, end, match_count) ranges. Use (?i) at the start for case-insensitive matching.")
-    def grep_buffer(self, name: str, pattern: str) -> list[tuple[int, int, int]]:
-        """Search buffer for pattern, return clustered ranges with match counts."""
+    @tool
+    def grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | None = None) -> dict[str, Any]:
+        """Search a buffer for a regex pattern.
+        Searches the full buffer by default, or a [start, end) range if provided.
+        Returns a dict with ok/error or ok/matches.
+        Use (?i) at the start for case-insensitive matching.
+        """
         if name not in self._buffers:
-            return []
+            return {"ok": False, "error": f"No buffer named '{name}'."}
+        total = len(self._buffers[name].lines)
+        resolved = _resolve_line_range(total, start, end)
+        if isinstance(resolved, dict):
+            return resolved
+        start, end = resolved
+        if start > end:
+            return {"ok": False, "error": f"start ({start}) > end ({end})."}
         try:
             compiled = re.compile(pattern)
         except re.error as e:
-            raise ValueError(f"Invalid regex pattern '{pattern}': {e}")
+            return {"ok": False, "error": f"Invalid regex pattern '{pattern}': {e}."}
         matches = []
         buf = self._buffers[name]
-        for i, entry in enumerate(buf.lines, start=1):
+        for i, entry in enumerate(buf.lines[start:end], start=start):
             if compiled.search(entry.data):
                 matches.append(i)
-        return self._cluster_lines_to_ranges(name, matches, self._NUM_CLUSTERS)
+        clusters = self._cluster_lines_to_ranges(name, matches, self._NUM_CLUSTERS)
+        return {"ok": True, "matches": clusters, "count": len(clusters)}
 
-    def _read_buffer(self, name: str, start: int | None = None, end: int | None = None, show_timestamps: bool = False) -> ReadBufferResult:
-        """Internal read. Returns ReadBufferResult with kind and branch data."""
+    def _read_buffer(self, name: str, start: int = 0, end: int | None = None, show_timestamps: bool = False) -> ReadBufferResult:
+        """Internal read. Returns ReadBufferResult with kind and branch data. Uses 0-based indices with [start, end) semantics."""
         if name not in self._buffers:
             return ReadBufferResult(kind="error", error=f"Error: no buffer named '{name}'. Use create_buffer first.")
         buf = self._buffers[name]
         total = len(buf.lines)
 
-        if start is not None and end is not None:
-            if start > end:
-                return ReadBufferResult(kind="error", error=f"Error: start ({start}) > end ({end}). Buffer has {total} lines.")
-        if start is not None and start > total:
-            return ReadBufferResult(kind="error", error=f"Error: start ({start}) is beyond buffer length ({total} lines).")
-        if end is not None and end < 1:
-            return ReadBufferResult(kind="error", error=f"Error: end ({end}) must be at least 1.")
+        resolved = _resolve_line_range(total, start, end)
+        if isinstance(resolved, dict):
+            return ReadBufferResult(kind="error", error=resolved["error"])
+        start, end = resolved
+        if start > end:
+            return ReadBufferResult(kind="error", error=f"Error: start ({start}) > end ({end}). Buffer has {total} lines.")
+        if start >= total:
+            return ReadBufferResult(kind="error", error=f"Error: start ({start}) is at or beyond buffer length ({total} lines).")
 
-        s = max(0, (start - 1) if start is not None else 0)
-        e = min(total, end if end is not None else total)
         if show_timestamps:
-            segment = [f"({entry.timestamp:.6f}) {entry.data}" for entry in buf.lines[s:e]]
+            segment = [f"({entry.timestamp:.6f}) {entry.data}" for entry in buf.lines[start:end]]
         else:
-            segment = [entry.data for entry in buf.lines[s:e]]
+            segment = [entry.data for entry in buf.lines[start:end]]
         total_chars = sum(len(l) for l in segment) + len(segment)
 
         if total_chars <= BufferManager._MAX_CHUNK_CHARS:
-            for entry in buf.lines[s:e]:
+            for entry in buf.lines[start:end]:
                 entry.seen = True
             return ReadBufferResult(
                 kind="content",
                 content="\n".join(segment),
-                line_range=(s + 1, e),
+                line_range=(start, end),
                 total_chars=total_chars,
                 line_count=len(segment),
             )
 
-        to_skip, _ = self._lines_to_skip(segment, s + 1)
+        to_skip, _ = self._lines_to_skip(segment, start)
         if to_skip and len(to_skip) <= 10:
             return ReadBufferResult(
                 kind="skip",
-                line_range=(s + 1, e),
+                line_range=(start, end),
                 total_chars=total_chars,
                 line_count=len(segment),
                 skip_lines=to_skip,
             )
 
-        buckets = self._make_buckets(segment, 10, s + 1)
+        buckets = self._make_buckets(segment, 10, start)
         return ReadBufferResult(
             kind="bucket",
-            line_range=(s + 1, e),
+            line_range=(start, end),
             total_chars=total_chars,
             line_count=len(segment),
             bucket_info=buckets,
         )
 
-    @tool(description="Read a range of lines from a buffer. start and end are 1-based and inclusive. Set show_timestamps=True to prefix each line with its unix timestamp.")
-    def read_buffer(self, name: str, start: int | None = None, end: int | None = None, show_timestamps: bool = False) -> str:
-        """Read buffer content with size guard-rails. Returns a hint if the range is too large."""
+    @tool
+    def read_buffer(
+        self,
+        name: str,
+        start: int = 0,
+        end: int | None = None,
+        show_timestamps: bool = False,
+        raw: bool = False,
+    ) -> dict[str, Any] | str:
+        """Read a range of lines from a buffer.
+        Set show_timestamps=True to prefix each line with its unix timestamp.
+        Returns a dict with ok/error or ok/content on success.
+        Set raw=True to get the raw string instead of a dict — errors always return dict.
+        """
         result = self._read_buffer(name, start, end, show_timestamps)
         if result.kind == "error":
-            return result.error  # type: ignore
+            return {"ok": False, "error": result.error}
         if result.kind == "content":
-            return result.content  # type: ignore
+            if raw:
+                return result.content
+            return {"ok": True, "content": result.content, "line_range": result.line_range, "lines": result.line_count}
         if result.kind == "skip":
-            skip_lines = result.skip_lines  # type: ignore
+            skip_lines = result.skip_lines
             skip_msg = ", ".join(f"line {idx}({cl} chars)" for idx, cl in skip_lines)
-            return (
-                f"Range [{result.line_range[0]}–{result.line_range[1]}] is {result.total_chars} chars ({result.line_count} lines). "
-                f"Heaviest lines ({len(skip_lines)} totaling {sum(c for _, c in skip_lines)} chars): {skip_msg}. "
-                f"Consider re-reading with a narrower range to avoid them."
-            )
+            return {
+                "ok": False,
+                "error": (
+                    f"Range [{result.line_range[0]}–{result.line_range[1]}] is {result.total_chars} chars ({result.line_count} lines). "
+                    f"Heaviest lines ({len(skip_lines)} totaling {sum(c for _, c in skip_lines)} chars): {skip_msg}. "
+                    f"Consider re-reading with a narrower range to avoid them."
+                ),
+            }
         # kind == "bucket"
         result_bucket = result.bucket_info  # type: ignore
         bucket_msgs = ", ".join(f"{sa}-{en}:{c}" for sa, en, c in result_bucket)
-        return (
-            f"Range [{result.line_range[0]}–{result.line_range[1]}] is {result.total_chars} chars ({result.line_count} lines) and exceeds the {BufferManager._MAX_CHUNK_CHARS}-char threshold. "
-            f"Reduce the read range to stay under the limit. "
-            f"Bucket distribution (start-end:chars): {bucket_msgs}."
-        )
+        return {
+            "ok": False,
+            "error": (
+                f"Range [{result.line_range[0]}–{result.line_range[1]}] is {result.total_chars} chars ({result.line_count} lines) and exceeds the {BufferManager._MAX_CHUNK_CHARS}-char threshold. "
+                f"Reduce the read range to stay under the limit. "
+                f"Bucket distribution (start-end:chars): {bucket_msgs}."
+            ),
+        }
 
-    @tool(description="Replace old_string with new_string in the buffer content. Both old_string and new_string can span multiple lines. Use replace_all to replace all occurrences (default False — errors if old_string appears more than once).")
-    def edit_buffer(self, name: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
-        """Replace text content with new text, rebuild lines array."""
+    @tool
+    def edit_buffer(self, name: str, old_string: str, new_string: str, start: int = 0, end: int | None = None, replace_all: bool = False) -> dict[str, Any]:
+        """Replace old_string with new_string in the buffer content within a [start, end) range.
+        Both old_string and new_string can span multiple lines.
+        Use replace_all to replace all occurrences (default False — errors if old_string appears more than once).
+        """
         if name not in self._buffers:
-            return f"Error: no buffer named '{name}'. Use create_buffer first."
+            return {"ok": False, "error": f"No buffer named '{name}'. Use create_buffer first."}
         buf = self._buffers[name]
-        old_entries = buf.lines
-        old_timestamps = [e.timestamp for e in old_entries]
-        original_content = "\n".join(entry.data for entry in old_entries)
+        total = len(buf.lines)
+        resolved = _resolve_line_range(total, start, end)
+        if isinstance(resolved, dict):
+            return resolved
+        lo, hi = resolved
+
+        segment_entries = buf.lines[lo:hi]
+        segment_text = "\n".join(e.data for e in segment_entries)
 
         all_ranges: list[tuple[int, int]] = []
         pos = 0
         while True:
-            idx = original_content.find(old_string, pos)
+            idx = segment_text.find(old_string, pos)
             if idx == -1:
                 break
             all_ranges.append((idx, idx + len(old_string)))
             pos = idx + 1
 
         if len(all_ranges) == 0:
-            return f"Error: '{old_string}' not found in buffer."
+            return {"ok": False, "error": f"'{old_string}' not found in buffer."}
 
         if not replace_all and len(all_ranges) > 1:
-            line_numbers = [i + 1 for i, entry in enumerate(buf.lines) if old_string in entry.data]
+            line_numbers = [lo + i for i, e in enumerate(segment_entries) if old_string in e.data]
             clusters = self._cluster_lines_to_ranges(name, line_numbers, 5)
             cluster_msgs = ", ".join(f"lines {s}–{e} ({n} occurrence(s))" for s, e, n in clusters)
-            return (
-                f"Error: '{old_string}' found multiple times ({original_content.count(old_string)} total) at: {cluster_msgs}. "
-                "Set replace_all=True to replace all occurrences."
-            )
+            return {
+                "ok": False,
+                "error": (
+                    f"'{old_string}' found multiple times ({segment_text.count(old_string)} total) at: {cluster_msgs}. "
+                    "Set replace_all=True to replace all occurrences."
+                ),
+            }
         char_ranges = all_ranges if replace_all else [all_ranges[0]]
 
-        new_content = original_content
-        for start, end in reversed(char_ranges):
-            new_content = new_content[:start] + new_string + new_content[end:]
+        new_content = segment_text
+        for r_start, r_end in reversed(char_ranges):
+            new_content = new_content[:r_start] + new_string + new_content[r_end:]
 
         if not replace_all and len(char_ranges) > 1:
-            line_numbers = [i + 1 for i, entry in enumerate(buf.lines) if old_string in entry.data]
-            clusters = self._cluster_lines_to_ranges(name, line_numbers, 5)
-            cluster_msgs = ", ".join(f"lines {s}–{e} ({n} occurrence(s))" for s, e, n in clusters)
-            return (
-                f"Error: '{old_string}' found multiple times ({original_content.count(old_string)} total) at: {cluster_msgs}. "
-                "Set replace_all=True to replace all occurrences."
-            )
+            return {
+                "ok": False,
+                "error": f"'{old_string}' found multiple times. Set replace_all=True to replace all occurrences.",
+            }
         if len(char_ranges) == 0:
-            return f"Error: '{old_string}' not found in buffer."
+            return {"ok": False, "error": f"'{old_string}' not found in buffer."}
 
-        new_content = original_content
-        for start, end in reversed(char_ranges):
-            new_content = new_content[:start] + new_string + new_content[end:]
+        new_content = segment_text
+        for r_start, r_end in reversed(char_ranges):
+            new_content = new_content[:r_start] + new_string + new_content[r_end:]
 
         new_lines = new_content.splitlines()
         now = time.time()
@@ -267,10 +365,13 @@ class BufferManager(AgenticObject):
 
         replaced_line_indices: set[int] = set()
         for r_start, r_end in sorted_ranges:
-            first_newline = original_content[:r_start].count('\n')
-            last_newline = original_content[:r_end].count('\n') - 1
+            first_newline = segment_text[:r_start].count('\n')
+            last_newline = segment_text[:r_end].count('\n') - 1
             for li in range(first_newline, last_newline + 1):
-                replaced_line_indices.add(li)
+                replaced_line_indices.add(lo + li)
+
+        old_entries = buf.lines
+        old_timestamps = [e.timestamp for e in old_entries]
 
         char_offset = 0
         for new_i, line_text in enumerate(new_lines):
@@ -308,54 +409,48 @@ class BufferManager(AgenticObject):
                 if mapped_pos <= 0:
                     mapped_line_idx = 0
                 else:
-                    mapped_line_idx = original_content[:mapped_pos].count('\n')
+                    mapped_line_idx = segment_text[:mapped_pos].count('\n')
+                abs_mapped = lo + mapped_line_idx
                 if (
-                    new_i < len(old_entries)
-                    and old_entries[new_i].data == line_text
-                    and new_i not in used_old_indices
-                    and new_i not in replaced_line_indices
+                    abs_mapped < len(old_entries)
+                    and old_entries[abs_mapped].data == line_text
+                    and abs_mapped not in used_old_indices
+                    and abs_mapped not in replaced_line_indices
                 ):
                     result_entries.append(
-                        BufferEntry(data=line_text, timestamp=old_timestamps[new_i], seen=True)
+                        BufferEntry(data=line_text, timestamp=old_timestamps[abs_mapped], seen=True)
                     )
-                    used_old_indices.add(new_i)
-                elif (
-                    mapped_line_idx < len(old_entries)
-                    and old_entries[mapped_line_idx].data == line_text
-                    and mapped_line_idx not in used_old_indices
-                    and mapped_line_idx not in replaced_line_indices
-                ):
-                    result_entries.append(
-                        BufferEntry(data=line_text, timestamp=old_timestamps[mapped_line_idx], seen=True)
-                    )
-                    used_old_indices.add(mapped_line_idx)
+                    used_old_indices.add(abs_mapped)
                 else:
                     result_entries.append(BufferEntry(data=line_text, timestamp=now, seen=True))
 
-        buf.lines = result_entries
+        buf.lines[lo:hi] = result_entries
         buf.modified_at = now
-        count = len(char_ranges)
-        return f"Replaced {count} occurrence(s) of '{old_string}'."
+        return {"ok": True, "count": len(char_ranges), "old_string": old_string}
 
-    @tool(description="Diff two buffers line-by-line using a unified diff. Stores the result in a target buffer named diff:a→b. Use overwrite=True to overwrite an existing diff buffer.")
-    def diff_buffers(self, a: str, b: str, overwrite: bool = False) -> str:
-        """Diff two buffers and store the result in a diff buffer."""
+    @tool
+    def diff_buffers(self, a: str, b: str, overwrite: bool = False) -> dict[str, Any]:
+        """Diff two buffers line-by-line using a unified diff.
+        Stores the result in a target buffer named diff:a→b.
+        Use overwrite=True to overwrite an existing diff buffer.
+        """
         if a not in self._buffers:
-            return f"Error: no buffer named '{a}'."
+            return {"ok": False, "error": f"No buffer named '{a}'."}
         if b not in self._buffers:
-            return f"Error: no buffer named '{b}'."
+            return {"ok": False, "error": f"No buffer named '{b}'."}
         buf_a = [e.data for e in self._buffers[a].lines]
         buf_b = [e.data for e in self._buffers[b].lines]
         if buf_a == buf_b:
-            return f"No differences — buffers '{a}' and '{b}' are identical."
+            return {"ok": True, "identical": True, "a": a, "b": b}
         diff_name = f"diff:{a}→{b}"
         if diff_name in self._buffers and not overwrite:
-            return (
-                f"Target Buffer '{diff_name}' already exists. "
-                f"To overwrite it, call diff_buffers again with overwrite=True. "
-                f"Alternatively, drop it first with drop_buffer. "
-                f"Make sure not to overwrite or drop data that you still need."
-            )
+            return {
+                "ok": False,
+                "error": (
+                    f"Target buffer '{diff_name}' already exists. "
+                    f"Use overwrite=True to replace it, or drop it first with drop_buffer."
+                ),
+            }
         import difflib
         diff_lines = list(difflib.unified_diff(
             buf_a, buf_b,
@@ -364,7 +459,7 @@ class BufferManager(AgenticObject):
         ))
         now = time.time()
         self._buffers[diff_name] = Buffer(lines=[BufferEntry(data=line, timestamp=now, seen=True) for line in diff_lines], created_at=now, modified_at=now)
-        return f"Diff written to buffer '{diff_name}' ({len(diff_lines)} lines). Use read_buffer to access it."
+        return {"ok": True, "buffer": diff_name, "lines": len(diff_lines)}
 
     def _lines_to_skip(self, segment: list[str], start_offset: int) -> tuple[list[tuple[int, int]], int]:
         """Find the minimum set of longest lines whose removal makes the segment fit under MAX.
@@ -426,10 +521,10 @@ class BufferManager(AgenticObject):
         buf_lines = self._buffers[name].lines
 
         def span_chars(start: int, end: int) -> int:
-            return sum(len(buf_lines[i - 1].data) + 1 for i in range(start, end + 1))
+            return sum(len(buf_lines[i].data) + 1 for i in range(start, end + 1))
 
         clusters = [
-            {'s': ln, 'e': ln, 'v': len(buf_lines[ln - 1].data) + 1, 'n': 1}
+            {'s': ln, 'e': ln, 'v': len(buf_lines[ln].data) + 1, 'n': 1}
             for ln in line_numbers
         ]
 

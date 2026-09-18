@@ -9,7 +9,8 @@ import unittest
 sys.path.insert(0, "/home/frygge/projects/AIOS/peteos-kit")
 sys.path.insert(0, "/home/frygge/projects/private/petekit/src/peteos/peteos")
 
-from petekit.buffer_manager import BufferManager, BufferEntry
+from petekit import BufferManager, BufferEntry
+from petekit.text.buffer_manager import Buffer
 
 
 class TestBufferManagerBasics(unittest.TestCase):
@@ -20,19 +21,19 @@ class TestBufferManagerBasics(unittest.TestCase):
 
     def test_create_buffer_empty(self):
         result = self.bm.create_buffer("test")
-        self.assertIn("created", result)
+        self.assertTrue(result["ok"])
         result2 = self.bm.create_buffer("test")
-        self.assertIn("already exists", result2)
+        self.assertFalse(result2["ok"])
 
     def test_create_buffer_with_text(self):
         result = self.bm.create_buffer("test", text="line1\nline2")
-        self.assertIn("2 lines", result)
-        content = self.bm.read_buffer("test")
+        self.assertTrue(result["ok"])
+        content = self.bm.read_buffer("test", raw=True)
         self.assertEqual(content, "line1\nline2")
 
     def test_read_buffer_with_timestamps(self):
         self.bm.create_buffer("test", text="a\nb")
-        result = self.bm.read_buffer("test", show_timestamps=True)
+        result = self.bm.read_buffer("test", show_timestamps=True, raw=True)
         lines = result.strip().split("\n")
         for line in lines:
             self.assertRegex(line, r"^\(\d+\.\d+\)")
@@ -40,31 +41,34 @@ class TestBufferManagerBasics(unittest.TestCase):
 
     def test_read_buffer_ranges(self):
         self.bm.create_buffer("test", text="a\nb\nc\nd\ne")
-        result = self.bm.read_buffer("test", start=2, end=4)
+        result = self.bm.read_buffer("test", start=1, end=4, raw=True)
         self.assertEqual(result, "b\nc\nd")
 
     def test_write_buffer(self):
         self.bm.create_buffer("test")
         result = self.bm.write_buffer("test", "x\ny\nz")
-        self.assertIn("3 lines", result)
-        self.assertEqual(self.bm.read_buffer("test"), "x\ny\nz")
+        self.assertTrue(result["ok"])
+        content = self.bm.read_buffer("test", raw=True)
+        self.assertEqual(content, "x\ny\nz")
 
     def test_write_buffer_nonexistent(self):
         result = self.bm.write_buffer("nonexistent", "text")
-        self.assertIn("Error", result)
+        self.assertFalse(result["ok"])
 
     def test_drop_buffer(self):
         self.bm.create_buffer("test", text="data")
         result = self.bm.drop_buffer("test")
-        self.assertIn("dropped", result)
+        self.assertTrue(result["ok"])
         result2 = self.bm.drop_buffer("test")
-        self.assertIn("Error", result2)
+        self.assertFalse(result2["ok"])
 
     def test_list_buffers(self):
         self.bm.create_buffer("a", text="x")
         self.bm.create_buffer("b", text="y\nz")
-        listing = self.bm.list_buffers()
-        self.assertEqual(listing, {"a": 1, "b": 2})
+        listing_raw = self.bm.read_buffer("system:list:buffers", raw=True)
+        self.assertIn('"name": "a"', listing_raw)
+        self.assertIn('"name": "b"', listing_raw)
+        self.assertIn('"name": "system:list:buffers"', listing_raw)
 
 
 class TestEditBufferTimestampSemantics(unittest.TestCase):
@@ -80,9 +84,7 @@ class TestEditBufferTimestampSemantics(unittest.TestCase):
         for i, line in enumerate(text.split("\n")):
             ts = timestamps[i] if timestamps and i < len(timestamps) else now
             entries.append(BufferEntry(data=line, timestamp=ts, seen=True))
-        self.bm._buffers["t"] = __import__(
-            "petekit.buffer_manager", fromlist=["Buffer"]
-        ).Buffer(
+        self.bm._buffers["t"] = Buffer(
             lines=entries,
             created_at=now,
             modified_at=now,
@@ -156,8 +158,8 @@ class TestEditBufferTimestampSemantics(unittest.TestCase):
     def test_replace_nonexistent_returns_error(self):
         self._make("A\nB\nC")
         result = self.bm.edit_buffer("t", "Z", "X")
-        self.assertIn("Error", result)
-        self.assertIn("not found", result)
+        self.assertFalse(result["ok"])
+        self.assertIn("not found", result["error"])
 
     def test_replace_all_with_single_occurrence(self):
         self._make("A\nB\nC", timestamps=[1.0, 2.0, 3.0])
@@ -171,19 +173,19 @@ class TestEditBufferTimestampSemantics(unittest.TestCase):
     def test_partial_match_without_replace_all_returns_error(self):
         self._make("A\nB\nA")
         result = self.bm.edit_buffer("t", "A", "X")
-        self.assertIn("found multiple times", result)
-        self.assertIn("Set replace_all=True", result)
+        self.assertFalse(result["ok"])
+        self.assertIn("found multiple times", result["error"])
+        self.assertIn("Set replace_all=True", result["error"])
 
     def test_empty_buffer_replace(self):
-        self.bm._buffers["t"] = __import__(
-            "petekit.buffer_manager", fromlist=["Buffer"]
-        ).Buffer(
+        self.bm._buffers["t"] = Buffer(
             lines=[],
             created_at=0.0,
             modified_at=0.0,
         )
         result = self.bm.edit_buffer("t", "A", "X")
-        self.assertIn("not found", result)
+        self.assertFalse(result["ok"])
+        self.assertIn("not found", result["error"])
 
     def test_timestamp_precision_single_edit(self):
         t0 = time.time()
@@ -203,17 +205,20 @@ class TestEditBufferReturnValues(unittest.TestCase):
     def test_single_replace_hint(self):
         self.bm.create_buffer("t", text="A\nB")
         result = self.bm.edit_buffer("t", "A", "X")
-        self.assertIn("1 occurrence", result)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 1)
 
     def test_replace_all_hint_count(self):
         self.bm.create_buffer("t", text="A\nA\nA")
         result = self.bm.edit_buffer("t", "A", "X", replace_all=True)
-        self.assertIn("3 occurrence", result)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 3)
 
     def test_multiline_hint(self):
         self.bm.create_buffer("t", text="A\nB\nC")
         result = self.bm.edit_buffer("t", "A\nB", "X")
-        self.assertIn("1 occurrence", result)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 1)
 
 
 class TestDiffBuffers(unittest.TestCase):
@@ -226,8 +231,9 @@ class TestDiffBuffers(unittest.TestCase):
         self.bm.create_buffer("a", text="x\ny")
         self.bm.create_buffer("b", text="x\nz")
         result = self.bm.diff_buffers("a", "b")
-        self.assertIn("diff:a→b", result)
-        diff_content = self.bm.read_buffer("diff:a→b")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["buffer"], "diff:a→b")
+        diff_content = self.bm.read_buffer("diff:a→b", raw=True)
         self.assertIn("-y", diff_content)
         self.assertIn("+z", diff_content)
 
@@ -235,7 +241,8 @@ class TestDiffBuffers(unittest.TestCase):
         self.bm.create_buffer("a", text="x\ny")
         self.bm.create_buffer("b", text="x\ny")
         result = self.bm.diff_buffers("a", "b")
-        self.assertIn("identical", result)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["identical"])
 
 
 class TestEditBufferShowTimestamps(unittest.TestCase):
@@ -247,7 +254,7 @@ class TestEditBufferShowTimestamps(unittest.TestCase):
     def test_edit_preserves_timestamps_in_read_output(self):
         self.bm.create_buffer("t", text="A\nB\nC")
         self.bm.edit_buffer("t", "B", "X")
-        result = self.bm.read_buffer("t", show_timestamps=True)
+        result = self.bm.read_buffer("t", show_timestamps=True, raw=True)
         lines = result.strip().split("\n")
         # first line A should have its original timestamp, not the new one
         # last line C should have original
