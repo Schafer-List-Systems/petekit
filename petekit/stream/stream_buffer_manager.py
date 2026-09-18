@@ -10,226 +10,202 @@ from typing import Any, Coroutine
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos.oap.decorators import sandbox, tool
+from ..utils.text_formatters import format_dict_list_for_buffer
 from ..text.buffer_manager import Buffer, BufferEntry, BufferManager
 
 
 @dataclass
-class Rule:
-    """A rule with a condition and an action, keyed by name in StreamBufferRules.rules.
-
-    The condition returns None (no match) or a dict (matched, dict is signal metadata).
-    Returning {} means matched with no metadata. Returning {"key": "val"} means matched
-    with rich metadata that the action can use (e.g. matched text, entity key, etc.).
-
-    The action is responsible for marking the entry as consumed (seen=True) once
-    it has processed it. This ensures the entry is excluded from the unseen_count
-    and the router only surfaces unconsumed entries to the agent for reasoning."""
-    condition: Callable[["BufferEntry", "Buffer"], None | dict]
-    action: Callable[["BufferEntry", str, dict], Coroutine[Any, Any, None]] | None = None
+class StreamBufferHookError:
+    timestamp: float = field(default_factory=time.time)  # when the error occurred
+    error: str = ""  # exception message
 
 
 @dataclass
-class StreamBufferRules:
-    """Holds rules (keyed by name) and an optional fallback rule for a stream.
+class StreamBufferHook:
+    # the async hook function, called with (entry, stream_buffer) after append
+    callable_: Callable[[BufferEntry, str], Coroutine[Any, Any, None]]
+    created_at: float = field(default_factory=time.time)  # registration timestamp
+    fire_count: int = 0  # how many times this hook has fired
+    errors: list[StreamBufferHookError] = field(default_factory=list)  # errors from fire-and-forget
+    # higher = fires sooner; owner hooks use 10000+ so agent hooks (1..9999) always fire after
+    priority: int = 0
 
-    Content lives in BufferManager._buffers (stream: prefix).
 
-    Rule evaluation: each rule is checked in order; its action fires if condition
-    is True. The fallback rule fires only when no other rule matched — this is the
-    'unexpected data' path that surfaces to the agent for reasoning."""
-    rules: dict[str, Rule] = field(default_factory=dict)
-    fallback: Rule | None = None
+@dataclass
+class StreamBufferConfig:
+    created_at: float = field(default_factory=time.time)  # stream creation timestamp
+    hooks: list[StreamBufferHook] = field(default_factory=list)  # all hooks on this stream
+
+
+def _fmt_ts(ts: float, round_up: bool = False) -> str:
+    """Format timestamp for agent-facing hints — up to 6 decimal places, trailing zeros stripped.
+
+    Use round_up=True for upper bounds (end of range) to avoid excluding entries
+    due to precision loss when the 7th+ digit rounds up. Use round_up=False (default)
+    for lower bounds (start of range)."""
+    s = f"{ts:.6f}"
+    rounded = float(s)
+    if round_up:
+        if rounded < ts:
+            ts = rounded + 0.000001
+    else:
+        if rounded > ts:
+            ts = rounded - 0.000001
+    return f"{ts:.6f}".rstrip("0").rstrip(".") or "0"
 
 
 class StreamBufferManager(BufferManager, AgenticObject):
     """
-    - You can read buffers also via "read_stream_buffer", which will allow you to access them via timestamps.
-      - Usually only 'stream:' prefixed buffers will work because their timestamps are ordered.
-      - Timestamps shown in read_stream_buffer hints are rounded to 6 decimals.
+    - You can read buffers via read_buffer with int (line-based) or float (time-based) start/end.
+      - Float start/end values trigger time-based reading on stream buffers.
+      - Timestamps in skip/bucket messages are rounded to 6 decimal places.
+    - The buffer "list:stream_buffers" is always up to date with all current stream buffers.
+      Read it to get a JSON array of {name, created_at, hook_count} for each stream.
     """
 
     # DESIGN: window_size (rolling trim) is deferred — buffers grow indefinitely for now.
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._stream_buffer_rules: dict[str, StreamBufferRules] = {}
-        self._stream_fallback_config: dict = {}
-
-    def _create_stream(self, stream_buffer: str) -> StreamBufferRules:
-        """Create a named stream. Raises KeyError if it already exists or name lacks 'stream:' prefix."""
-        if not stream_buffer.startswith("stream:"):
-            raise KeyError(f"Stream name '{stream_buffer}' must start with 'stream:' prefix.")
-        if stream_buffer in self._stream_buffer_rules:
-            raise KeyError(f"Stream '{stream_buffer}' already exists.")
-        super().create_buffer(stream_buffer)
-        rules = StreamBufferRules(rules={}, fallback=None)
-        self._stream_buffer_rules[stream_buffer] = rules
-        return rules
-
-    def _drop_stream(self, stream_buffer: str) -> None:
-        """Drop a stream and all its entries. Raises KeyError if it doesn't exist."""
-        if stream_buffer not in self._stream_buffer_rules:
-            raise KeyError(f"No stream named '{stream_buffer}'.")
-        super().drop_buffer(stream_buffer)
-        del self._stream_buffer_rules[stream_buffer]
-
-    def _list_streams(self) -> dict[str, int]:
-        """List all streams with their unseen counts."""
-        return {
-            name: sum(1 for e in self._buffers[name].lines if not e.seen)
-            for name in self._stream_buffer_rules
-        }
-
-    def _get_stream_rules(self, stream_buffer: str) -> StreamBufferRules:
-        """Get the StreamBufferRules for a stream. Raises KeyError if it doesn't exist."""
-        if stream_buffer not in self._stream_buffer_rules:
-            raise KeyError(f"No stream named '{stream_buffer}'.")
-        return self._stream_buffer_rules[stream_buffer]
-
-    def _timestamp_range_to_lines(self, buf: Buffer, start_time: float, end_time: float) -> tuple[int, int]:
-        """Convert [start_time, end_time] to 1-based line range using binary search. Returns (lo, hi) or (-1, -1) if no entries match."""
-        timestamps = [entry.timestamp for entry in buf.lines]
-        lo = bisect.bisect_left(timestamps, start_time)
-        hi = bisect.bisect_right(timestamps, end_time)
-        if lo >= hi:
-            return (-1, -1)
-        return (lo + 1, hi)  # 1-based
-
-    def _fmt_ts(self, ts: float, round_up: bool = False) -> str:
-        """Format timestamp for agent-facing hints — up to 6 decimal places, trailing zeros stripped.
-
-        Use round_up=True for upper bounds (end of range) to avoid excluding entries
-        due to precision loss when the 7th+ digit rounds up. Use round_up=False (default)
-        for lower bounds (start of range)."""
-        s = f"{ts:.6f}"
-        rounded = float(s)
-        if round_up:
-            if rounded < ts:
-                ts = rounded + 0.000001
-        else:
-            if rounded > ts:
-                ts = rounded - 0.000001
-        return f"{ts:.6f}".rstrip("0").rstrip(".") or "0"
+        self.stream_buffer_configs: dict[str, StreamBufferConfig] = {}
+        self._refresh_stream_buffers_buffer()
 
     @tool
-    def read_stream_buffer(self, stream_buffer: str, start_time: float | None = None, end_time: float | None = None) -> str:
-        """Read from a buffer within a time range [start_time, end_time] instead of using line numbers."""
-        if stream_buffer not in self._stream_buffer_rules:
-            raise KeyError(f"No stream named '{stream_buffer}'.")
-        buf = self._buffers[stream_buffer]
-        if not buf.lines:
-            return f"Buffer '{stream_buffer}' is empty."
-        if start_time is None:
-            start_time = buf.lines[0].timestamp
-        if end_time is None:
-            end_time = buf.lines[-1].timestamp
-        lo, hi = self._timestamp_range_to_lines(buf, start_time, end_time)
-        if lo == -1:
-            timestamps = [entry.timestamp for entry in buf.lines]
-            idx = bisect.bisect_left(timestamps, start_time)
-            nearest_before = f", nearest before: {self._fmt_ts(timestamps[idx - 1])}" if idx > 0 else ""
-            nearest_after = f", nearest after: {self._fmt_ts(timestamps[idx])}" if idx < len(timestamps) else ""
-            hint = (nearest_before + nearest_after).strip(", ")
-            suffix = f" ({hint})" if hint else ""
-            return f"No entries in '{stream_buffer}' between {start_time} and {end_time}.{suffix}"
-        result = self._read_buffer(stream_buffer, start=lo, end=hi, show_timestamps=True)
-        if result.kind == "content":
-            return result.content  # type: ignore
-        if result.kind == "error":
-            return result.error  # type: ignore
-        if result.kind == "skip":
-            ts_start = buf.lines[result.line_range[0] - 1].timestamp
-            ts_end = buf.lines[result.line_range[1] - 1].timestamp
-            skip_msgs = []
-            for line_idx, char_count in result.skip_lines:  # type: ignore
-                ts = buf.lines[line_idx - 1].timestamp
-                skip_msgs.append(f"{self._fmt_ts(ts)}({char_count} chars)")
-            skip_lines = result.skip_lines  # type: ignore
-            return (
-                f"Range [{self._fmt_ts(ts_start)}–{self._fmt_ts(ts_end, round_up=True)}] is {result.total_chars} chars ({result.line_count} entries). "
-                f"Heaviest lines ({len(skip_lines)} totaling {sum(c for _, c in skip_lines)} chars): {', '.join(skip_msgs)}. "
-                f"Consider re-reading with a narrower time range to avoid them."
-            )
-        # kind == "bucket"
-        ts_start = buf.lines[result.line_range[0] - 1].timestamp
-        ts_end = buf.lines[result.line_range[1] - 1].timestamp
-        result_bucket = result.bucket_info  # type: ignore
-        bucket_msgs = []
-        for b_start, b_end, b_chars in result_bucket:
-            ts_b_start = buf.lines[b_start - 1].timestamp
-            ts_b_end = buf.lines[b_end - 1].timestamp
-            bucket_msgs.append(f"{self._fmt_ts(ts_b_start)}-{self._fmt_ts(ts_b_end, round_up=True)}:{b_chars}")
-        return (
-            f"Range [{self._fmt_ts(ts_start)}–{self._fmt_ts(ts_end, round_up=True)}] is {result.total_chars} chars ({result.line_count} entries) and exceeds the {BufferManager._MAX_CHUNK_CHARS}-char threshold. "
-            f"Reduce the read time range to stay under the limit. "
-            f"Bucket distribution (start-end:chars): {', '.join(bucket_msgs)}."
-        )
+    def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False, stream: bool = False) -> dict[str, Any]:
+        """Create a new named buffer, optionally populated with text.
+        Pass stream=True to create a stream buffer with hook support."""
+        if stream:
+            if not name.startswith("stream:"):
+                return {"ok": False, "error": "stream name must start with 'stream:' prefix"}
+            if name in self.stream_buffer_configs and not overwrite:
+                return {"ok": False, "error": f"stream '{name}' already exists. Use overwrite=True to replace it."}
+
+        result = super().create_buffer(name, text=text, overwrite=overwrite)
+
+        if not result.get("ok", False):
+            return result
+
+        if stream:
+            self.stream_buffer_configs[name] = StreamBufferConfig()
+            self._refresh_stream_buffers_buffer()
+        return result
+
+    @tool
+    def drop_buffer(self, name: str) -> dict[str, Any]:
+        """Delete a named buffer.
+        Automatically cleans up stream metadata if it was a stream buffer."""
+        is_stream = name in self.stream_buffer_configs  # detect before super() removes it
+
+        result = super().drop_buffer(name)
+
+        if not result.get("ok", False):
+            return result
+
+        if is_stream:
+            del self.stream_buffer_configs[name]
+            self._refresh_stream_buffers_buffer()
+        return result
 
     @sandbox
-    def _register_stream_rule(
+    def list_stream_buffers(self) -> list[dict]:
+        """Return structured records for all stream buffers: name, created_at, hook_count."""
+        return [
+            {
+                "name": name,
+                "created_at": cfg.created_at,
+                "hook_count": len(cfg.hooks),
+            }
+            for name, cfg in self.stream_buffer_configs.items()
+        ]
+
+    def _refresh_stream_buffers_buffer(self) -> None:
+        """Refresh the list:stream_buffers buffer, one JSON dict per line."""
+        text = format_dict_list_for_buffer(self.list_stream_buffers())
+        if "list:stream_buffers" not in self._buffers:
+            self._create_buffer("list:stream_buffers", text=text)
+        else:
+            self.write_buffer("list:stream_buffers", text)
+
+    def _resolve_time(self, ts: float, anchor: float) -> float:
+        """Resolve a relative (negative) or absolute float timestamp to an absolute one.
+
+        Negative values are offsets from `anchor` (e.g. last entry timestamp or now).
+        Positive values are absolute unix timestamps and are returned unchanged."""
+        return anchor + ts if ts < 0 else ts
+
+    @tool
+    def read_buffer(self, name: str, start: int | float | None = None, end: int | float | None = None, show_timestamps: bool = False) -> dict[str, Any]:
+        """Read a range of lines from a buffer. Pass int for line-based (0-based, inclusive),
+        pass float for time-based read (unix timestamps, stream buffers only).
+        Negative floats (e.g. -60.0) are relative to the last entry: -60.0 means '60s ago'.
+        Set show_timestamps=True to prefix each line with its unix timestamp."""
+        time_based = isinstance(start, float) or isinstance(end, float)
+
+        if time_based and name not in self.stream_buffer_configs:
+            return {"ok": False, "error": f"No stream named '{name}'. Only stream buffers support time-based reading."}
+
+        if time_based:
+            buf = self._buffers[name]
+            if not buf.lines:
+                return {"ok": False, "error": f"Buffer '{name}' is empty."}
+            anchor = buf.lines[-1].timestamp
+            ts_list = [e.timestamp for e in buf.lines]
+
+            if isinstance(start, float):
+                resolved_start = self._resolve_time(start, anchor)
+                start_idx = bisect.bisect_left(ts_list, resolved_start)
+                if start_idx >= len(ts_list):
+                    return {"ok": False, "error": f"No entries at or after {_fmt_ts(resolved_start)}."}
+                start = start_idx
+
+            if isinstance(end, float):
+                resolved_end = self._resolve_time(end, anchor)
+                end_idx = bisect.bisect_right(ts_list, resolved_end)
+                if end_idx < 1:
+                    return {"ok": False, "error": f"No entries at or before {_fmt_ts(resolved_end)}."}
+                end = end_idx
+
+            show_timestamps = True
+
+        return super().read_buffer(name, start=start, end=end, show_timestamps=show_timestamps)
+
+    @sandbox
+    async def _register_stream_on_append_hook(
         self,
         stream_buffer: str,
-        rule_name: str,
-        condition: Callable[[BufferEntry, Buffer], None | dict],
-        action: Callable[..., Coroutine[Any, Any, None]] | None = None,
+        hook: Callable[[BufferEntry, str], Coroutine[Any, Any, None]],
+        priority: int = 0,
     ) -> str:
-        """Register a rule on a stream with the given condition and action. Callable from agent-written Python."""
-        if stream_buffer not in self._stream_buffer_rules:
-            return {"ok": False, "error": f"no stream named '{stream_buffer}'", "rule_name": rule_name, "stream_buffer": stream_buffer}
-        br = self._stream_buffer_rules[stream_buffer]
-        if rule_name in br.rules:
-            return {"ok": False, "error": f"rule '{rule_name}' already registered", "rule_name": rule_name, "stream_buffer": stream_buffer}
-        br.rules[rule_name] = Rule(condition=condition, action=action)
-        return {"ok": True, "rule_name": rule_name, "stream_buffer": stream_buffer}
-
-    def _get_stream_rule(self, stream_buffer: str, rule_name: str) -> Rule:
-        """Get a rule by stream and name. Raises KeyError if not found."""
-        if stream_buffer not in self._stream_buffer_rules:
-            raise KeyError(f"No stream named '{stream_buffer}'.")
-        br = self._stream_buffer_rules[stream_buffer]
-        if rule_name not in br.rules:
-            raise KeyError(f"Rule '{rule_name}' not found on '{stream_buffer}'.")
-        return br.rules[rule_name]
-
-    def _exchange_stream_fallback_rule(self, stream_buffer: str, fallback: Rule) -> Rule | None:
-        """Exchange the fallback rule on a stream. Returns the previous fallback (or None)."""
-        if stream_buffer not in self._stream_buffer_rules:
-            raise KeyError(f"No stream named '{stream_buffer}'. Create it with _create_stream first.")
-        previous = self._stream_buffer_rules[stream_buffer].fallback
-        self._stream_buffer_rules[stream_buffer].fallback = fallback
-        return previous
+        """Register an async hook on a stream. The hook is called with (entry, stream_buffer) after every append. Higher priority fires first."""
+        if stream_buffer not in self.stream_buffer_configs:
+            return {"ok": False, "error": f"no stream named '{stream_buffer}'", "stream_buffer": stream_buffer}
+        entry = StreamBufferHook(callable_=hook, priority=priority)
+        self.stream_buffer_configs[stream_buffer].hooks.append(entry)
+        return {"ok": True, "hook_count": len(self.stream_buffer_configs[stream_buffer].hooks), "stream_buffer": stream_buffer}
 
     async def _append_stream_entry(self, stream_buffer: str, data: str) -> None:
         """
         Append a data entry to the named stream. Raises KeyError if the stream doesn't exist.
 
-        Rule evaluation: each rule is checked in order; its action fires if condition is True.
-        Multiple rules may fire simultaneously if multiple conditions are True.
-        The fallback rule fires only when no other rule matched.
+        After appending, all registered hooks are fired in priority order (highest first).
+        Each hook receives (entry, stream_buffer) and can perform I/O (write to process,
+        send over socket, etc.). Hooks are fire-and-forget; exceptions are not propagated.
 
-        The fallback is the 'unexpected data' path — entries that didn't match any known
-        pattern are surfaced to the agent for reasoning.
-
-        Design: entry.seen is not set to True here. The rule's action is responsible for
-        marking the entry as consumed (e.g. via read_buffer or directly). This keeps the
-        seen/unseen semantics aligned with "has an intelligent consumer processed this."
-        Only entries with seen=False accumulate toward the unseen_count batch threshold.
+        Design: entry.seen is not set to True here. Consuming an entry (marking it seen)
+        is the responsibility of whatever reads it (e.g. read_buffer).
         """
-        if stream_buffer not in self._stream_buffer_rules:
-            raise KeyError(f"No stream named '{stream_buffer}'. Create it with _create_stream first.")
-        br = self._stream_buffer_rules[stream_buffer]
+        if stream_buffer not in self.stream_buffer_configs:
+            raise KeyError(f"No stream named '{stream_buffer}'. Create it with create_buffer(..., stream=True) first.")
         buf = self._buffers[stream_buffer]
         now = time.time()
         entry = BufferEntry(timestamp=now, data=data, seen=False)
         buf.lines.append(entry)
-        any_matched = False
-        for name, rule in br.rules.items():
-            signal = rule.condition(entry, buf)
-            if signal is not None:
-                any_matched = True
-                if rule.action is not None:
-                    await rule.action(entry, name, signal)
-        if not any_matched and br.fallback is not None:
-            signal = br.fallback.condition(entry, buf)
-            if signal is not None and br.fallback.action is not None:
-                await br.fallback.action(entry, stream_buffer, signal)
+        cfg = self.stream_buffer_configs.get(stream_buffer)
+        if cfg:
+            ordered = sorted(cfg.hooks, key=lambda h: h.priority, reverse=True)
+            for sh in ordered:
+                try:
+                    await sh.callable_(entry, stream_buffer)
+                    sh.fire_count += 1
+                except Exception as e:
+                    sh.errors.append(StreamBufferHookError(timestamp=time.time(), error=str(e)))
