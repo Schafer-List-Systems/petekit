@@ -102,9 +102,9 @@ class BufferManager(AgenticObject):
             refresh_result = self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already created and registered — rolling back would require
-                # deleting from self._buffers. Until a rollback strategy is defined, returning the
+                # deleting from self._buffers. Until a rollback strategy is defined, raising the
                 # error leaves BufferManager in an inconsistent state (buffer exists, listing stale).
-                return refresh_result
+                raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
         return {"ok": True, "created": not existed, "overwritten": existed, "lines": lines}
 
     @tool
@@ -125,9 +125,9 @@ class BufferManager(AgenticObject):
             refresh_result = self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already created and registered — rolling back would require
-                # deleting from self._buffers. Until a rollback strategy is defined, returning the
+                # deleting from self._buffers. Until a rollback strategy is defined, raising the
                 # error leaves BufferManager in an inconsistent state (buffer exists, listing stale).
-                return refresh_result
+                raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
         return {"ok": True, "target": target_name, "source": source_name, "lines": len(new_entries)}
 
     @tool
@@ -154,9 +154,9 @@ class BufferManager(AgenticObject):
             refresh_result = self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already modified — rolling back would require restoring prior
-                # content. Until a rollback strategy is defined, returning the error leaves the
+                # content. Until a rollback strategy is defined, raising the error leaves the
                 # BufferManager in an inconsistent state (content changed, listing stale).
-                return refresh_result
+                raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
         return {"ok": True, "lines_written": len(new_entries), "total_lines": len(buf.lines)}
 
     @tool
@@ -172,9 +172,9 @@ class BufferManager(AgenticObject):
         refresh_result = self._refresh_buffers_buffer()
         if not refresh_result.get("ok"):
             # TODO(design): buffer already deleted from self._buffers — rolling back would require
-            # restoring from a snapshot. Until a rollback strategy is defined, returning the error
+            # restoring from a snapshot. Until a rollback strategy is defined, raising the error
             # leaves BufferManager in an inconsistent state (buffer gone, listing stale).
-            return refresh_result
+            raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
         return {"ok": True, "dropped": name}
 
     @tool
