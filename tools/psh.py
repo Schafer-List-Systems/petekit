@@ -223,7 +223,7 @@ class PSH:
 
     def run_shell(self) -> str:
         print(f"{self._TITLE}")
-        print("Type /help for commands, /quit to exit.")
+        print(_c("HINT", "/help commands, /quit exit  |  ? agent mode  ! code mode  Ctrl+C clear line"))
         while True:
             session = self._session_for(self._state.mode)
             args = self._get_prompt_args(self._state.mode)
@@ -242,7 +242,7 @@ class PSH:
                 self._state.mode = "agent"
             elif raw == "!":
                 self._state.mode = "code"
-                print(_c("HINT", "Code mode: Enter=newline, Meta+Enter=execute, Alt+F/→=accept word, Ctrl+E=accept full"))
+                print(_c("HINT", "Code mode: Enter=newline, Meta+Enter=execute, Alt+F=accept word, →/Ctrl+E=accept full"))
             elif raw.startswith("?"):
                 self._invoke_once(raw)
             elif raw.startswith("!"):
