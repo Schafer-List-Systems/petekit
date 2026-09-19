@@ -142,7 +142,7 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         table_name = _routing_table_key(routing_table)
         if routing_table in self._routing_tables or table_name in self._buffers:
             return {"ok": False, "error": f"routing table '{routing_table}' already exists"}
-        create_result = self.create_buffer(table_name, stream=True)
+        create_result = self.create_buffer(table_name)
         if not create_result.get("ok"):
             raise RuntimeError(f"failed to create routing table buffer '{table_name}': {create_result.get('error')}")
         self._routing_tables[routing_table] = RoutingTable(input_stream=input_stream)
