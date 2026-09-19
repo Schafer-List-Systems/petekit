@@ -70,8 +70,12 @@ class StreamBufferManager(BufferManager, AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.stream_buffer_configs: dict[str, StreamBufferConfig] = {}
-        self._refresh_stream_buffers_buffer()
-        self._refresh_stream_buffer_hooks()
+        buffers_result = self._refresh_stream_buffers_buffer()
+        if not buffers_result.get("ok"):
+            raise RuntimeError(f"failed to refresh stream buffers list: {buffers_result.get('error')}")
+        hooks_result = self._refresh_stream_buffer_hooks()
+        if not hooks_result.get("ok"):
+            raise RuntimeError(f"failed to refresh stream buffer hooks: {hooks_result.get('error')}")
 
     @tool
     def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False, stream: bool = False) -> dict[str, Any]:
@@ -90,7 +94,12 @@ class StreamBufferManager(BufferManager, AgenticObject):
 
         if stream:
             self.stream_buffer_configs[name] = StreamBufferConfig()
-            self._refresh_stream_buffers_buffer()
+            refresh_result = self._refresh_stream_buffers_buffer()
+            if not refresh_result.get("ok"):
+                # TODO(design): stream_buffer_configs entry already registered — rolling back would require
+                # deleting the entry and restoring the super() state. Until a rollback strategy is defined,
+                # returning the error leaves the StreamBufferManager in an inconsistent state.
+                return refresh_result
         return result
 
     @tool
@@ -106,7 +115,12 @@ class StreamBufferManager(BufferManager, AgenticObject):
 
         if is_stream:
             del self.stream_buffer_configs[name]
-            self._refresh_stream_buffers_buffer()
+            refresh_result = self._refresh_stream_buffers_buffer()
+            if not refresh_result.get("ok"):
+                # TODO(design): buffer already deleted from parent and stream config removed — rolling back
+                # would require restoring both. Until a rollback strategy is defined, returning the error
+                # leaves the StreamBufferManager in an inconsistent state.
+                return refresh_result
         return result
 
     @sandbox
@@ -121,12 +135,12 @@ class StreamBufferManager(BufferManager, AgenticObject):
             for name, cfg in self.stream_buffer_configs.items()
         ]
 
-    def _refresh_stream_buffers_buffer(self) -> None:
+    def _refresh_stream_buffers_buffer(self) -> dict[str, Any]:
         """Refresh the system:list:stream_buffers buffer, one JSON dict per line."""
         text = format_dict_list_for_buffer(self.list_stream_buffers())
-        self.create_buffer("system:list:stream_buffers", text=text, overwrite=True)
+        return self.create_buffer("system:list:stream_buffers", text=text, overwrite=True)
 
-    def _refresh_stream_buffer_hooks(self) -> None:
+    def _refresh_stream_buffer_hooks(self) -> dict[str, Any]:
         """Refresh the system:list:stream_buffer_hooks buffer with all hook states."""
         records = [
             {
@@ -141,7 +155,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         ]
         records.sort(key=lambda r: (r["stream"], -r["priority"]))
         text = format_dict_list_for_buffer(records)
-        self.create_buffer("system:list:stream_buffer_hooks", text=text, overwrite=True)
+        return self.create_buffer("system:list:stream_buffer_hooks", text=text, overwrite=True)
 
     def _resolve_time(self, ts: float, anchor: float) -> float:
         """Resolve a relative (negative) or absolute float timestamp to an absolute one.
@@ -235,14 +249,24 @@ class StreamBufferManager(BufferManager, AgenticObject):
         if hook is None:
             if name in self.stream_buffer_configs[stream_buffer].hooks:
                 del self.stream_buffer_configs[stream_buffer].hooks[name]
-                self._refresh_stream_buffer_hooks()
+                refresh_result = self._refresh_stream_buffer_hooks()
+                if not refresh_result.get("ok"):
+                    # TODO(design): hook already removed from config — rolling back would require
+                    # restoring it. Until a rollback strategy is defined, returning the error
+                    # leaves the StreamBufferManager in an inconsistent state (hook gone, listing stale).
+                    return refresh_result
                 return {"ok": True, "removed": name, "stream_buffer": stream_buffer}
             return {"ok": False, "error": f"no hook named '{name}' on '{stream_buffer}'", "stream_buffer": stream_buffer}
         self.stream_buffer_configs[stream_buffer].hooks[name] = StreamBufferHook(
             callable_=hook,
             priority=priority,
         )
-        self._refresh_stream_buffer_hooks()
+        refresh_result = self._refresh_stream_buffer_hooks()
+        if not refresh_result.get("ok"):
+            # TODO(design): hook already registered in config — rolling back would require
+            # removing it. Until a rollback strategy is defined, returning the error leaves the
+            # StreamBufferManager in an inconsistent state (hook registered, listing stale).
+            return refresh_result
         return {"ok": True, "hook_count": len(self.stream_buffer_configs[stream_buffer].hooks), "name": name, "stream_buffer": stream_buffer}
 
 

@@ -78,10 +78,10 @@ class BufferManager(AgenticObject):
         self._buffers: dict[str, Buffer] = {}
         self._refresh_buffers_buffer()
 
-    def _refresh_buffers_buffer(self) -> None:
+    def _refresh_buffers_buffer(self) -> dict[str, Any]:
         records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
         text = format_dict_list_for_buffer(records)
-        self.create_buffer("system:list:buffers", text=text, overwrite=True)
+        return self.create_buffer("system:list:buffers", text=text, overwrite=True)
 
     @tool
     def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False) -> dict[str, Any]:
@@ -99,7 +99,12 @@ class BufferManager(AgenticObject):
             self._buffers[name].lines = [BufferEntry(data=line, timestamp=ts, seen=True) for line in text.splitlines()]
             lines = len(self._buffers[name].lines)
         if name != "system:list:buffers":
-            self._refresh_buffers_buffer()
+            refresh_result = self._refresh_buffers_buffer()
+            if not refresh_result.get("ok"):
+                # TODO(design): buffer already created and registered — rolling back would require
+                # deleting from self._buffers. Until a rollback strategy is defined, returning the
+                # error leaves BufferManager in an inconsistent state (buffer exists, listing stale).
+                return refresh_result
         return {"ok": True, "created": not existed, "overwritten": existed, "lines": lines}
 
     @tool
@@ -117,7 +122,12 @@ class BufferManager(AgenticObject):
         new_entries = [BufferEntry(data=e.data, timestamp=e.timestamp, seen=e.seen) for e in src.lines]
         self._buffers[target_name] = Buffer(lines=new_entries, created_at=now, modified_at=now)
         if target_name != "system:list:buffers":
-            self._refresh_buffers_buffer()
+            refresh_result = self._refresh_buffers_buffer()
+            if not refresh_result.get("ok"):
+                # TODO(design): buffer already created and registered — rolling back would require
+                # deleting from self._buffers. Until a rollback strategy is defined, returning the
+                # error leaves BufferManager in an inconsistent state (buffer exists, listing stale).
+                return refresh_result
         return {"ok": True, "target": target_name, "source": source_name, "lines": len(new_entries)}
 
     @tool
@@ -141,7 +151,12 @@ class BufferManager(AgenticObject):
         buf.lines[start:end] = new_entries
         buf.modified_at = time.time()
         if name != "system:list:buffers":
-            self._refresh_buffers_buffer()
+            refresh_result = self._refresh_buffers_buffer()
+            if not refresh_result.get("ok"):
+                # TODO(design): buffer already modified — rolling back would require restoring prior
+                # content. Until a rollback strategy is defined, returning the error leaves the
+                # BufferManager in an inconsistent state (content changed, listing stale).
+                return refresh_result
         return {"ok": True, "lines_written": len(new_entries), "total_lines": len(buf.lines)}
 
     @tool
@@ -154,7 +169,12 @@ class BufferManager(AgenticObject):
         if name == "system:list:buffers":
             return {"ok": False, "error": "Cannot drop the 'system:list:buffers' buffer."}
         del self._buffers[name]
-        self._refresh_buffers_buffer()
+        refresh_result = self._refresh_buffers_buffer()
+        if not refresh_result.get("ok"):
+            # TODO(design): buffer already deleted from self._buffers — rolling back would require
+            # restoring from a snapshot. Until a rollback strategy is defined, returning the error
+            # leaves BufferManager in an inconsistent state (buffer gone, listing stale).
+            return refresh_result
         return {"ok": True, "dropped": name}
 
     @tool
