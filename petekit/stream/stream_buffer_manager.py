@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Coroutine
 
 from peteos.oap.agentic_object import AgenticObject
-from peteos.oap.decorators import sandbox, tool
+from peteos import sandbox, tool
 from ..utils.text_formatters import format_dict_list_for_buffer
 from ..text.buffer_manager import Buffer, BufferEntry, BufferManager
 

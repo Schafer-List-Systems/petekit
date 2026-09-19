@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 from peteos.oap.agentic_object import AgenticObject
-from peteos.oap.decorators import tool
+from peteos import tool
 from peteos.utils import get_logger
 
 from ..text.buffer_manager import Buffer

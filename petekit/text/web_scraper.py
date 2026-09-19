@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from typing import Any
 
 from peteos.oap.agentic_object import AgenticObject
-from peteos.oap.decorators import tool
+from peteos import tool
 
 from petekit.utils.web_utils import (
     _fetch_html,

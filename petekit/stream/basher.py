@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from peteos.oap.agentic_object import AgenticObject
-from peteos.oap.decorators import sandbox, tool
+from peteos import sandbox, tool
 from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buffer
 
 

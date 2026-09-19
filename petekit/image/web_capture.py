@@ -10,7 +10,7 @@ import time as time_mod
 from pathlib import Path
 
 from peteos.oap.agentic_object import AgenticObject
-from peteos.oap.decorators import tool
+from peteos import tool
 
 from petekit.image.image_buffer_manager import ImageBufferManager
 from petekit.utils.web_utils import _CHROME_BIN

@@ -5,7 +5,7 @@ from __future__ import annotations
 import cv2
 
 from peteos import AgenticObject
-from peteos.oap.decorators import tool
+from peteos import tool
 
 from petekit.utils.camera_driver import CameraDriver, V4L2CameraDriver
 from .image_buffer_manager import ImageBufferManager

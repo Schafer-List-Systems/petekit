@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass
 
 from peteos.oap.agentic_object import AgenticObject
-from peteos.oap.decorators import tool
+from peteos import tool
 
 from .buffer_manager import BufferEntry, BufferManager
 

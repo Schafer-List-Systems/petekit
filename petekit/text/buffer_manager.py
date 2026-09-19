@@ -8,7 +8,7 @@ from typing import Any
 from typing import Literal
 
 from peteos.oap.agentic_object import AgenticObject
-from peteos.oap.decorators import tool
+from peteos import tool
 from petekit.utils.text_formatters import format_dict_list_for_buffer
 
 
