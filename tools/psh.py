@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 
 from peteos import AgenticObject, Error, tool
@@ -189,13 +190,20 @@ class PSH:
         return self._session if mode == "code" else self._agent_session
 
     def _get_prompt_args(self, mode: str) -> dict[str, Any]:
-        base: dict[str, Any] = {"message": self._prompt_str()}
+        base = "?> " if mode == "agent" else "!> "
+        if self._state._allow_all_session:
+            message: Any = HTML(f"<ansired><b>{base}</b></ansired>")
+        elif self._state._deny_all_session:
+            message = HTML(f"<ansicyan><b>{base}</b></ansicyan>")
+        else:
+            message = base
+        result: dict[str, Any] = {"message": message}
         if mode == "code":
-            base["multiline"] = True
-            base["completer"] = self._PYTHON_COMPLETER
-            base["complete_while_typing"] = True
-            base["prompt_continuation"] = lambda width, ln, soft: ".  "
-        return base
+            result["multiline"] = True
+            result["completer"] = self._PYTHON_COMPLETER
+            result["complete_while_typing"] = True
+            result["prompt_continuation"] = lambda width, ln, soft: ".  "
+        return result
 
     def run_shell(self) -> str:
         print(f"{self._TITLE}")
