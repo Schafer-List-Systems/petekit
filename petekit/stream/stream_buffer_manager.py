@@ -98,8 +98,8 @@ class StreamBufferManager(BufferManager, AgenticObject):
             if not refresh_result.get("ok"):
                 # TODO(design): stream_buffer_configs entry already registered — rolling back would require
                 # deleting the entry and restoring the super() state. Until a rollback strategy is defined,
-                # returning the error leaves the StreamBufferManager in an inconsistent state.
-                return refresh_result
+                # raising the error leaves the StreamBufferManager in an inconsistent state.
+                raise RuntimeError(f"failed to refresh stream buffers list: {refresh_result.get('error')}")
         return result
 
     @tool
@@ -118,9 +118,9 @@ class StreamBufferManager(BufferManager, AgenticObject):
             refresh_result = self._refresh_stream_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already deleted from parent and stream config removed — rolling back
-                # would require restoring both. Until a rollback strategy is defined, returning the error
+                # would require restoring both. Until a rollback strategy is defined, raising the error
                 # leaves the StreamBufferManager in an inconsistent state.
-                return refresh_result
+                raise RuntimeError(f"failed to refresh stream buffers list: {refresh_result.get('error')}")
         return result
 
     @sandbox
@@ -252,9 +252,9 @@ class StreamBufferManager(BufferManager, AgenticObject):
                 refresh_result = self._refresh_stream_buffer_hooks()
                 if not refresh_result.get("ok"):
                     # TODO(design): hook already removed from config — rolling back would require
-                    # restoring it. Until a rollback strategy is defined, returning the error
+                    # restoring it. Until a rollback strategy is defined, raising the error
                     # leaves the StreamBufferManager in an inconsistent state (hook gone, listing stale).
-                    return refresh_result
+                    raise RuntimeError(f"failed to refresh stream buffer hooks: {refresh_result.get('error')}")
                 return {"ok": True, "removed": name, "stream_buffer": stream_buffer}
             return {"ok": False, "error": f"no hook named '{name}' on '{stream_buffer}'", "stream_buffer": stream_buffer}
         self.stream_buffer_configs[stream_buffer].hooks[name] = StreamBufferHook(
@@ -264,9 +264,9 @@ class StreamBufferManager(BufferManager, AgenticObject):
         refresh_result = self._refresh_stream_buffer_hooks()
         if not refresh_result.get("ok"):
             # TODO(design): hook already registered in config — rolling back would require
-            # removing it. Until a rollback strategy is defined, returning the error leaves the
+            # removing it. Until a rollback strategy is defined, raising the error leaves the
             # StreamBufferManager in an inconsistent state (hook registered, listing stale).
-            return refresh_result
+            raise RuntimeError(f"failed to refresh stream buffer hooks: {refresh_result.get('error')}")
         return {"ok": True, "hook_count": len(self.stream_buffer_configs[stream_buffer].hooks), "name": name, "stream_buffer": stream_buffer}
 
 
