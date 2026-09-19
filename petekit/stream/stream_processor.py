@@ -49,19 +49,33 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._routing_tables: dict[str, RoutingTable] = {}
-        self.create_buffer("stream:processor:control", stream=True)
-        self.create_buffer("stream:processor:feedback", stream=True)
-        self._set_stream_on_append_hook(
+        result = self.create_buffer("stream:processor:control", stream=True)
+        if not result.get("ok"):
+            raise RuntimeError(f"failed to create stream:processor:control: {result.get('error')}")
+        result = self.create_buffer("stream:processor:feedback", stream=True)
+        if not result.get("ok"):
+            self.drop_buffer("stream:processor:control")
+            raise RuntimeError(f"failed to create stream:processor:feedback: {result.get('error')}")
+        hook_result = self._set_stream_on_append_hook(
             "stream:processor:control",
             name="system_processor",
             hook=lambda stream, text, metadata: self._system_processor_hook(stream, text, metadata),
         )
-        self._refresh_routing_tables_buffer()
+        if not hook_result.get("ok"):
+            self.drop_buffer("stream:processor:feedback")
+            self.drop_buffer("stream:processor:control")
+            raise RuntimeError(f"failed to register system_processor hook: {hook_result.get('error')}")
+        refresh_result = self._refresh_routing_tables_buffer()
+        if not refresh_result.get("ok"):
+            self._set_stream_on_append_hook("stream:processor:control", name="system_processor", hook=None)
+            self.drop_buffer("stream:processor:feedback")
+            self.drop_buffer("stream:processor:control")
+            raise RuntimeError(f"failed to refresh routing tables buffer: {refresh_result.get('error')}")
 
-    def _refresh_routing_tables_buffer(self) -> None:
+    def _refresh_routing_tables_buffer(self) -> dict[str, Any]:
         """Refresh the system:list:routing_tables buffer."""
         from petekit.utils.text_formatters import format_dict_list_for_buffer
-        self.create_buffer(
+        return self.create_buffer(
             "system:list:routing_tables",
             text=format_dict_list_for_buffer(self._list_routing_tables()),
             overwrite=True
@@ -91,20 +105,30 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
                 continue
             parts = line.split()
             cmd = parts[0]
+            result: dict[str, Any] | None = None
             if cmd == "new" and len(parts) >= 3:
                 routing_table, input_stream = parts[1], parts[2]
-                await self.write_buffer("stream:processor:feedback", str(self._routing_table_new(routing_table, input_stream)))
+                result = self._routing_table_new(routing_table, input_stream)
             elif cmd == "drop" and len(parts) >= 2:
                 routing_table = parts[1]
-                await self.write_buffer("stream:processor:feedback", str(self._routing_table_drop(routing_table)))
+                result = self._routing_table_drop(routing_table)
             elif cmd == "add" and len(parts) >= 4:
                 routing_table, condition_list, output_stream = parts[1], parts[2], " ".join(parts[3:])
-                await self.write_buffer("stream:processor:feedback", str(self._routing_table_add(routing_table, condition_list, output_stream)))
+                result = self._routing_table_add(routing_table, condition_list, output_stream)
             elif cmd == "del" and len(parts) >= 4:
                 routing_table, condition_list, output_stream = parts[1], parts[2], " ".join(parts[3:])
-                await self.write_buffer("stream:processor:feedback", str(self._routing_table_del(routing_table, condition_list, output_stream)))
+                result = self._routing_table_del(routing_table, condition_list, output_stream)
             else:
-                await self.write_buffer("stream:processor:feedback", f"unknown or malformed command: {line}")
+                fb_result = await self.write_buffer("stream:processor:feedback", f"unknown or malformed command: {line}")
+                if not fb_result.get("ok"):
+                    raise RuntimeError(f"failed to write to feedback buffer: {fb_result.get('error')}")
+                continue
+
+            if not result.get("ok"):
+                raise RuntimeError(f"command '{cmd}' failed: {result.get('error')}")
+            fb_result = await self.write_buffer("stream:processor:feedback", str(result))
+            if not fb_result.get("ok"):
+                raise RuntimeError(f"failed to write to feedback buffer: {fb_result.get('error')}")
 
     @sandbox
     def _routing_table_new(self, routing_table: str, input_stream: str) -> dict[str, Any]:
@@ -112,7 +136,9 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         table_name = _routing_table_key(routing_table)
         if routing_table in self._routing_tables or table_name in self._buffers:
             return {"ok": False, "error": f"routing table '{routing_table}' already exists"}
-        self.create_buffer(table_name, stream=True)
+        create_result = self.create_buffer(table_name, stream=True)
+        if not create_result.get("ok"):
+            raise RuntimeError(f"failed to create routing table buffer '{table_name}': {create_result.get('error')}")
         self._routing_tables[routing_table] = RoutingTable(input_stream=input_stream)
         hook_result = self._set_stream_on_append_hook(
             input_stream,
@@ -122,8 +148,13 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         if not hook_result.get("ok"):
             del self._routing_tables[routing_table]
             self.drop_buffer(table_name)
-            return {"ok": False, "error": f"failed to hook input stream '{input_stream}': {hook_result.get('error')}"}
-        self._refresh_routing_tables_buffer()
+            raise RuntimeError(f"failed to hook input stream '{input_stream}': {hook_result.get('error')}")
+        refresh_result = self._refresh_routing_tables_buffer()
+        if not refresh_result.get("ok"):
+            self._set_stream_on_append_hook(input_stream, name=f"routing_table:{routing_table}", hook=None)
+            del self._routing_tables[routing_table]
+            self.drop_buffer(table_name)
+            raise RuntimeError(f"failed to refresh routing tables buffer: {refresh_result.get('error')}")
         return {"ok": True, "table": routing_table, "input_stream": input_stream}
 
     @sandbox
@@ -139,7 +170,9 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         del self._routing_tables[routing_table]
         if table_name in self._buffers:
             self.drop_buffer(table_name)
-        self._refresh_routing_tables_buffer()
+        refresh_result = self._refresh_routing_tables_buffer()
+        if not refresh_result.get("ok"):
+            raise RuntimeError(f"failed to refresh routing tables buffer: {refresh_result.get('error')}")
         return {"ok": True, "dropped": routing_table}
 
     @sandbox
@@ -149,9 +182,13 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         if routing_table not in self._routing_tables or table_name not in self._buffers:
             return {"ok": False, "error": f"routing table '{routing_table}' not found. Use 'new' first."}
         entry = _format_routing_entry(condition_list, output_stream)
-        self.create_buffer(table_name, text=entry, overwrite=False)
+        create_result = self.create_buffer(table_name, text=entry, overwrite=False)
+        if not create_result.get("ok"):
+            raise RuntimeError(f"failed to append to routing table buffer: {create_result.get('error')}")
         self._routing_tables[routing_table].conditions.append((condition_list, output_stream))
-        self._refresh_routing_tables_buffer()
+        refresh_result = self._refresh_routing_tables_buffer()
+        if not refresh_result.get("ok"):
+            raise RuntimeError(f"failed to refresh routing tables buffer: {refresh_result.get('error')}")
         return {"ok": True, "table": routing_table, "condition_list": condition_list, "output": output_stream}
 
     @sandbox
@@ -174,7 +211,9 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         First matching condition writes the data to its output stream. No match = reported as FALLTHROUGH.
         """
         if routing_table not in self._routing_tables:
-            await self.write_buffer("stream:processor:feedback", f"ERROR: routing_table '{routing_table}' not found")
+            fb_result = await self.write_buffer("stream:processor:feedback", f"ERROR: routing_table '{routing_table}' not found")
+            if not fb_result.get("ok"):
+                raise RuntimeError(f"failed to write ERROR to feedback: {fb_result.get('error')}")
             return
 
         table = self._routing_tables[routing_table]
@@ -186,7 +225,9 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
                 try:
                     matched = await self._evaluate_condition(sc, text, metadata)
                 except ConditionNotFound as e:
-                    await self.write_buffer("stream:processor:feedback", f"FALLTHROUGH source={table.input_stream} ts={ts} reason={e}")
+                    fb_result = await self.write_buffer("stream:processor:feedback", f"FALLTHROUGH source={table.input_stream} ts={ts} reason={e}")
+                    if not fb_result.get("ok"):
+                        raise RuntimeError(f"failed to write FALLTHROUGH to feedback: {fb_result.get('error')}")
                     return
                 if not matched:
                     all_match = False
@@ -194,7 +235,9 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
             if all_match:
                 await self.write_buffer(output_stream, text)
                 return
-        await self.write_buffer("stream:processor:feedback", f"FALLTHROUGH source={table.input_stream} ts={ts}")
+        fb_result = await self.write_buffer("stream:processor:feedback", f"FALLTHROUGH source={table.input_stream} ts={ts}")
+        if not fb_result.get("ok"):
+            raise RuntimeError(f"failed to write FALLTHROUGH to feedback: {fb_result.get('error')}")
 
     async def _evaluate_condition(self, condition_name: str, text: str, metadata: dict | None = None) -> bool:
         if condition_name.startswith("!"):
