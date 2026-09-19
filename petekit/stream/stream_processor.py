@@ -12,6 +12,10 @@ class ConditionNotFound(Exception):
     def __init__(self, condition: str) -> None:
         self.condition = condition
         super().__init__(f"condition not found: {condition}")
+
+
+@dataclass
+class RoutingTable:
     input_stream: str
     conditions: list[tuple[str, str]] = field(default_factory=list)
 
@@ -32,10 +36,14 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
     - Condition lists are comma-separated; each sub-condition must be true (AND semantics).
     - Prefix a sub-condition with "!" to negate it.
     - The condition name "true" always matches (good for catch-all / fallback rule).
-    - When data arrives but no condition matches, it is reported as FALLTHROUGH error in the feedback stream.
-    - Control the stream processor by writing commands to "stream:processor:control".
-      Command documentation is in "system:doc:stream_processor:control".
-    - Read feedback and streaming errors from "stream:processor:feedback".
+    - Condition names are sandbox-decorated methods with signature (stream: str, text: str, metadata: dict) -> bool.
+      Discover available conditions in docs:reflect:sandbox (hardcoded) and docs:reflect:dynamic (runtime); use define_function to add your own.
+    - Control the stream processor by writing to "stream:processor:control":
+      new <routing_table> <input_stream>  — create routing table
+      drop <routing_table>              — delete routing table
+      add <routing_table> <condition_list> <output_stream>  — add rule
+      del <routing_table> <condition_list> <output_stream>  — remove rule
+    - Read feedback and streaming errors (command results, FALLTHROUGH) from "stream:processor:feedback".
     """
 
     def __init__(self, **kwargs) -> None:
