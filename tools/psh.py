@@ -511,7 +511,7 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
         raw_answer = await loop.run_in_executor(
             None, lambda: input("  allow? [y/n] ").strip().lower()
         )
-        if raw_answer not in ("y", "yes"):
+        if raw_answer not in ("y", "yes", ""):
             if state.output_flags.get("DENY", True):
                 print(_c("DENY", n))
             return (False, f"Tool '{n}' denied by user.")
