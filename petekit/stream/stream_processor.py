@@ -170,12 +170,13 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
             return
 
         table = self._routing_tables[routing_table]
+        ts = metadata.get("timestamp", 0) if metadata else 0
         for condition_list, output_stream in table.conditions:
             all_match = True
             for sub_condition in condition_list.split(","):
                 sc = sub_condition.strip()
                 try:
-                    matched = await self._evaluate_condition(sc, text)
+                    matched = await self._evaluate_condition(sc, text, metadata)
                 except ConditionNotFound as e:
                     await self.write_buffer("stream:processor:feedback", f"FALLTHROUGH source={table.input_stream} ts={ts} reason={e}")
                     return
@@ -185,21 +186,25 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
             if all_match:
                 await self.write_buffer(output_stream, text)
                 return
-        ts = metadata.get("timestamp", 0) if metadata else 0
         await self.write_buffer("stream:processor:feedback", f"FALLTHROUGH source={table.input_stream} ts={ts}")
 
-    async def _evaluate_condition(self, condition_name: str, text: str) -> bool:
-        # Negation: prefix "!" inverts the result.
+    async def _evaluate_condition(self, condition_name: str, text: str, metadata: dict | None = None) -> bool:
         if condition_name.startswith("!"):
             inner = condition_name[1:]
-            return not await self._evaluate_condition(inner, text)
+            return not await self._evaluate_condition(inner, text, metadata)
 
-        # Built-in: "true" always matches (catch-all / fallback).
         if condition_name.lower() == "true":
             return True
 
-        # Sandbox method: look up a sandbox-decorated method on self by name.
-        # Use gather_sandbox_methods() to get {name -> callable}, verify signature
-        # (stream: str, text: str, metadata: dict), call it and return the bool result.
-        # If not found or wrong signature, raise ConditionNotFound.
+        import inspect
+        members = self._gather_sandbox_members()
+        if condition_name not in members:
+            raise ConditionNotFound(condition_name)
+
+        method = members[condition_name]
+        sig = inspect.signature(method)
+        params = list(sig.parameters.keys())
+        if params[:3] == ["stream", "text", "metadata"] and sig.return_annotation in (bool, inspect.Parameter.empty):
+            return await method(stream=condition_name, text=text, metadata=metadata or {})
+
         raise ConditionNotFound(condition_name)
