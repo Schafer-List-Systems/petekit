@@ -290,9 +290,15 @@ class PSH:
         elif cmd == "session":
             self._session_cmd(parts[1:] if len(parts) > 1 else None)
         elif cmd == "ask_confirmation":
-            self._state.ask_confirmation = not self._state.ask_confirmation
-            state = "ON" if self._state.ask_confirmation else "OFF"
-            print(_c("SHELL", f"Ask for tool confirmation: {state}"))
+            if self._state._allow_all_session or self._state._deny_all_session:
+                self._state.ask_confirmation = True
+                self._state._allow_all_session = False
+                self._state._deny_all_session = False
+                print(_c("SHELL", "Ask for tool confirmation: ON"))
+            else:
+                self._state.ask_confirmation = not self._state.ask_confirmation
+                state = "ON" if self._state.ask_confirmation else "OFF"
+                print(_c("SHELL", f"Ask for tool confirmation: {state}"))
         elif cmd == "set_output":
             if len(parts) < 3:
                 flags = ", ".join(f"{k}={v}" for k, v in self._state.output_flags.items())
@@ -457,6 +463,8 @@ class _ShellState:
         }
         self._allow_all_remaining = False
         self._deny_all_remaining = False
+        self._allow_all_session = False
+        self._deny_all_session = False
 
 
 def _spawn(name: str, agent_or_cls: Any, agents: dict[str, Any]) -> None:
@@ -509,6 +517,12 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
             print(_c("RUN", f"{n}{_fmt_tool_args(args_str)}"))
         if not state.ask_confirmation:
             return
+        if state._allow_all_session:
+            return
+        if state._deny_all_session:
+            if state.output_flags.get("DENY", True):
+                print(_c("DENY", n))
+            return (False, f"Tool '{n}' denied by user.")
         if state._allow_all_remaining:
             return
         if state._deny_all_remaining:
@@ -517,7 +531,7 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
             return (False, f"Tool '{n}' denied by user.")
         loop = asyncio.get_running_loop()
         raw_answer = await loop.run_in_executor(
-            None, lambda: input("  allow? [y/n/Y/N] ").strip()
+            None, lambda: input("  allow? [y/n/yes/no] this call | [Y/N] this invoke | [YES/NO] session: ").strip()
         )
         if raw_answer == "Y":
             state._allow_all_remaining = True
@@ -526,6 +540,15 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
             if state.output_flags.get("DENY", True):
                 print(_c("DENY", n))
             state._deny_all_remaining = True
+            return (False, f"Tool '{n}' denied by user.")
+        if raw_answer == "YES":
+            state._allow_all_session = True
+            state.ask_confirmation = False
+            return
+        if raw_answer == "NO":
+            if state.output_flags.get("DENY", True):
+                print(_c("DENY", n))
+            state._deny_all_session = True
             return (False, f"Tool '{n}' denied by user.")
         answer_lower = raw_answer.lower()
         if answer_lower in ("y", "yes", ""):
