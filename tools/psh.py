@@ -455,6 +455,8 @@ class _ShellState:
             "RESULT": True,
             "READ": True,
         }
+        self._allow_all_remaining = False
+        self._deny_all_remaining = False
 
 
 def _spawn(name: str, agent_or_cls: Any, agents: dict[str, Any]) -> None:
@@ -507,15 +509,34 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
             print(_c("RUN", f"{n}{_fmt_tool_args(args_str)}"))
         if not state.ask_confirmation:
             return
-        loop = asyncio.get_running_loop()
-        raw_answer = await loop.run_in_executor(
-            None, lambda: input("  allow? [y/n] ").strip().lower()
-        )
-        if raw_answer not in ("y", "yes", ""):
+        if state._allow_all_remaining:
+            return
+        if state._deny_all_remaining:
             if state.output_flags.get("DENY", True):
                 print(_c("DENY", n))
             return (False, f"Tool '{n}' denied by user.")
-        return None
+        loop = asyncio.get_running_loop()
+        raw_answer = await loop.run_in_executor(
+            None, lambda: input("  allow? [y/n/Y/N] ").strip()
+        )
+        if raw_answer == "Y":
+            state._allow_all_remaining = True
+            return
+        if raw_answer == "N":
+            if state.output_flags.get("DENY", True):
+                print(_c("DENY", n))
+            state._deny_all_remaining = True
+            return (False, f"Tool '{n}' denied by user.")
+        answer_lower = raw_answer.lower()
+        if answer_lower in ("y", "yes", ""):
+            return
+        if answer_lower in ("n", "no"):
+            if state.output_flags.get("DENY", True):
+                print(_c("DENY", n))
+            return (False, f"Tool '{n}' denied by user.")
+        if state.output_flags.get("DENY", True):
+            print(_c("DENY", n))
+        return (False, f"Tool '{n}' denied by user.")
     return _bte
 
 
@@ -550,6 +571,8 @@ def _make_mappend(state: _ShellState) -> Callable[[Any, Any], None]:
 
 def _make_done(state: _ShellState) -> Callable[[dict], None]:
     def _hook(ctx: dict) -> None:
+        state._allow_all_remaining = False
+        state._deny_all_remaining = False
         r = ctx.get("result")
         if isinstance(r, Error):
             if state.output_flags.get("ERROR", True):
