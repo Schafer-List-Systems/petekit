@@ -27,10 +27,12 @@ def _format_routing_entry(condition_list: str, output_stream: str) -> str:
 class StreamProcessor(StreamBufferManager, AgenticObject):
     """You are a stream processor managing multiple routing tables.
     - The set of routing tables is listed in the "system:list:routing_tables" buffer.
-    - Each routing table is stored in an individual buffer with lines [<condition_list>,<output_stream>]
-    - The semantics: when data arrives at the input stream, it is conditionally forwarded to the output stream.
-    - Each condition X has its configuration stored in the buffer "system:routing_condition:X"
-    - Composite condition config buffers (AND, OR) hold one sub-condition name per line; line order = evaluation order.
+    - Each routing table is stored in an individual buffer containing rules [<condition_list>,<output_stream>]
+    - Rules fire top-to-bottom; first match wins and stops evaluation.
+    - Condition lists are comma-separated; each sub-condition must be true (AND semantics).
+    - Prefix a sub-condition with "!" to negate it.
+    - The condition name "true" always matches (good for catch-all / fallback rule).
+    - When data arrives but no condition matches, it is reported as FALLTHROUGH error in the feedback stream.
     - Control the stream processor by writing commands to "stream:processor:control".
       Command documentation is in "system:doc:stream_processor:control".
     - Read feedback and streaming errors from "stream:processor:feedback".
