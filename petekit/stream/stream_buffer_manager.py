@@ -153,8 +153,9 @@ class StreamBufferManager(BufferManager, AgenticObject):
     @tool
     def read_buffer(self, name: str, start: int | float = 0, end: int | float | None = None, show_timestamps: bool = False, raw: bool = False) -> dict[str, Any] | str:
         """Read a range of lines from a buffer.
+        Omit start to read from the beginning; omit end to read to the last line.
         Float values trigger time-based reading on stream buffers (int for line-based).
-        Negative floats (e.g. -60.0) are relative to the last entry: -60.0 means '60s ago'.
+        Negative floats (e.g. start=-60.0) are relative to the last entry: -60.0 means '60s ago'.
         Set show_timestamps=True to prefix each line with its timestamp.
         Returns a dict with ok/error or ok/content on success.
         Set raw=True to get the raw string instead of a dict — errors always return dict."""

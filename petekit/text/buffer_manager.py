@@ -247,10 +247,10 @@ class BufferManager(AgenticObject):
         raw: bool = False,
     ) -> dict[str, Any] | str:
         """Read a range of lines from a buffer.
+        Omit start to read from the beginning; omit end to read to the last line.
         Set show_timestamps=True to prefix each line with its unix timestamp.
         Returns a dict with ok/error or ok/content on success.
-        Set raw=True to get the raw string instead of a dict — errors always return dict.
-        """
+        Set raw=True to get the raw string instead of a dict — errors always return dict."""
         result = self._read_buffer(name, start, end, show_timestamps)
         if result.kind == "error":
             return {"ok": False, "error": result.error}
