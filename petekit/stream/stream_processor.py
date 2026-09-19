@@ -115,7 +115,7 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
                     result = self._routing_table_drop(routing_table)
                 elif cmd == "add" and len(parts) >= 4:
                     routing_table, condition_list, output_stream = parts[1], parts[2], " ".join(parts[3:])
-                    result = self._routing_table_add(routing_table, condition_list, output_stream)
+                    result = await self._routing_table_add(routing_table, condition_list, output_stream)
                 elif cmd == "del" and len(parts) >= 4:
                     routing_table, condition_list, output_stream = parts[1], parts[2], " ".join(parts[3:])
                     result = self._routing_table_del(routing_table, condition_list, output_stream)
@@ -182,15 +182,15 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         return {"ok": True, "dropped": routing_table}
 
     @sandbox
-    def _routing_table_add(self, routing_table: str, condition_list: str, output_stream: str) -> dict[str, Any]:
+    async def _routing_table_add(self, routing_table: str, condition_list: str, output_stream: str) -> dict[str, Any]:
         """Append a condition->output entry to a routing table."""
         table_name = _routing_table_key(routing_table)
         if routing_table not in self._routing_tables or table_name not in self._buffers:
             return {"ok": False, "error": f"routing table '{routing_table}' not found. Use 'new' first."}
         entry = _format_routing_entry(condition_list, output_stream)
-        create_result = self.create_buffer(table_name, text=entry, overwrite=False)
-        if not create_result.get("ok"):
-            raise RuntimeError(f"failed to append to routing table buffer: {create_result.get('error')}")
+        append_result = await self.write_buffer(table_name, entry)
+        if not append_result.get("ok"):
+            raise RuntimeError(f"failed to append to routing table buffer: {append_result.get('error')}")
         self._routing_tables[routing_table].conditions.append((condition_list, output_stream))
         refresh_result = self._refresh_routing_tables_buffer()
         if not refresh_result.get("ok"):
@@ -208,7 +208,12 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
             if cn == condition_list and os == output_stream:
                 del table.conditions[i]
                 entry = _format_routing_entry(condition_list, output_stream)
-                self.edit_buffer(table_name, old_string=entry, new_string="")
+                edit_result = self.edit_buffer(table_name, old_string=entry, new_string="")
+                if not edit_result.get("ok"):
+                    error_msg = edit_result.get("error", "")
+                    if "not found" in error_msg:
+                        return edit_result
+                    raise RuntimeError(f"failed to edit routing table buffer: {error_msg}")
                 return {"ok": True, "removed": f"{condition_list} {output_stream}"}
         return {"ok": False, "error": f"no matching entry in '{routing_table}'"}
 
