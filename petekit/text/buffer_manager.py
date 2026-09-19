@@ -76,7 +76,9 @@ class BufferManager(AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._buffers: dict[str, Buffer] = {}
-        self._refresh_buffers_buffer()
+        refresh_result = self._refresh_buffers_buffer()
+        if not refresh_result.get("ok"):
+            raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
 
     def _refresh_buffers_buffer(self) -> dict[str, Any]:
         records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
