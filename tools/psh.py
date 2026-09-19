@@ -16,6 +16,8 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 
 from peteos import AgenticObject, Error, tool
 
@@ -40,6 +42,18 @@ TAG_COLORS: dict[str, str] = {
     "SESSION": "\033[96m",
     "HINT": "\033[90m",
 }
+
+
+def _make_ctrl_c_bindings() -> KeyBindings:
+    kb = KeyBindings()
+
+    @kb.add(Keys.ControlC)
+    def _ctrl_c(event: Any) -> None:
+        if not event.current_buffer.text:
+            raise KeyboardInterrupt
+        event.current_buffer.text = ""
+
+    return kb
 
 
 @dataclass
@@ -173,10 +187,12 @@ class PSH:
         self._session = PromptSession(
             history=FileHistory(os.path.join(os.getcwd(), ".psh_history")),
             auto_suggest=AutoSuggestFromHistory(),
+            key_bindings=_make_ctrl_c_bindings(),
         )
         self._agent_session = PromptSession(
             history=FileHistory(os.path.join(os.getcwd(), ".psh_agent_history")),
             auto_suggest=AutoSuggestFromHistory(),
+            key_bindings=_make_ctrl_c_bindings(),
         )
 
     @property
