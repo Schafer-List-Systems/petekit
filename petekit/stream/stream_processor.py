@@ -106,23 +106,29 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
             parts = line.split()
             cmd = parts[0]
             result: dict[str, Any] | None = None
-            if cmd == "new" and len(parts) >= 3:
-                routing_table, input_stream = parts[1], parts[2]
-                result = self._routing_table_new(routing_table, input_stream)
-            elif cmd == "drop" and len(parts) >= 2:
-                routing_table = parts[1]
-                result = self._routing_table_drop(routing_table)
-            elif cmd == "add" and len(parts) >= 4:
-                routing_table, condition_list, output_stream = parts[1], parts[2], " ".join(parts[3:])
-                result = self._routing_table_add(routing_table, condition_list, output_stream)
-            elif cmd == "del" and len(parts) >= 4:
-                routing_table, condition_list, output_stream = parts[1], parts[2], " ".join(parts[3:])
-                result = self._routing_table_del(routing_table, condition_list, output_stream)
-            else:
-                fb_result = await self.write_buffer("stream:processor:feedback", f"unknown or malformed command: {line}")
+            try:
+                if cmd == "new" and len(parts) >= 3:
+                    routing_table, input_stream = parts[1], parts[2]
+                    result = self._routing_table_new(routing_table, input_stream)
+                elif cmd == "drop" and len(parts) >= 2:
+                    routing_table = parts[1]
+                    result = self._routing_table_drop(routing_table)
+                elif cmd == "add" and len(parts) >= 4:
+                    routing_table, condition_list, output_stream = parts[1], parts[2], " ".join(parts[3:])
+                    result = self._routing_table_add(routing_table, condition_list, output_stream)
+                elif cmd == "del" and len(parts) >= 4:
+                    routing_table, condition_list, output_stream = parts[1], parts[2], " ".join(parts[3:])
+                    result = self._routing_table_del(routing_table, condition_list, output_stream)
+                else:
+                    fb_result = await self.write_buffer("stream:processor:feedback", f"unknown or malformed command: {line}")
+                    if not fb_result.get("ok"):
+                        raise RuntimeError(f"failed to write to feedback buffer: {fb_result.get('error')}")
+                    continue
+            except Exception as e:
+                fb_result = await self.write_buffer("stream:processor:feedback", f"SYSTEM ERROR: {e}")
                 if not fb_result.get("ok"):
-                    raise RuntimeError(f"failed to write to feedback buffer: {fb_result.get('error')}")
-                continue
+                    raise RuntimeError(f"failed to write system error to feedback buffer: {fb_result.get('error')}") from e
+                raise
 
             if not result.get("ok"):
                 raise RuntimeError(f"command '{cmd}' failed: {result.get('error')}")
