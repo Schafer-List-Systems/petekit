@@ -58,7 +58,7 @@ class Connector(StreamBufferManager, AgenticObject):
         except KeyError:
             self.drop_buffer(in_buffer)
             raise
-        hook_result = await self._set_stream_on_append_hook(
+        hook_result = self._set_stream_on_append_hook(
             out_buffer,
             name="connection_send",
             hook=lambda s, t, m: self._connection_send_hook(name, t),

@@ -221,7 +221,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         return result
 
     @sandbox
-    async def _set_stream_on_append_hook(
+    def _set_stream_on_append_hook(
         self,
         stream_buffer: str,
         name: str,

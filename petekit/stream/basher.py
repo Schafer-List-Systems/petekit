@@ -97,7 +97,7 @@ class Basher(StreamBufferManager, AgenticObject):
         self.create_buffer(stdin_buffer, stream=True)
         self.create_buffer(stdout_buffer, stream=True)
         self.create_buffer(stderr_buffer, stream=True)
-        hook_result = await self._set_stream_on_append_hook(
+        hook_result = self._set_stream_on_append_hook(
             stdin_buffer,
             name="bash_send",
             hook=lambda stream, text, metadata: self._bash_send_hook(process_id, text),
