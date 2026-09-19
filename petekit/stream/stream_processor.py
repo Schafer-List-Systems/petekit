@@ -244,7 +244,12 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
                     all_match = False
                     break
             if all_match:
-                await self.write_buffer(output_stream, text)
+                sink_result = await self.write_buffer(output_stream, text)
+                if not sink_result.get("ok"):
+                    fb_result = await self.write_buffer("stream:processor:feedback", f"SINK ERROR: failed to write to '{output_stream}': {sink_result.get('error')}")
+                    if not fb_result.get("ok"):
+                        raise RuntimeError(f"failed to write SINK ERROR to feedback: {fb_result.get('error')}")
+                    return
                 return
         fb_result = await self.write_buffer("stream:processor:feedback", f"FALLTHROUGH source={table.input_stream} ts={ts}")
         if not fb_result.get("ok"):

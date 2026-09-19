@@ -138,7 +138,7 @@ class Basher(StreamBufferManager, AgenticObject):
         message = f"Started process [{process_id}] '{title}': {command}. Streams created at {now}. stdin='{stdin_buffer}', stdout='{stdout_buffer}', stderr='{stderr_buffer}'. Use list_processes to track, terminate to stop."
         return {"ok": True, "process_id": process_id, "title": title, "stdin_buffer": stdin_buffer, "stdout_buffer": stdout_buffer, "stderr_buffer": stderr_buffer, "message": message}
 
-    async def _bash_send_hook(self, process_id: int, text: str = "", flush: bool = False, trailing_newline: bool = False) -> str:
+    async def _bash_send_hook(self, process_id: int, text: str = "", flush: bool = True, trailing_newline: bool = False) -> str:
         """Send text to a running process's stdin. Pass flush=True to drain the write buffer without closing. Pass trailing_newline=True to append a trailing newline (as if pressing Enter)."""
         if process_id not in self._processes:
             raise KeyError(f"No process with id '{process_id}'.")
@@ -200,7 +200,7 @@ class Basher(StreamBufferManager, AgenticObject):
                     line_bytes = await stdout.readline()
                     if not line_bytes:
                         break
-                    line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+                    line = line_bytes.decode("utf-8", errors="replace")
                     await self.write_buffer(handle.stdout_buffer, line)
             except asyncio.CancelledError:
                 pass
