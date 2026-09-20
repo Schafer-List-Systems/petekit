@@ -134,11 +134,11 @@ class BufferManager(AgenticObject):
 
     @tool
     def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
-        """Overwrite the text in the range [start, end) of a buffer.
-        To overwrite the whole buffer, pass start=0.
-        To insert at line N: pass start=N and end=N.
-        Omit both start and end to append after the last line.
-        """
+        """Overwrite the text in the range [start, end) of a buffer. Omitting start means start=END. Omitting end means end=END.
+        INSERT at line N: pass start=N and end=N.
+        APPEND: Omit both start and end.
+        OVERWRITE the whole buffer: pass start=0.
+        REPLACE lines M to N: pass start=M and end=N."""
         if name not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{name}'. Use create_buffer first."}
         buf = self._buffers[name]
