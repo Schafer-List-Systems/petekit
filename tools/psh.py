@@ -211,8 +211,10 @@ class PSH:
             message: Any = HTML(f"<ansired><b>{base}</b></ansired>")
         elif self._state._deny_all_session:
             message = HTML(f"<ansicyan><b>{base}</b></ansicyan>")
+        elif not self._state.ask_confirmation:
+            message = HTML(f"<ansired><b>{base}</b></ansired>")
         else:
-            message = base
+            message = HTML(f"<b>{base}</b>")
         result: dict[str, Any] = {"message": message}
         if mode == "code":
             result["multiline"] = True
