@@ -555,7 +555,7 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
             return (False, f"Tool '{n}' denied by user.")
         loop = asyncio.get_running_loop()
         raw_answer = await loop.run_in_executor(
-            None, lambda: input("  allow? [y/n/yes/no] this call | [Y/N] this invoke | [YES/NO] session: ").strip()
+            None, lambda:             input("  allow? [y/n/yes/no/msg] | [Y/N] invoke | [YES/NO] session (or type custom msg): ").strip()
         )
         if raw_answer == "Y":
             state._allow_all_remaining = True
@@ -583,7 +583,7 @@ def _make_bte(state: _ShellState) -> Callable[[Any], Any]:
             return (False, f"Tool '{n}' denied by user.")
         if state.output_flags.get("DENY", True):
             print(_c("DENY", n))
-        return (False, f"Tool '{n}' denied by user.")
+        return (False, raw_answer)
     return _bte
 
 
