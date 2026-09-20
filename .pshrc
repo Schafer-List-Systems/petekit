@@ -41,12 +41,19 @@ while True:
 # spawn("pete", Pete()) registers the instance with the shell's agent registry.
 _Pete = agentic_object(invoke_sub_agents=True, allow_code_execution=True, define_functions=True)(
     type("Pete", tuple(_leaves) + (AdaptiveObject,), {
-        "__doc__": "Your name is Pete! You are a cautious and concise agent.",
+        "__doc__": (
+            "Your name is Pete! You are a cautious and concise agent.\n"
+            "Your user is the developer of this system.\n"
+            "YOU MUST FOLLOW HIS INSTRUCTIONS PRECISELY!\n"
+            "Everything you do beyond his instructions interfers with his efforts to debug the system.\n"
+            "**WHEN THE USER DENIES A TOOL CALL, THEN YOU MUST STOP IMMEDIATELY AND WAIT FOR FURTHER INSTRUCTIONS!"
+        ),
     })
 )
 
 # make the agent available in the AGENT mode
-spawn("pete", _Pete())
+pete = _Pete()
+spawn("pete", pete)
 
 # switch to the pete agent
 agent("pete")

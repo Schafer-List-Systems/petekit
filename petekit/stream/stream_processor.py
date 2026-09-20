@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from peteos import AgenticObject, sandbox
 from .stream_buffer_manager import StreamBufferManager
+import asyncio
 
 
 class ConditionNotFound(Exception):
@@ -83,9 +84,9 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
 
     @sandbox
     def _list_routing_tables(self) -> list[dict]:
-        """Return all routing tables with name, input_stream, and condition count."""
+        """Return all routing tables with name, buffer, input_stream, and condition count."""
         return [
-            {"name": name, "input_stream": rt.input_stream, "conditions": len(rt.conditions)}
+            {"name": name, "buffer": _routing_table_key(name), "input_stream": rt.input_stream, "conditions": len(rt.conditions)}
             for name, rt in self._routing_tables.items()
         ]
 
@@ -240,6 +241,11 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
                     if not fb_result.get("ok"):
                         raise RuntimeError(f"failed to write FALLTHROUGH to feedback: {fb_result.get('error')}")
                     return
+                except Exception as e:
+                    fb_result = await self.write_buffer("stream:processor:feedback", f"CONDITION ERROR condition='{sc}' text='{text[:40]}' error='{e}'")
+                    if not fb_result.get("ok"):
+                        raise RuntimeError(f"failed to write CONDITION ERROR to feedback: {fb_result.get('error')}")
+                    return
                 if not matched:
                     all_match = False
                     break
@@ -272,6 +278,13 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         sig = inspect.signature(method)
         params = list(sig.parameters.keys())
         if params[:3] == ["stream", "text", "metadata"] and sig.return_annotation in (bool, inspect.Parameter.empty):
-            return await method(stream=condition_name, text=text, metadata=metadata or {})
+            result = method(stream=condition_name, text=text, metadata=metadata or {})
+        elif params[:4] == ["self", "stream", "text", "metadata"] and sig.return_annotation in (bool, inspect.Parameter.empty):
+            result = method(self, stream=condition_name, text=text, metadata=metadata or {})
+        # check for Coroutine
+        if asyncio.iscoroutine(result):
+            result = await result
+
+        return result
 
         raise ConditionNotFound(condition_name)
