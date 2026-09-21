@@ -9,8 +9,8 @@ import unittest
 sys.path.insert(0, "/home/frygge/projects/AIOS/peteos-kit")
 sys.path.insert(0, "/home/frygge/projects/private/petekit/src/peteos/peteos")
 
-from petekit import BufferManager, BufferEntry
-from petekit.text.buffer_manager import Buffer
+from petekit import BufferManager
+from petekit.text.buffer_manager import Buffer, BufferEntry
 
 
 class TestBufferManagerBasics(unittest.TestCase):
@@ -28,12 +28,12 @@ class TestBufferManagerBasics(unittest.TestCase):
     def test_create_buffer_with_text(self):
         result = self.bm.create_buffer("test", text="line1\nline2")
         self.assertTrue(result["ok"])
-        content = self.bm.read_buffer("test", raw=True)
+        content = self.bm.read_buffer("test", raw=True, show_line_numbers=False)
         self.assertEqual(content, "line1\nline2")
 
     def test_read_buffer_with_timestamps(self):
         self.bm.create_buffer("test", text="a\nb")
-        result = self.bm.read_buffer("test", show_timestamps=True, raw=True)
+        result = self.bm.read_buffer("test", show_timestamps=True, show_line_numbers=False, raw=True)
         lines = result.strip().split("\n")
         for line in lines:
             self.assertRegex(line, r"^\(\d+\.\d+\)")
@@ -41,14 +41,14 @@ class TestBufferManagerBasics(unittest.TestCase):
 
     def test_read_buffer_ranges(self):
         self.bm.create_buffer("test", text="a\nb\nc\nd\ne")
-        result = self.bm.read_buffer("test", start=1, end=4, raw=True)
+        result = self.bm.read_buffer("test", start=1, end=4, raw=True, show_line_numbers=False)
         self.assertEqual(result, "b\nc\nd")
 
     def test_write_buffer(self):
         self.bm.create_buffer("test")
         result = self.bm.write_buffer("test", "x\ny\nz")
         self.assertTrue(result["ok"])
-        content = self.bm.read_buffer("test", raw=True)
+        content = self.bm.read_buffer("test", raw=True, show_line_numbers=False)
         self.assertEqual(content, "x\ny\nz")
 
     def test_write_buffer_nonexistent(self):
@@ -254,7 +254,7 @@ class TestEditBufferShowTimestamps(unittest.TestCase):
     def test_edit_preserves_timestamps_in_read_output(self):
         self.bm.create_buffer("t", text="A\nB\nC")
         self.bm.edit_buffer("t", "B", "X")
-        result = self.bm.read_buffer("t", show_timestamps=True, raw=True)
+        result = self.bm.read_buffer("t", show_timestamps=True, show_line_numbers=False, raw=True)
         lines = result.strip().split("\n")
         for line in lines:
             self.assertRegex(line, r"^\(\d+\.\d+\)")

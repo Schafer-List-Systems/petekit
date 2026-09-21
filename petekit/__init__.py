@@ -1,4 +1,4 @@
-from petekit.text import TextEditor, WebScraper
+from petekit.text import TextEditor, WebScraper, BufferManager
 from petekit.stream import (
     StreamBufferManager,
     Basher,
@@ -16,6 +16,7 @@ from petekit.image import (
 from petekit.reflection import SelfReflector
 
 __all__ = [
+    "BufferManager",
     "TextEditor",
     "WebScraper",
     "StreamBufferManager",

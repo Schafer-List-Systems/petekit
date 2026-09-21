@@ -86,14 +86,14 @@ class TestStreamBufferReadBufferTimeBased(unittest.TestCase):
         )
 
     def test_absolute_range_inclusive(self):
-        result = self.sbm.read_buffer("stream:t", start=20.0, end=40.0)
+        result = self.sbm.read_buffer("stream:t", start=20.0, end=40.0, show_line_numbers=False)
         self.assertTrue(result["ok"])
         lines = result["content"].split("\n")
         timestamps_in_content = [float(l.split(")")[0][1:]) for l in lines]
         self.assertEqual(timestamps_in_content, [20.0, 30.0, 40.0])
 
     def test_float_start_only(self):
-        result = self.sbm.read_buffer("stream:t", start=35.0)
+        result = self.sbm.read_buffer("stream:t", start=35.0, show_line_numbers=False)
         self.assertTrue(result["ok"])
         lines = result["content"].split("\n")
         self.assertEqual(len(lines), 2)
@@ -101,7 +101,7 @@ class TestStreamBufferReadBufferTimeBased(unittest.TestCase):
         self.assertEqual(timestamps, [40.0, 50.0])
 
     def test_float_end_only(self):
-        result = self.sbm.read_buffer("stream:t", end=25.0)
+        result = self.sbm.read_buffer("stream:t", end=25.0, show_line_numbers=False)
         self.assertTrue(result["ok"])
         lines = result["content"].split("\n")
         timestamps = [float(l.split(")")[0][1:]) for l in lines]
@@ -144,28 +144,28 @@ class TestStreamBufferReadBufferRelativeTime(unittest.TestCase):
         self.sbm.stream_buffer_configs[name] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
 
     def test_negative_start_relative_to_last_entry(self):
-        result = self.sbm.read_buffer("stream:t", start=-20.0)
+        result = self.sbm.read_buffer("stream:t", start=-20.0, show_line_numbers=False)
         self.assertTrue(result["ok"])
         lines = result["content"].split("\n")
         timestamps = [float(l.split(")")[0][1:]) for l in lines]
         self.assertEqual(timestamps, [30.0, 40.0, 50.0])
 
     def test_negative_end_relative_to_last_entry(self):
-        result = self.sbm.read_buffer("stream:t", end=-20.0)
+        result = self.sbm.read_buffer("stream:t", end=-20.0, show_line_numbers=False)
         self.assertTrue(result["ok"])
         lines = result["content"].split("\n")
         timestamps = [float(l.split(")")[0][1:]) for l in lines]
         self.assertEqual(timestamps, [10.0, 20.0, 30.0])
 
     def test_both_negative_relative_range(self):
-        result = self.sbm.read_buffer("stream:t", start=-30.0, end=-10.0)
+        result = self.sbm.read_buffer("stream:t", start=-30.0, end=-10.0, show_line_numbers=False)
         self.assertTrue(result["ok"])
         lines = result["content"].split("\n")
         timestamps = [float(l.split(")")[0][1:]) for l in lines]
         self.assertEqual(timestamps, [20.0, 30.0, 40.0])
 
     def test_negative_zero_means_from_start(self):
-        result = self.sbm.read_buffer("stream:t", start=-0.0)
+        result = self.sbm.read_buffer("stream:t", start=-0.0, show_line_numbers=False)
         self.assertTrue(result["ok"])
         lines = result["content"].split("\n")
         self.assertEqual(len(lines), 5)
@@ -202,10 +202,10 @@ class TestStreamBufferReadBufferLineBased(unittest.TestCase):
         lines = result["content"].split("\n")
         self.assertEqual(len(lines), 5)
         for line in lines:
-            self.assertRegex(line, r"^\(\d+\.\d+\)")
+            self.assertRegex(line, r"^\d+: \(\d+\.\d+\)")
 
     def test_read_range_0_based(self):
-        result = self.sbm.read_buffer("stream:t", start=1, end=4, show_timestamps=True)
+        result = self.sbm.read_buffer("stream:t", start=1, end=4, show_timestamps=True, show_line_numbers=False)
         self.assertTrue(result["ok"])
         lines = result["content"].split("\n")
         self.assertEqual(len(lines), 3)
@@ -213,7 +213,7 @@ class TestStreamBufferReadBufferLineBased(unittest.TestCase):
         self.assertEqual(timestamps, [20.0, 30.0, 40.0])
 
     def test_negative_index_from_end(self):
-        result = self.sbm.read_buffer("stream:t", start=-2, end=None, show_timestamps=True)
+        result = self.sbm.read_buffer("stream:t", start=-2, end=None, show_timestamps=True, show_line_numbers=False)
         self.assertTrue(result["ok"])
         lines = result["content"].split("\n")
         self.assertEqual(len(lines), 2)
