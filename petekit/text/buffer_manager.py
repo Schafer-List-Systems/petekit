@@ -310,7 +310,7 @@ class BufferManager(AgenticObject):
         Use replace_all to replace all occurrences in the given range (default False — errors if old_string appears more than once).
         """
         if name not in self._buffers:
-            return {"ok": False, "error": f"No buffer named '{name}'. Use create_buffer first."}
+            return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"system:list:buffers\" to see available buffers."}
         buf = self._buffers[name]
         total = len(buf.lines)
         resolved = _resolve_line_range(total, start, end)
@@ -331,7 +331,7 @@ class BufferManager(AgenticObject):
             pos = idx + 1
 
         if len(all_ranges) == 0:
-            return {"ok": False, "error": f"'{old_string}' not found in buffer."}
+            return {"ok": False, "error": f"Search pattern '{old_string}' not found in buffer."}
 
         if not replace_all and len(all_ranges) > 1:
             line_numbers = [lo + i for i, e in enumerate(segment_entries) if old_string in e.data]
@@ -340,7 +340,7 @@ class BufferManager(AgenticObject):
             return {
                 "ok": False,
                 "error": (
-                    f"'{old_string}' found multiple times ({segment_text.count(old_string)} total) at: {cluster_msgs}. "
+                    f"Search pattern '{old_string}' found multiple times ({segment_text.count(old_string)} total) at: {cluster_msgs}. "
                     "Set replace_all=True to replace all occurrences."
                 ),
             }
@@ -353,10 +353,10 @@ class BufferManager(AgenticObject):
         if not replace_all and len(char_ranges) > 1:
             return {
                 "ok": False,
-                "error": f"'{old_string}' found multiple times. Set replace_all=True to replace all occurrences.",
+                "error": f"Search pattern '{old_string}' found multiple times. Set replace_all=True to replace all occurrences.",
             }
         if len(char_ranges) == 0:
-            return {"ok": False, "error": f"'{old_string}' not found in buffer."}
+            return {"ok": False, "error": f"Search pattern '{old_string}' not found in buffer."}
 
         new_content = segment_text
         for r_start, r_end in reversed(char_ranges):
