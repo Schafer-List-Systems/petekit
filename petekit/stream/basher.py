@@ -206,7 +206,7 @@ class Basher(StreamBufferManager, AgenticObject):
                     line_bytes = await stdout.readline()
                     if not line_bytes:
                         break
-                    line = line_bytes.decode("utf-8", errors="replace")
+                    line = line_bytes.decode("utf-8", errors="replace").rstrip("\n")
                     await self.write_buffer(handle.stdout_buffer, line)
             except asyncio.CancelledError:
                 pass

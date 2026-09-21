@@ -159,7 +159,7 @@ class Connector(StreamBufferManager, AgenticObject):
                     handle.task.cancel()
                     handle.writer.close()
                     break
-                line = line_bytes.decode("utf-8", errors="replace")
+                line = line_bytes.decode("utf-8", errors="replace").rstrip("\n")
                 await self.write_buffer(handle.in_buffer, line)
         except asyncio.CancelledError:
             pass
