@@ -135,7 +135,6 @@ class BufferManager(AgenticObject):
     @tool
     def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
         """Overwrite the text in the range [start, end) of a buffer.
-
         A trailing newline is always appended, so a blank line in the input
         creates a blank line in the buffer. Omitting start means start=END.
         Omitting end means end=END.
@@ -318,9 +317,8 @@ class BufferManager(AgenticObject):
     @tool
     def edit_buffer(self, name: str, old_string: str, new_string: str, start: int = 0, end: int | None = None, replace_all: bool = False) -> dict[str, Any]:
         """Replace old_string with new_string in the buffer content within a [start, end) range.
-
         Both old_string and new_string can span multiple lines.
-        Use replace_all to replace all occurrences in the given range (default False — errors if old_string appears more than once).
+        Editing fails when old_string is found more than once. Set replace_all=True to replace ALL occurrences.
         """
         # Validate the named buffer exists.
         if name not in self._buffers:
@@ -352,7 +350,7 @@ class BufferManager(AgenticObject):
 
         # Guard: no matches found in the segment.
         if len(all_ranges) == 0:
-            return {"ok": False, "error": f"Search pattern '{old_string}' not found in buffer."}
+            return {"ok": False, "error": f"Search pattern '{old_string}' not found in the range [{lo}, {end})."}
 
         # Guard: multiple matches found but replace_all is False — report clusters and decline.
         if not replace_all and len(all_ranges) > 1:
@@ -386,7 +384,7 @@ class BufferManager(AgenticObject):
                 "error": f"Search pattern '{old_string}' found multiple times. Set replace_all=True to replace all occurrences.",
             }
         if len(char_ranges) == 0:
-            return {"ok": False, "error": f"Search pattern '{old_string}' not found in buffer."}
+            return {"ok": False, "error": f"Search pattern '{old_string}' not found in the range [{lo}, {end})."}
 
         # Duplicate of the replacement block above — rebuilds new_content identically.
         new_content = segment_text
