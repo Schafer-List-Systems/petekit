@@ -11,16 +11,12 @@ from typing import Any
 from peteos.oap.agentic_object import AgenticObject
 from peteos import sandbox, tool
 from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buffer
-
-
-def _sanitize_title(title: str) -> str:
-    """Remove ASCII whitespace from a stream title."""
-    return "".join(c for c in title if c not in " \t\n\r")
+from ..utils.text_formatters import _sanitize_title
 
 
 def _make_stream_name(process_id: int, title: str, stream_type: str) -> str:
     """Build a stream buffer name from a process ID, title, and stream type."""
-    return f"stream:bash:{process_id}:{_sanitize_title(title)}:{stream_type}"
+    return f"stream:bash:{process_id}:{stream_type}:{_sanitize_title(title)}"
 
 
 @dataclass

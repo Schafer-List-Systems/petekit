@@ -9,3 +9,8 @@ def format_dict_list_for_buffer(records: list[dict]) -> str:
         return "[]"
     json_lines = [json.dumps(r) for r in records]
     return "[\n" + ",\n".join(json_lines) + "\n]"
+
+
+def _sanitize_title(title: str) -> str:
+    """Remove ASCII whitespace from a stream title."""
+    return "".join(c for c in title if c not in " \t\n\r")

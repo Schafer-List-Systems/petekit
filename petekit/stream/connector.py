@@ -5,6 +5,7 @@ from typing import Any
 
 from peteos import AgenticObject, sandbox, tool
 from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buffer
+from ..utils.text_formatters import _sanitize_title
 
 
 @dataclass
@@ -45,8 +46,8 @@ class Connector(StreamBufferManager, AgenticObject):
 
         # Prepare stream buffers for incoming and outgoing data
         now = time.time()
-        in_buffer = f"stream:in:{name}"
-        out_buffer = f"stream:out:{name}"
+        in_buffer = f"stream:in:{_sanitize_title(name)}"
+        out_buffer = f"stream:out:{_sanitize_title(name)}"
         for buf in (in_buffer, out_buffer):
             try:
                 self.drop_buffer(buf)
