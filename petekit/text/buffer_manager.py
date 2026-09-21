@@ -134,7 +134,11 @@ class BufferManager(AgenticObject):
 
     @tool
     def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
-        """Overwrite the text in the range [start, end) of a buffer. Omitting start means start=END. Omitting end means end=END.
+        """Overwrite the text in the range [start, end) of a buffer.
+
+        A trailing newline is always appended, so a blank line in the input
+        creates a blank line in the buffer. Omitting start means start=END.
+        Omitting end means end=END.
         INSERT at line N: pass start=N and end=N.
         APPEND: Omit both start and end.
         OVERWRITE the whole buffer: pass start=0.
@@ -149,7 +153,7 @@ class BufferManager(AgenticObject):
         start, end = resolved
         if start > end:
             return {"ok": False, "error": f"start ({start}) > end ({end})."}
-        new_entries = [BufferEntry(data=line, timestamp=time.time(), seen=True) for line in text.splitlines()]
+        new_entries = [BufferEntry(data=line, timestamp=time.time(), seen=True) for line in (text + "\n").splitlines()]
         buf.lines[start:end] = new_entries
         buf.modified_at = time.time()
         if name != "system:list:buffers":
@@ -314,21 +318,29 @@ class BufferManager(AgenticObject):
     @tool
     def edit_buffer(self, name: str, old_string: str, new_string: str, start: int = 0, end: int | None = None, replace_all: bool = False) -> dict[str, Any]:
         """Replace old_string with new_string in the buffer content within a [start, end) range.
+
         Both old_string and new_string can span multiple lines.
         Use replace_all to replace all occurrences in the given range (default False — errors if old_string appears more than once).
         """
+        # Validate the named buffer exists.
         if name not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"system:list:buffers\" to see available buffers."}
+        if not old_string:
+            return {"ok": False, "error": "old_string must not be empty."}
         buf = self._buffers[name]
         total = len(buf.lines)
+
+        # Resolve start/end to absolute 0-based indices; return an error dict if out of range.
         resolved = _resolve_line_range(total, start, end)
         if isinstance(resolved, dict):
             return resolved
         lo, hi = resolved
 
+        # Extract the target segment text and collect its entries.
         segment_entries = buf.lines[lo:hi]
-        segment_text = "\n".join(e.data for e in segment_entries)
+        segment_text = "\n".join(e.data for e in segment_entries) + "\n"
 
+        # Find every occurrence of old_string within the segment.
         all_ranges: list[tuple[int, int]] = []
         pos = 0
         while True:
@@ -338,9 +350,11 @@ class BufferManager(AgenticObject):
             all_ranges.append((idx, idx + len(old_string)))
             pos = idx + 1
 
+        # Guard: no matches found in the segment.
         if len(all_ranges) == 0:
             return {"ok": False, "error": f"Search pattern '{old_string}' not found in buffer."}
 
+        # Guard: multiple matches found but replace_all is False — report clusters and decline.
         if not replace_all and len(all_ranges) > 1:
             line_numbers = [lo + i for i, e in enumerate(segment_entries) if old_string in e.data]
             clusters = self._cluster_lines_to_ranges(name, line_numbers, 5)
@@ -352,12 +366,20 @@ class BufferManager(AgenticObject):
                     "Set replace_all=True to replace all occurrences."
                 ),
             }
+
+        # Narrow char_ranges: all occurrences if replace_all else the first occurrence only.
         char_ranges = all_ranges if replace_all else [all_ranges[0]]
 
+        # Build new_content by applying all replacements in reverse order.
+        # NOTE: this block is duplicated below at lines 369–371 — the same construction
+        # runs again unconditionally before the result is committed.
         new_content = segment_text
         for r_start, r_end in reversed(char_ranges):
             new_content = new_content[:r_start] + new_string + new_content[r_end:]
 
+        # Guards that can never fire: replace_all=False already narrowed char_ranges to a
+        # single element at line 355, so len(char_ranges)>1 is impossible here; the empty
+        # case is already handled at line 341. These guards remain for completeness.
         if not replace_all and len(char_ranges) > 1:
             return {
                 "ok": False,
@@ -366,17 +388,19 @@ class BufferManager(AgenticObject):
         if len(char_ranges) == 0:
             return {"ok": False, "error": f"Search pattern '{old_string}' not found in buffer."}
 
+        # Duplicate of the replacement block above — rebuilds new_content identically.
         new_content = segment_text
         for r_start, r_end in reversed(char_ranges):
             new_content = new_content[:r_start] + new_string + new_content[r_end:]
 
+        # Split the replaced text into lines and prepare timestamp bookkeeping.
         new_lines = new_content.splitlines()
         now = time.time()
         result_entries: list[BufferEntry] = []
         used_old_indices: set[int] = set()
 
+        # Identify which original line indices fall inside any replacement range.
         sorted_ranges = sorted(char_ranges)
-
         replaced_line_indices: set[int] = set()
         for r_start, r_end in sorted_ranges:
             first_newline = segment_text[:r_start].count('\n')
@@ -387,6 +411,9 @@ class BufferManager(AgenticObject):
         old_entries = buf.lines
         old_timestamps = [e.timestamp for e in old_entries]
 
+        # Walk each new line, tracking its position relative to original content so the
+        # correct timestamp can be assigned: replaced lines get the current timestamp;
+        # untouched lines that match the original content at the same index keep theirs.
         char_offset = 0
         for new_i, line_text in enumerate(new_lines):
             char_pos_new = sum(len(new_lines[j]) + 1 for j in range(new_i)) if new_i > 0 else 0
@@ -406,6 +433,7 @@ class BufferManager(AgenticObject):
                     break
                 effective_offset += len(new_string) - (r_end - r_start)
 
+            # Re-check replaced status after offset adjustment.
             if in_replaced and matched_range is not None:
                 r_start, r_end = matched_range
                 net_change = len(new_string) - (r_end - r_start)
@@ -416,6 +444,8 @@ class BufferManager(AgenticObject):
                 if not (r_start <= remapped_pos < r_end):
                     in_replaced = False
 
+            # Assign timestamp: replaced lines get now; untouched preserved lines keep
+            # their original timestamp; novel content also gets now.
             if in_replaced:
                 result_entries.append(BufferEntry(data=line_text, timestamp=now, seen=True))
             else:
@@ -438,6 +468,7 @@ class BufferManager(AgenticObject):
                 else:
                     result_entries.append(BufferEntry(data=line_text, timestamp=now, seen=True))
 
+        # Commit the new line entries back into the buffer at the target range.
         buf.lines[lo:hi] = result_entries
         buf.modified_at = now
         return {"ok": True, "count": len(char_ranges), "old_string": old_string}
