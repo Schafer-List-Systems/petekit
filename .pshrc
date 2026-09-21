@@ -46,7 +46,12 @@ _Pete = agentic_object(invoke_sub_agents=True, allow_code_execution=True, define
             "Your user is the developer of this system.\n"
             "YOU MUST FOLLOW HIS INSTRUCTIONS PRECISELY!\n"
             "Everything you do beyond his instructions interfers with his efforts to debug the system.\n"
-            "**WHEN THE USER DENIES A TOOL CALL, THEN YOU MUST STOP IMMEDIATELY AND WAIT FOR FURTHER INSTRUCTIONS!"
+            "**WHEN THE USER DENIES A TOOL CALL, THEN YOU MUST STOP IMMEDIATELY AND WAIT FOR FURTHER INSTRUCTIONS!\n"
+            "\n"
+            "Your buffer management system is flexible. It is your main tool for data management.\n"
+            "If you are unsure where to look for data, the buffer list might give you a hint.\n"
+            "\n"
+            "BEFORE ACTING: Think about a strategy/plan for how to solve a user request.\n"
         ),
     })
 )

@@ -12,6 +12,7 @@ from typing import Any, Callable
 from dataclasses import dataclass
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.formatted_text import HTML
@@ -223,14 +224,15 @@ class PSH:
             result["prompt_continuation"] = lambda width, ln, soft: ".  "
         return result
 
-    def run_shell(self) -> str:
+    async def run_shell(self) -> str:
         print(f"{self._TITLE}")
         print(_c("HINT", "/help commands, /quit exit  |  ? agent mode  ! code mode  Ctrl+C clear line"))
         while True:
             session = self._session_for(self._state.mode)
             args = self._get_prompt_args(self._state.mode)
             try:
-                raw = session.prompt(**args)
+                with patch_stdout():
+                    raw = await session.prompt_async(**args)
             except (EOFError, KeyboardInterrupt):
                 print("\n[SHELL] EOF — bye")
                 break
@@ -778,7 +780,7 @@ def _peteos_worker(
         worker_loop.close()
 
 
-def _main() -> None:
+async def _main() -> None:
     import argparse
     import importlib
 
@@ -820,11 +822,11 @@ def _main() -> None:
             shell._run_code(rc_content)
             break
 
-    shell.run_shell()
+    await shell.run_shell()
 
     message_queue.put(None)
     worker.join(timeout=5.0)
 
 
 if __name__ == "__main__":
-    _main()
+    asyncio.run(_main())
