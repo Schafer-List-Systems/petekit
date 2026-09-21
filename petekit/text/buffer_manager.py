@@ -207,7 +207,7 @@ class BufferManager(AgenticObject):
         clusters = self._cluster_lines_to_ranges(name, matches, self._NUM_CLUSTERS)
         return {"ok": True, "matches": clusters, "count": len(clusters)}
 
-    def _read_buffer(self, name: str, start: int = 0, end: int | None = None, show_timestamps: bool = False) -> ReadBufferResult:
+    def _read_buffer(self, name: str, start: int = 0, end: int | None = None, show_timestamps: bool = False, show_line_numbers: bool = True) -> ReadBufferResult:
         """Internal read. Returns ReadBufferResult with kind and branch data. Uses 0-based indices with [start, end) semantics."""
         if name not in self._buffers:
             return ReadBufferResult(kind="error", error=f"Error: no buffer named '{name}'. Use create_buffer first.")
@@ -223,10 +223,16 @@ class BufferManager(AgenticObject):
         if start >= total:
             return ReadBufferResult(kind="error", error=f"Error: start ({start}) is at or beyond buffer length ({total} lines).")
 
-        if show_timestamps:
-            segment = [f"({entry.timestamp:.6f}) {entry.data}" for entry in buf.lines[start:end]]
-        else:
-            segment = [entry.data for entry in buf.lines[start:end]]
+        segment = []
+        for i, entry in enumerate(buf.lines[start:end], start=start):
+            if show_timestamps and show_line_numbers:
+                segment.append(f"{i}: ({entry.timestamp:.6f}) {entry.data}")
+            elif show_timestamps:
+                segment.append(f"({entry.timestamp:.6f}) {entry.data}")
+            elif show_line_numbers:
+                segment.append(f"{i}: {entry.data}")
+            else:
+                segment.append(entry.data)
         total_chars = sum(len(l) for l in segment) + len(segment)
 
         if total_chars <= BufferManager._MAX_CHUNK_CHARS:
@@ -266,14 +272,16 @@ class BufferManager(AgenticObject):
         start: int = 0,
         end: int | None = None,
         show_timestamps: bool = False,
+        show_line_numbers: bool = True,
         raw: bool = False,
     ) -> dict[str, Any] | str:
         """Read a range of lines from a buffer.
         Omit start to read from the beginning; omit end to read to the last line.
         Set show_timestamps=True to prefix each line with its unix timestamp.
+        Set show_line_numbers=True (default) to prefix each line with its 0-based line index.
         Returns a dict with ok/error or ok/content on success.
         Set raw=True to get the raw string instead of a dict — errors always return dict."""
-        result = self._read_buffer(name, start, end, show_timestamps)
+        result = self._read_buffer(name, start, end, show_timestamps, show_line_numbers)
         if result.kind == "error":
             return {"ok": False, "error": result.error}
         if result.kind == "content":
