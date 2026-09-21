@@ -13,6 +13,11 @@ from peteos import sandbox, tool
 from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buffer
 
 
+def _make_stream_name(process_id: int, title: str, stream_type: str) -> str:
+    """Build a stream buffer name from a process ID, title, and stream type."""
+    return f"stream:bash:{process_id}:{title}:{stream_type}"
+
+
 @dataclass
 class BashHandle:
     """Holds the execution context for a tracked process."""
@@ -91,9 +96,9 @@ class Basher(StreamBufferManager, AgenticObject):
 
         now = time.time()
         process_id = self._next_process_id()
-        stdin_buffer = f"stream:bash:stdin:{process_id}"
-        stdout_buffer = f"stream:bash:stdout:{process_id}"
-        stderr_buffer = f"stream:bash:stderr:{process_id}"
+        stdin_buffer = _make_stream_name(process_id, title, "stdin")
+        stdout_buffer = _make_stream_name(process_id, title, "stdout")
+        stderr_buffer = _make_stream_name(process_id, title, "stderr")
         self.create_buffer(stdin_buffer, stream=True)
         self.create_buffer(stdout_buffer, stream=True)
         self.create_buffer(stderr_buffer, stream=True)
