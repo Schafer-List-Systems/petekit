@@ -134,7 +134,7 @@ class BufferManager(AgenticObject):
 
     @tool
     def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
-        """Overwrite the text in the range [start, end) of a buffer.
+        """Overwrite the text in the range [start, end) of an existing buffer.
         A trailing newline is always appended, so a blank line in the input
         creates a blank line in the buffer. Omitting start means start=END.
         Omitting end means end=END.
@@ -371,22 +371,6 @@ class BufferManager(AgenticObject):
         # Build new_content by applying all replacements in reverse order.
         # NOTE: this block is duplicated below at lines 369–371 — the same construction
         # runs again unconditionally before the result is committed.
-        new_content = segment_text
-        for r_start, r_end in reversed(char_ranges):
-            new_content = new_content[:r_start] + new_string + new_content[r_end:]
-
-        # Guards that can never fire: replace_all=False already narrowed char_ranges to a
-        # single element at line 355, so len(char_ranges)>1 is impossible here; the empty
-        # case is already handled at line 341. These guards remain for completeness.
-        if not replace_all and len(char_ranges) > 1:
-            return {
-                "ok": False,
-                "error": f"Search pattern '{old_string}' found multiple times. Set replace_all=True to replace all occurrences.",
-            }
-        if len(char_ranges) == 0:
-            return {"ok": False, "error": f"Search pattern '{old_string}' not found in the range [{lo}, {end})."}
-
-        # Duplicate of the replacement block above — rebuilds new_content identically.
         new_content = segment_text
         for r_start, r_end in reversed(char_ranges):
             new_content = new_content[:r_start] + new_string + new_content[r_end:]

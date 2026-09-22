@@ -206,7 +206,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
 
     @tool
     async def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
-        """Overwrite the text in the range [start, end) of a buffer.
+        """Overwrite the text in the range [start, end) of an existing buffer.
         A trailing newline is always appended, so a blank line in the input
         creates a blank line in the buffer. Omitting start means start=END.
         Omitting end means end=END.
