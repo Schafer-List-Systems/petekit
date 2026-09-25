@@ -165,13 +165,13 @@ class StreamBufferManager(BufferManager, AgenticObject):
         return anchor + ts if ts < 0 else ts
 
     @tool
-    def read_buffer(self, name: str, start: int | float = 0, end: int | float | None = None, show_timestamps: bool = False, show_line_numbers: bool = True, raw: bool = False) -> dict[str, Any] | str:
+    def read_buffer(self, name: str, start: int | float = 0, end: int | float | None = None, show_timestamps: bool = False, show_line_numbers: bool = False, raw: bool = False) -> dict[str, Any] | str:
         """Read a range of lines from a buffer.
         Omit start to read from the beginning; omit end to read to the last line.
         Float values trigger time-based reading on stream buffers (int for line-based).
         Negative floats (e.g. start=-60.0) are relative to the last entry: -60.0 means '60s ago'.
         Set show_timestamps=True to prefix each line with its timestamp.
-        Set show_line_numbers=True (default) to prefix each line with its 0-based line index.
+        Set show_line_numbers=True to prefix each line with its 0-based line index.
         Returns a dict with ok/error or ok/content on success.
         Set raw=True to get the raw string instead of a dict — errors always return dict."""
         time_based = isinstance(start, float) or isinstance(end, float)
@@ -273,5 +273,4 @@ class StreamBufferManager(BufferManager, AgenticObject):
             # StreamBufferManager in an inconsistent state (hook registered, listing stale).
             raise RuntimeError(f"failed to refresh stream buffer hooks: {refresh_result.get('error')}")
         return {"ok": True, "hook_count": len(self.stream_buffer_configs[stream_buffer].hooks), "name": name, "stream_buffer": stream_buffer}
-
 

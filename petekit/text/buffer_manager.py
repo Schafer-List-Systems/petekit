@@ -275,7 +275,7 @@ class BufferManager(AgenticObject):
         start: int = 0,
         end: int | None = None,
         show_timestamps: bool = False,
-        show_line_numbers: bool = True,
+        show_line_numbers: bool = False,
         raw: bool = False,
     ) -> dict[str, Any] | str:
         """Read a range of lines from a buffer.
@@ -585,3 +585,4 @@ class BufferManager(AgenticObject):
             clusters = clusters[:min_i] + [merged] + clusters[min_i + 2:]
 
         return [(c['s'], c['e'], c['n']) for c in clusters]
+
