@@ -43,6 +43,17 @@ class ReadBufferResult:
 
 
 @dataclass
+class GrepResult:
+    """Result of Buffer.grep and _grep_buffer. Carries raw match data for downstream processing."""
+    ok: bool
+    matches: list[int] | None = None
+    start: int | None = None
+    end: int | None = None
+    count: int = 0
+    error: str | None = None
+
+
+@dataclass
 class BufferEntry:
     """A single line in a buffer with timestamp and seen flag."""
     data: str
@@ -97,6 +108,29 @@ class Buffer:
             total_chars=total_chars,
             line_count=len(segment),
         )
+
+    def grep(self, pattern: str, start: int = 0, end: int | None = None) -> GrepResult:
+        # Resolve the requested range to absolute 0-based indices, returning an error if out of bounds.
+        total = len(self.lines)
+        resolved = _resolve_line_range(total, start, end)
+        if isinstance(resolved, dict):
+            return GrepResult(ok=False, error=resolved["error"])
+        start, end = resolved
+        if start > end:
+            return GrepResult(ok=False, error=f"start ({start}) > end ({end}).")
+
+        # Compile the regex pattern and collect line indices where it matches.
+        try:
+            compiled = re.compile(pattern)
+        except re.error as e:
+            return GrepResult(ok=False, error=f"Invalid regex pattern '{pattern}': {e}.")
+        matches = []
+        for i, entry in enumerate(self.lines[start:end], start=start):
+            if compiled.search(entry.data):
+                matches.append(i)
+
+        # Return the unclustered raw match list for the caller to further process.
+        return GrepResult(ok=True, matches=matches, start=start, end=end, count=len(matches))
 
 
 class BufferManager(AgenticObject):
@@ -224,6 +258,28 @@ class BufferManager(AgenticObject):
             raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
         return {"ok": True, "dropped": name}
 
+    @sandbox
+    def _grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | None = None) -> dict[str, Any]:
+        """Search a buffer for a regex pattern.
+        Searches the full buffer by default, or a [start, end) range if provided.
+        Returns a dict with ok/error or ok/matches.
+        Use (?i) at the start for case-insensitive matching.
+        """
+        # Look up the named buffer and delegate grep to Buffer.grep, returning an error if the buffer is missing.
+        if name not in self._buffers:
+            return {"ok": False, "error": f"No buffer named '{name}'."}
+        buf = self._buffers[name]
+        result = buf.grep(pattern=pattern, start=start, end=end)
+        if not result.ok:
+            return {"ok": False, "error": result.error}
+        return {
+            "ok": True,
+            "matches": result.matches,
+            "start": result.start,
+            "end": result.end,
+            "count": result.count,
+        }
+
     @tool
     def grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | None = None) -> dict[str, Any]:
         """Search a buffer for a regex pattern.
@@ -231,26 +287,14 @@ class BufferManager(AgenticObject):
         Returns a dict with ok/error or ok/matches.
         Use (?i) at the start for case-insensitive matching.
         """
-        if name not in self._buffers:
-            return {"ok": False, "error": f"No buffer named '{name}'."}
-        total = len(self._buffers[name].lines)
-        resolved = _resolve_line_range(total, start, end)
-        if isinstance(resolved, dict):
-            return resolved
-        start, end = resolved
-        if start > end:
-            return {"ok": False, "error": f"start ({start}) > end ({end})."}
-        try:
-            compiled = re.compile(pattern)
-        except re.error as e:
-            return {"ok": False, "error": f"Invalid regex pattern '{pattern}': {e}."}
-        matches = []
-        buf = self._buffers[name]
-        for i, entry in enumerate(buf.lines[start:end], start=start):
-            if compiled.search(entry.data):
-                matches.append(i)
-        clusters = self._cluster_lines_to_ranges(name, matches, self._NUM_CLUSTERS)
-        return {"ok": True, "matches": clusters, "count": len(clusters)}
+        # Delegate retrieval to the sandboxed helper, which surfaces raw unclustered matches.
+        result = self._grep_buffer(name, pattern, start, end)
+        if not result.get("ok"):
+            return result
+
+        # Cluster the match indices to keep the agent context bounded when results are numerous.
+        clusters = self._cluster_lines_to_ranges(None, result["matches"], self._NUM_CLUSTERS)
+        return {"ok": True, "matches": clusters, "count": result["count"]}
 
     @sandbox
     def _read_buffer(self, name: str, start: int = 0, end: int | None = None, show_timestamps: bool = False, show_line_numbers: bool = True) -> dict[str, Any]:
