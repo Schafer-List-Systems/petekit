@@ -401,7 +401,7 @@ class BufferManager(AgenticObject):
         return {"ok": True, "matches": clusters, "count": result["count"]}
 
     @sandbox
-    def _read_buffer(self, name: str, start: int = 0, end: int | None = None, show_timestamps: bool = False, show_line_numbers: bool = True) -> dict[str, Any]:
+    def _read_buffer(self, name: str, start: int = 0, end: int | None = None, show_timestamps: bool = False, show_line_numbers: bool = False) -> dict[str, Any]:
         """Read a range of lines from a buffer.
         Omit start to read from the beginning; omit end to read to the last line.
         Set show_timestamps=True to prefix each line with its unix timestamp.
