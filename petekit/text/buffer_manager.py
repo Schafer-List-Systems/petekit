@@ -637,14 +637,19 @@ class BufferManager(AgenticObject):
         Stores the result in a target buffer named diff:a→b.
         Use overwrite=True to overwrite an existing diff buffer.
         """
+        # Validate both buffer names exist before proceeding.
         if a not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{a}'."}
         if b not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{b}'."}
+
+        # Extract line data for the diff computation.
         buf_a = [e.data for e in self._buffers[a].lines]
         buf_b = [e.data for e in self._buffers[b].lines]
         if buf_a == buf_b:
             return {"ok": True, "identical": True, "a": a, "b": b}
+
+        # Guard against overwriting an existing diff buffer.
         diff_name = f"diff:{a}→{b}"
         if diff_name in self._buffers and not overwrite:
             return {
@@ -654,12 +659,16 @@ class BufferManager(AgenticObject):
                     f"Use overwrite=True to replace it, or drop it first with drop_buffer."
                 ),
             }
+
+        # Generate the unified diff and persist it as a new named buffer.
         import difflib
         diff_lines = list(difflib.unified_diff(
             buf_a, buf_b,
             fromfile=f"buffer:{a}", tofile=f"buffer:{b}",
             lineterm="",
         ))
-        now = time.time()
-        self._buffers[diff_name] = Buffer(lines=[BufferEntry(data=line, timestamp=now, seen=True) for line in diff_lines], created_at=now, modified_at=now)
-        return {"ok": True, "buffer": diff_name, "lines": len(diff_lines)}
+        diff_text = "\n".join(diff_lines) + "\n"
+        create_result = self.create_buffer(diff_name, text=diff_text, overwrite=True)
+        if not create_result.get("ok"):
+            return create_result
+        return {"ok": True, "buffer": diff_name, "lines": create_result.get("lines", 0)}
