@@ -8,7 +8,7 @@ from typing import Any
 from typing import Literal
 
 from peteos.oap.agentic_object import AgenticObject
-from peteos import tool
+from peteos import tool, sandbox
 from petekit.utils.text_formatters import format_dict_list_for_buffer
 
 
@@ -33,7 +33,8 @@ class ReadBufferResult:
     """Result of _read_buffer. Signals which branch was taken and carries data for hint construction."""
     kind: Literal["content", "skip", "bucket", "error"]
     content: str | None = None
-    line_range: tuple[int, int] | None = None  # (0-based start, 0-based end, [start, end) semantics)
+    start: int | None = None
+    end: int | None = None
     total_chars: int = 0
     line_count: int = 0
     skip_lines: list[tuple[int, int]] | None = None  # (0-based line index, char count)
@@ -55,6 +56,47 @@ class Buffer:
     lines: list[BufferEntry]
     created_at: float
     modified_at: float
+
+    def read(
+        self,
+        start: int = 0,
+        end: int | None = None,
+        show_timestamps: bool = False,
+        show_line_numbers: bool = True,
+    ) -> ReadBufferResult:
+        # Resolve the requested range to absolute 0-based indices, returning an error if out of bounds.
+        total = len(self.lines)
+        resolved = _resolve_line_range(total, start, end)
+        if isinstance(resolved, dict):
+            return ReadBufferResult(kind="error", error=resolved["error"])
+        start, end = resolved
+        if start > end:
+            return ReadBufferResult(kind="error", error=f"Error: start ({start}) > end ({end}). Buffer has {total} lines.")
+        if start >= total:
+            return ReadBufferResult(kind="error", error=f"Error: start ({start}) is at or beyond buffer length ({total} lines).")
+
+        # Format each line with optional line numbers and timestamps.
+        segment = []
+        for i, entry in enumerate(self.lines[start:end], start=start):
+            if show_timestamps and show_line_numbers:
+                segment.append(f"{i}: ({entry.timestamp:.6f}) {entry.data}")
+            elif show_timestamps:
+                segment.append(f"({entry.timestamp:.6f}) {entry.data}")
+            elif show_line_numbers:
+                segment.append(f"{i}: {entry.data}")
+            else:
+                segment.append(entry.data)
+
+        # Compute total char count and return the content result.
+        total_chars = sum(len(l) for l in segment) + len(segment)
+        return ReadBufferResult(
+            kind="content",
+            content="\n".join(segment),
+            start=start,
+            end=end,
+            total_chars=total_chars,
+            line_count=len(segment),
+        )
 
 
 class BufferManager(AgenticObject):
@@ -210,63 +252,31 @@ class BufferManager(AgenticObject):
         clusters = self._cluster_lines_to_ranges(name, matches, self._NUM_CLUSTERS)
         return {"ok": True, "matches": clusters, "count": len(clusters)}
 
-    def _read_buffer(self, name: str, start: int = 0, end: int | None = None, show_timestamps: bool = False, show_line_numbers: bool = True) -> ReadBufferResult:
-        """Internal read. Returns ReadBufferResult with kind and branch data. Uses 0-based indices with [start, end) semantics."""
+    @sandbox
+    def _read_buffer(self, name: str, start: int = 0, end: int | None = None, show_timestamps: bool = False, show_line_numbers: bool = True) -> dict[str, Any]:
+        """Read a range of lines from a buffer.
+        Omit start to read from the beginning; omit end to read to the last line.
+        Set show_timestamps=True to prefix each line with its unix timestamp.
+        Set show_line_numbers=True (default) to prefix each line with its 0-based line index.
+        Returns a dict with ok/error or ok/content on success.
+        Set raw=True to get the raw string instead of a dict — errors always return dict."""
+        # Look up the named buffer and delegate retrieval to Buffer.read, returning an error if the buffer is missing.
         if name not in self._buffers:
-            return ReadBufferResult(kind="error", error=f"Error: no buffer named '{name}'. Use create_buffer first.")
+            return {"ok": False, "error": f"Error: no buffer named '{name}' found."}
         buf = self._buffers[name]
-        total = len(buf.lines)
+        result = buf.read(start=start, end=end, show_timestamps=show_timestamps, show_line_numbers=show_line_numbers)
+        if result.kind == "error":
+            return {"ok": False, "error": result.error}
 
-        resolved = _resolve_line_range(total, start, end)
-        if isinstance(resolved, dict):
-            return ReadBufferResult(kind="error", error=resolved["error"])
-        start, end = resolved
-        if start > end:
-            return ReadBufferResult(kind="error", error=f"Error: start ({start}) > end ({end}). Buffer has {total} lines.")
-        if start >= total:
-            return ReadBufferResult(kind="error", error=f"Error: start ({start}) is at or beyond buffer length ({total} lines).")
-
-        segment = []
-        for i, entry in enumerate(buf.lines[start:end], start=start):
-            if show_timestamps and show_line_numbers:
-                segment.append(f"{i}: ({entry.timestamp:.6f}) {entry.data}")
-            elif show_timestamps:
-                segment.append(f"({entry.timestamp:.6f}) {entry.data}")
-            elif show_line_numbers:
-                segment.append(f"{i}: {entry.data}")
-            else:
-                segment.append(entry.data)
-        total_chars = sum(len(l) for l in segment) + len(segment)
-
-        if total_chars <= BufferManager._MAX_CHUNK_CHARS:
-            for entry in buf.lines[start:end]:
-                entry.seen = True
-            return ReadBufferResult(
-                kind="content",
-                content="\n".join(segment),
-                line_range=(start, end),
-                total_chars=total_chars,
-                line_count=len(segment),
-            )
-
-        to_skip, _ = self._lines_to_skip(segment, start)
-        if to_skip and len(to_skip) <= 10:
-            return ReadBufferResult(
-                kind="skip",
-                line_range=(start, end),
-                total_chars=total_chars,
-                line_count=len(segment),
-                skip_lines=to_skip,
-            )
-
-        buckets = self._make_buckets(segment, 10, start)
-        return ReadBufferResult(
-            kind="bucket",
-            line_range=(start, end),
-            total_chars=total_chars,
-            line_count=len(segment),
-            bucket_info=buckets,
-        )
+        # Surface the full untruncated content with resolved range metadata.
+        return {
+            "ok": True,
+            "content": result.content,
+            "start": result.start,
+            "end": result.end,
+            "total_chars": result.total_chars,
+            "line_count": result.line_count,
+        }
 
     @tool
     def read_buffer(
@@ -284,31 +294,49 @@ class BufferManager(AgenticObject):
         Set show_line_numbers=True (default) to prefix each line with its 0-based line index.
         Returns a dict with ok/error or ok/content on success.
         Set raw=True to get the raw string instead of a dict — errors always return dict."""
+        # Retrieve the full untruncated buffer content.
         result = self._read_buffer(name, start, end, show_timestamps, show_line_numbers)
-        if result.kind == "error":
-            return {"ok": False, "error": result.error}
-        if result.kind == "content":
+        if not result.get("ok"):
+            return result
+        total_chars = result["total_chars"]
+
+        # Within-size path: mark entries as seen by the agent and return content directly.
+        if total_chars <= BufferManager._MAX_CHUNK_CHARS:
+            buf = self._buffers[name]
+            for entry in buf.lines[result["start"]:result["end"]]:
+                entry.seen = True
             if raw:
-                return result.content
-            return {"ok": True, "content": result.content, "line_range": result.line_range, "lines": result.line_count}
-        if result.kind == "skip":
-            skip_lines = result.skip_lines
+                return result["content"]
+            return {"ok": True, "content": result["content"], "start": result["start"], "end": result["end"], "lines": result["line_count"]}
+
+        # Split the formatted content into lines for heavy-line detection; this segment reflects the
+        # pre-formatted text (with line numbers and timestamps as applicable) and its total char
+        # count is the authoritative measure used by the skip and bucket heuristics.
+        segment = result["content"].split("\n")
+        if result["content"].endswith("\n"):
+            segment = segment[:-1]
+
+        # Over-size path: check whether excluding the heaviest lines would bring the segment under the threshold.
+        to_skip, _ = self._lines_to_skip(segment, result["start"])
+        if to_skip and len(to_skip) <= 10:
+            skip_lines = to_skip
             skip_msg = ", ".join(f"line {idx}({cl} chars)" for idx, cl in skip_lines)
             return {
                 "ok": False,
                 "error": (
-                    f"Range [{result.line_range[0]}–{result.line_range[1]}] is {result.total_chars} chars ({result.line_count} lines). "
+                    f"Range [{result['start']}–{result['end']}] is {total_chars} chars ({result['line_count']} lines). "
                     f"Heaviest lines ({len(skip_lines)} totaling {sum(c for _, c in skip_lines)} chars): {skip_msg}. "
                     f"Consider re-reading with a narrower range to avoid them."
                 ),
             }
-        # kind == "bucket"
-        result_bucket = result.bucket_info  # type: ignore
-        bucket_msgs = ", ".join(f"{sa}-{en}:{c}" for sa, en, c in result_bucket)
+
+        # Over-size path: report bucket distribution and prompt the caller to narrow the range.
+        buckets = self._make_buckets(segment, 10, result["start"])
+        bucket_msgs = ", ".join(f"{sa}-{en}:{c}" for sa, en, c in buckets)
         return {
             "ok": False,
             "error": (
-                f"Range [{result.line_range[0]}–{result.line_range[1]}] is {result.total_chars} chars ({result.line_count} lines) and exceeds the {BufferManager._MAX_CHUNK_CHARS}-char threshold. "
+                f"Range [{result['start']}–{result['end']}] is {total_chars} chars ({result['line_count']} lines) and exceeds the {BufferManager._MAX_CHUNK_CHARS}-char threshold. "
                 f"Reduce the read range to stay under the limit. "
                 f"Bucket distribution (start-end:chars): {bucket_msgs}."
             ),
