@@ -28,6 +28,110 @@ def _resolve_line_range(total: int, start: int | None, end: int | None) -> dict[
     return (start, end)
 
 
+def _lines_to_skip(segment: list[str], start_offset: int, max_chars: int) -> tuple[list[tuple[int, int]], int]:
+    """Find the minimum set of longest lines whose removal makes the segment fit under max_chars.
+
+    Sorts lines longest-first, then greedily removes them until the remaining total fits.
+    Returns a list of (1-based line index, char_count) to skip, and the char count of
+    what remains.
+    """
+    # Index each line with its absolute position and sort longest-first.
+    lines_with_idx = [(start_offset + i, l) for i, l in enumerate(segment)]
+    by_len = sorted(lines_with_idx, key=lambda x: len(x[1]), reverse=True)
+    seg_total = sum(len(l) for l in segment) + len(segment)
+
+    # Greedily skip longest lines until the segment fits under the threshold.
+    skip = []
+    skip_total_chars = 0
+    for idx, line in by_len:
+        if seg_total - skip_total_chars <= max_chars:
+            break
+        skip.append((idx, len(line)))
+        skip_total_chars += len(line) + 1
+
+    return (skip, seg_total - skip_total_chars)
+
+
+def _make_buckets(segment: list[str], num_buckets: int, start_offset: int) -> list[tuple[int, int, int]]:
+    """Divide a segment into num_buckets equal-size buckets.
+
+    Each bucket is described by its start line index, end line index, and total char
+    count. All indices are absolute (1-based relative to the full buffer).
+    """
+    n = len(segment)
+    if n == 0:
+        return []
+    bucket_size = n // num_buckets
+
+    # Partition the segment into equal-sized buckets, the last bucket absorbing any remainder.
+    buckets = []
+    for b in range(num_buckets):
+        start = b * bucket_size
+        end = n if b == num_buckets - 1 else start + bucket_size
+        lines = segment[start:end]
+        chars = sum(len(l) + 1 for l in lines)
+        buckets.append((start_offset + start, start_offset + end - 1, chars))
+    return buckets
+
+
+_NO_BUFFER_ = object()
+
+
+def _cluster_lines_to_ranges(
+    line_numbers: list[int],
+    num_clusters: int,
+    buf_lines: list[BufferEntry] | None = _NO_BUFFER_,
+) -> list[tuple[int, int, int]]:
+    """Cluster matching line numbers into num_clusters ranges by agglomerative neighbor merging.
+
+    Each line starts as its own cluster. Repeatedly merges the pair of neighboring
+    clusters with the smallest content-based distance (sum of both cluster char
+    counts plus the char count of the lines between them). Stops when num_clusters
+    remain. Returns a list of (cluster_start, cluster_end, match_count).
+    """
+    if not line_numbers:
+        return []
+    if len(line_numbers) <= num_clusters:
+        return [(ln, ln, 1) for ln in line_numbers]
+
+    # Bootstrap clusters, using buffer line lengths when a buffer is available.
+    if buf_lines is _NO_BUFFER_:
+        clusters = [{'s': ln, 'e': ln, 'v': 0, 'n': 1} for ln in line_numbers]
+    else:
+        clusters = [{'s': ln, 'e': ln, 'v': len(buf_lines[ln].data) + 1, 'n': 1} for ln in line_numbers]
+
+    # Sum the char counts of two adjacent clusters plus the gap between them.
+    def span_chars(start: int, end: int) -> int:
+        return sum(len(buf_lines[i].data) + 1 for i in range(start, end + 1))
+
+    def neighbor_distance(i: int) -> int:
+        a = clusters[i]
+        b = clusters[i + 1]
+        between = span_chars(a['e'] + 1, b['s'])
+        return a['v'] + b['v'] + between
+
+    # Repeatedly merge the closest neighboring clusters until the target cluster count is reached.
+    while len(clusters) > num_clusters:
+        min_i = 0
+        min_d = neighbor_distance(0)
+        for i in range(1, len(clusters) - 1):
+            d = neighbor_distance(i)
+            if d < min_d:
+                min_d = d
+                min_i = i
+        a = clusters[min_i]
+        b = clusters[min_i + 1]
+        merged = {
+            's': a['s'],
+            'e': b['e'],
+            'v': span_chars(a['s'], b['e']),
+            'n': a['n'] + b['n'],
+        }
+        clusters = clusters[:min_i] + [merged] + clusters[min_i + 2:]
+
+    return [(c['s'], c['e'], c['n']) for c in clusters]
+
+
 @dataclass
 class ReadBufferResult:
     """Result of _read_buffer. Signals which branch was taken and carries data for hint construction."""
@@ -293,7 +397,7 @@ class BufferManager(AgenticObject):
             return result
 
         # Cluster the match indices to keep the agent context bounded when results are numerous.
-        clusters = self._cluster_lines_to_ranges(None, result["matches"], self._NUM_CLUSTERS)
+        clusters = _cluster_lines_to_ranges(result["matches"], self._NUM_CLUSTERS)
         return {"ok": True, "matches": clusters, "count": result["count"]}
 
     @sandbox
@@ -361,7 +465,7 @@ class BufferManager(AgenticObject):
             segment = segment[:-1]
 
         # Over-size path: check whether excluding the heaviest lines would bring the segment under the threshold.
-        to_skip, _ = self._lines_to_skip(segment, result["start"])
+        to_skip, _ = _lines_to_skip(segment, result["start"], BufferManager._MAX_CHUNK_CHARS)
         if to_skip and len(to_skip) <= 10:
             skip_lines = to_skip
             skip_msg = ", ".join(f"line {idx}({cl} chars)" for idx, cl in skip_lines)
@@ -375,7 +479,7 @@ class BufferManager(AgenticObject):
             }
 
         # Over-size path: report bucket distribution and prompt the caller to narrow the range.
-        buckets = self._make_buckets(segment, 10, result["start"])
+        buckets = _make_buckets(segment, 10, result["start"])
         bucket_msgs = ", ".join(f"{sa}-{en}:{c}" for sa, en, c in buckets)
         return {
             "ok": False,
@@ -427,7 +531,7 @@ class BufferManager(AgenticObject):
         # Guard: multiple matches found but replace_all is False — report clusters and decline.
         if not replace_all and len(all_ranges) > 1:
             line_numbers = [lo + i for i, e in enumerate(segment_entries) if old_string in e.data]
-            clusters = self._cluster_lines_to_ranges(name, line_numbers, 5)
+            clusters = _cluster_lines_to_ranges(line_numbers, 5, self._buffers[name].lines)
             cluster_msgs = ", ".join(f"lines {s}–{e} ({n} occurrence(s))" for s, e, n in clusters)
             return {
                 "ok": False,
@@ -559,102 +663,3 @@ class BufferManager(AgenticObject):
         now = time.time()
         self._buffers[diff_name] = Buffer(lines=[BufferEntry(data=line, timestamp=now, seen=True) for line in diff_lines], created_at=now, modified_at=now)
         return {"ok": True, "buffer": diff_name, "lines": len(diff_lines)}
-
-    def _lines_to_skip(self, segment: list[str], start_offset: int) -> tuple[list[tuple[int, int]], int]:
-        """Find the minimum set of longest lines whose removal makes the segment fit under MAX.
-
-        Args:
-            segment: list of line strings
-            start_offset: 1-based index of the first line in the segment
-
-        Returns:
-            (list of (1-based line index, char_count) to skip, sorted by line index,
-             total chars of remaining lines including their newlines)
-        """
-        lines_with_idx = [(start_offset + i, l) for i, l in enumerate(segment)]
-        by_len = sorted(lines_with_idx, key=lambda x: len(x[1]), reverse=True)
-        seg_total = sum(len(l) for l in segment) + len(segment)
-        skip = []
-        skip_total_chars = 0
-        for idx, line in by_len:
-            # if we do not exceed the threshold, we can stop removing / skipping lines
-            if seg_total - skip_total_chars <= BufferManager._MAX_CHUNK_CHARS:
-                break
-
-            skip.append((idx, len(line)))
-            skip_total_chars += len(line) + 1
-        return (skip, seg_total - skip_total_chars)
-
-    def _make_buckets(self, segment: list[str], num_buckets: int, start_offset: int) -> list[tuple[int, int, int]]:
-        """Divide segment into num_buckets buckets. Returns list of (start, end, char_count) with absolute line numbers."""
-        n = len(segment)
-        if n == 0:
-            return []
-        bucket_size = n // num_buckets
-        buckets = []
-        for b in range(num_buckets):
-            start = b * bucket_size
-            if b == num_buckets - 1:
-                end = n
-            else:
-                end = start + bucket_size
-            lines = segment[start:end]
-            chars = sum(len(l) + 1 for l in lines)
-            buckets.append((start_offset + start, start_offset + end - 1, chars))
-        return buckets
-
-    def _cluster_lines_to_ranges(self, name: str, line_numbers: list[int], num_clusters: int) -> list[tuple[int, int, int]]:
-        """Cluster matching line numbers into ranges by repeatedly merging closest neighbors.
-
-        Agglomerative clustering: each line starts as its own cluster with count 1.
-        Repeatedly merge the pair of neighboring clusters with the smallest
-        content-based distance (sum of both cluster char counts plus char count
-        of lines between them). Stops when num_clusters remain.
-        Returns list of (cluster_start, cluster_end, match_count).
-        """
-        if not line_numbers or name not in self._buffers:
-            return []
-        if len(line_numbers) <= num_clusters:
-            return [(ln, ln, 1) for ln in line_numbers]
-
-        buf_lines = self._buffers[name].lines
-
-        def span_chars(start: int, end: int) -> int:
-            return sum(len(buf_lines[i].data) + 1 for i in range(start, end + 1))
-
-        clusters = [
-            {'s': ln, 'e': ln, 'v': len(buf_lines[ln].data) + 1, 'n': 1}
-            for ln in line_numbers
-        ]
-
-        def neighbor_distance(i: int) -> int:
-            a = clusters[i]
-            b = clusters[i + 1]
-            between = span_chars(a['e'] + 1, b['s'])
-            return a['v'] + b['v'] + between
-
-        # TODO: Replace O(n^2) linear scan with O(n log n) min-heap.
-        #   Maintain a priority queue of (distance, index) for adjacent cluster pairs.
-        #   After each merge, re-insert the two new neighbor distances.
-        #   This mirrors mesh simplification (e.g. QSlim): each merge updates only
-        #   the affected local region, not the entire list.
-        while len(clusters) > num_clusters:
-            min_i = 0
-            min_d = neighbor_distance(0)
-            for i in range(1, len(clusters) - 1):
-                d = neighbor_distance(i)
-                if d < min_d:
-                    min_d = d
-                    min_i = i
-            a = clusters[min_i]
-            b = clusters[min_i + 1]
-            merged = {
-                's': a['s'],
-                'e': b['e'],
-                'v': span_chars(a['s'], b['e']),
-                'n': a['n'] + b['n']
-            }
-            clusters = clusters[:min_i] + [merged] + clusters[min_i + 2:]
-
-        return [(c['s'], c['e'], c['n']) for c in clusters]
-
