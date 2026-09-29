@@ -5,7 +5,11 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from typing import Callable
 from typing import Literal
+
+
+UpdateHook = Callable[["Buffer", str | None, int, int, str | None], bool | str | None]
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos import tool, sandbox
@@ -171,6 +175,20 @@ class Buffer:
     lines: list[BufferEntry]
     created_at: float
     modified_at: float
+    _update_hooks: dict[str, UpdateHook] = field(default_factory=dict)
+
+    def _fire_update_hooks(self, old_text: str | None, start: int, end: int, new_text: str | None) -> bool | str:
+        # Guard: return early if no hooks are registered.
+        if not self._update_hooks:
+            return True
+
+        # Fire each hook in registration order; stop and return the first rejection.
+        for hook_name, hook in self._update_hooks.items():
+            result = hook(self, old_text, start, end, new_text)
+            if result is not None and result is not True:
+                return result
+
+        return True
 
     def read(
         self,
@@ -322,9 +340,12 @@ class BufferManager(AgenticObject):
         APPEND: Omit both start and end.
         OVERWRITE the whole buffer: pass start=0.
         REPLACE lines M to N: pass start=M and end=N."""
+        # Guard: reject unknown buffer names to keep write operations consistent.
         if name not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{name}'. Use create_buffer first."}
         buf = self._buffers[name]
+
+        # Resolve the requested range and validate it before any content is read.
         total = len(buf.lines)
         resolved = _resolve_line_range(total, start, end)
         if isinstance(resolved, dict):
@@ -332,9 +353,21 @@ class BufferManager(AgenticObject):
         start, end = resolved
         if start > end:
             return {"ok": False, "error": f"start ({start}) > end ({end})."}
+
+        # Capture old buffer content and compute new content, then fire update hooks.
+        # The hook sees the exact slice that will be replaced and the proposed replacement.
+        old_text = "\n".join(buf.lines[i].data for i in range(start, min(end, total))) + "\n"
+        new_text = text + "\n"
+        hook_result = buf._fire_update_hooks(old_text, start, end, new_text)
+        if hook_result is not True and hook_result is not None:
+            return {"ok": False, "error": str(hook_result)}
+
+        # Commit the mutation to the buffer and stamp the modification time.
         new_entries = [BufferEntry(data=line, timestamp=time.time(), seen=True) for line in (text + "\n").splitlines()]
         buf.lines[start:end] = new_entries
         buf.modified_at = time.time()
+
+        # Refresh the buffer registry to keep the system listing current.
         if name != "system:list:buffers":
             refresh_result = self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
@@ -349,10 +382,23 @@ class BufferManager(AgenticObject):
         """Drop (delete) a buffer by name.
         The buffer and its content are discarded.
         """
+        # Guard: reject unknown buffer names to keep drop operations consistent.
         if name not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{name}'."}
+        buf = self._buffers[name]
+
+        # Guard: the system listing buffer may not be dropped.
         if name == "system:list:buffers":
             return {"ok": False, "error": "Cannot drop the 'system:list:buffers' buffer."}
+
+        # Fire update hooks with the full buffer content and None for new_text (signals drop).
+        # Rejection means the drop is denied and the buffer must not be deleted.
+        old_text = "\n".join(e.data for e in buf.lines) + "\n"
+        hook_result = buf._fire_update_hooks(old_text, 0, len(buf.lines), None)
+        if hook_result is not True and hook_result is not None:
+            return {"ok": False, "error": str(hook_result)}
+
+        # Delete the buffer and refresh the system listing.
         del self._buffers[name]
         refresh_result = self._refresh_buffers_buffer()
         if not refresh_result.get("ok"):
@@ -361,6 +407,41 @@ class BufferManager(AgenticObject):
             # leaves BufferManager in an inconsistent state (buffer gone, listing stale).
             raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
         return {"ok": True, "dropped": name}
+
+    def register_buffer_update_hook(self, buffer_name: str, hook_name: str, hook: UpdateHook) -> dict[str, Any]:
+        """Register an update hook on a buffer by name. The hook is called before any mutation
+        with the old buffer content and the proposed new content. Return True/None to accept,
+        or a string reason to reject. Multiple hooks per buffer are supported; the first
+        rejection blocks the operation. old_text=None signals buffer creation,
+        new_text=None signals buffer drop."""
+        
+        # Guard: reject unknown buffers to keep hook registration consistent.
+        if buffer_name not in self._buffers:
+            return {"ok": False, "error": f"No buffer named '{buffer_name}'."}
+        buf = self._buffers[buffer_name]
+        
+        # Guard: reject overwrites to keep hook registration consistent; use unregister first.
+        if hook_name in buf._update_hooks:
+            return {"ok": False, "error": f"hook '{hook_name}' already registered on '{buffer_name}'. Unregister first."}
+        buf._update_hooks[hook_name] = hook
+        
+        return {"ok": True, "buffer": buffer_name, "hook": hook_name, "hook_count": len(buf._update_hooks)}
+
+    def unregister_buffer_update_hook(self, buffer_name: str, hook_name: str) -> dict[str, Any]:
+        """Remove a named update hook from a buffer. Silently succeeds if the hook or buffer
+        does not exist — the caller does not need to know whether the hook was registered."""
+        
+        # Guard: reject unknown buffers to keep hook registration consistent.
+        if buffer_name not in self._buffers:
+            return {"ok": False, "error": f"No buffer named '{buffer_name}'."}
+        buf = self._buffers[buffer_name]
+        
+        # Silently succeed if the named hook is not registered on this buffer.
+        if hook_name not in buf._update_hooks:
+            return {"ok": False, "error": f"no hook named '{hook_name}' on '{buffer_name}'"}
+        del buf._update_hooks[hook_name]
+
+        return {"ok": True, "buffer": buffer_name, "removed": hook_name}
 
     @sandbox
     def _grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | None = None) -> dict[str, Any]:
@@ -625,6 +706,12 @@ class BufferManager(AgenticObject):
                     used_old_indices.add(abs_mapped)
                 else:
                     result_entries.append(BufferEntry(data=line_text, timestamp=now, seen=True))
+
+        # Fire update hooks with the old segment and the computed new content.
+        # Rejection means the edit is denied and the buffer must not be modified.
+        hook_result = buf._fire_update_hooks(segment_text, lo, hi, new_content)
+        if hook_result is not True and hook_result is not None:
+            return {"ok": False, "error": str(hook_result)}
 
         # Commit the new line entries back into the buffer at the target range.
         buf.lines[lo:hi] = result_entries
