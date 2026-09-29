@@ -14,6 +14,9 @@ from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buf
 from ..utils.text_formatters import _sanitize_title
 
 
+_BASH_PROCESSES_BUFFER = "system:list:bash_processes"
+
+
 def _make_stream_name(process_id: int, title: str, stream_type: str) -> str:
     """Build a stream buffer name from a process ID, title, and stream type."""
     return f"stream:bash:{process_id}:{stream_type}:{_sanitize_title(title)}"
@@ -50,7 +53,7 @@ class Basher(StreamBufferManager, AgenticObject):
         super().__init__(**kwargs)
         self._processes: dict[int, BashHandle] = {}
         self._bash_buffer_counter: int = 0
-        self._refresh_bash_processes_buffer()
+        self._create_buffer(_BASH_PROCESSES_BUFFER, "[]\n")
 
     def _next_buffer_name(self) -> str:
         self._bash_buffer_counter += 1
@@ -60,10 +63,10 @@ class Basher(StreamBufferManager, AgenticObject):
         self._bash_buffer_counter += 1
         return self._bash_buffer_counter
 
-    def _refresh_bash_processes_buffer(self) -> None:
+    async def _refresh_bash_processes_buffer(self) -> None:
         records = self.list_processes()
         text = format_dict_list_for_buffer(records)
-        self.create_buffer("system:list:bash_processes", text=text, overwrite=True)
+        await self.create_buffer(_BASH_PROCESSES_BUFFER, text=text, overwrite=True)
 
     @sandbox
     def list_processes(self) -> list[dict]:
@@ -95,25 +98,30 @@ class Basher(StreamBufferManager, AgenticObject):
         if not command.strip():
             return {"ok": False, "error": "Empty command."}
 
+        # Guard: reject empty commands before allocating resources.
+        # Provision: claim buffer names and create the three stream buffers for stdin/stdout/stderr.
         now = time.time()
         process_id = self._next_process_id()
         stdin_buffer = _make_stream_name(process_id, title, "stdin")
         stdout_buffer = _make_stream_name(process_id, title, "stdout")
         stderr_buffer = _make_stream_name(process_id, title, "stderr")
-        self.create_buffer(stdin_buffer, stream=True)
-        self.create_buffer(stdout_buffer, stream=True)
-        self.create_buffer(stderr_buffer, stream=True)
+        await self.create_buffer(stdin_buffer, stream=True)
+        await self.create_buffer(stdout_buffer, stream=True)
+        await self.create_buffer(stderr_buffer, stream=True)
+
+        # Register: attach a hook on stdin so writes to that buffer forward text to the process.
         hook_result = self._set_stream_on_append_hook(
             stdin_buffer,
             name="bash_send",
             hook=lambda stream, text, metadata: self._bash_send_hook(process_id, text),
         )
         if not hook_result.get("ok"):
-            self.drop_buffer(stdin_buffer)
-            self.drop_buffer(stdout_buffer)
-            self.drop_buffer(stderr_buffer)
+            await self.drop_buffer(stdin_buffer)
+            await self.drop_buffer(stdout_buffer)
+            await self.drop_buffer(stderr_buffer)
             return {"ok": False, "error": f"failed to register bash_send hook: {hook_result.get('error')}"}
 
+        # Launch: fork the subprocess with connected stdin/stdout/stderr pipes.
         try:
             process = await asyncio.create_subprocess_exec(
                 "/bin/sh", "-c", command,
@@ -123,11 +131,12 @@ class Basher(StreamBufferManager, AgenticObject):
                 cwd=cwd,
             )
         except Exception as e:
-            self.drop_buffer(stdin_buffer)
-            self.drop_buffer(stdout_buffer)
-            self.drop_buffer(stderr_buffer)
+            await self.drop_buffer(stdin_buffer)
+            await self.drop_buffer(stdout_buffer)
+            await self.drop_buffer(stderr_buffer)
             return {"ok": False, "error": f"Failed to start process: {e}"}
 
+        # Register: store the handle, schedule the read loop, and refresh the processes listing.
         handle = BashHandle(
             process_id=process_id,
             title=title,
@@ -140,7 +149,8 @@ class Basher(StreamBufferManager, AgenticObject):
         )
         self._processes[process_id] = handle
         handle.task = asyncio.create_task(self._bash_read_loop(handle))
-        self._refresh_bash_processes_buffer()
+        await self._refresh_bash_processes_buffer()
+
         message = f"Started process [{process_id}] '{title}': {command}. Streams created at {now}. stdin='{stdin_buffer}', stdout='{stdout_buffer}', stderr='{stderr_buffer}'. Use list_processes to track, terminate to stop."
         return {"ok": True, "process_id": process_id, "title": title, "stdin_buffer": stdin_buffer, "stdout_buffer": stdout_buffer, "stderr_buffer": stderr_buffer, "message": message}
 
@@ -149,10 +159,14 @@ class Basher(StreamBufferManager, AgenticObject):
         if process_id not in self._processes:
             raise KeyError(f"No process with id '{process_id}'.")
         handle = self._processes[process_id]
+
+        # Guard: reject sends to closed or exited processes.
         if handle.closed:
             raise ConnectionError(f"Process '{handle.title}' is not running (exit_code={handle.exit_code}).")
         if handle.process is None or handle.process.stdin is None:
             raise ConnectionError(f"Process '{handle.title}' has no stdin.")
+
+        # Write: encode text and write to the subprocess stdin; optionally append a trailing newline.
         try:
             if text:
                 data = text.encode("utf-8")
@@ -163,6 +177,7 @@ class Basher(StreamBufferManager, AgenticObject):
                 await handle.process.stdin.drain()
         except Exception as e:
             raise ConnectionError(f"Send error: {e}")
+
         return f"Sent {len(text)} chars to process '{handle.title}'."
 
     @tool
@@ -171,6 +186,8 @@ class Basher(StreamBufferManager, AgenticObject):
         if process_id not in self._processes:
             return {"ok": False, "error": f"No process with id '{process_id}'."}
         handle = self._processes.pop(process_id)
+
+        # Stop: cancel the read loop task and terminate the subprocess.
         if handle.task:
             handle.task.cancel()
         if handle.process and handle.process.returncode is None:
@@ -183,13 +200,16 @@ class Basher(StreamBufferManager, AgenticObject):
                 handle.process.kill()
         handle.closed = True
         handle.exit_code = handle.process.returncode if handle.process else None
-        self._refresh_bash_processes_buffer()
+
+        # Refresh the processes listing and optionally drop the stream buffers.
+        await self._refresh_bash_processes_buffer()
         if drop_buffers:
-            self.drop_buffer(handle.stdin_buffer)
-            self.drop_buffer(handle.stdout_buffer)
-            self.drop_buffer(handle.stderr_buffer)
+            await self.drop_buffer(handle.stdin_buffer)
+            await self.drop_buffer(handle.stdout_buffer)
+            await self.drop_buffer(handle.stderr_buffer)
             message = f"Terminated process [{handle.process_id}] '{handle.title}': {handle.command} (exit_code={handle.exit_code}). Dropped buffers."
             return {"ok": True, "process_id": handle.process_id, "title": handle.title, "exit_code": handle.exit_code, "dropped_buffers": True, "message": message}
+
         message = f"Terminated process [{handle.process_id}] '{handle.title}': {handle.command} (exit_code={handle.exit_code}). Buffers '{handle.stdin_buffer}', '{handle.stdout_buffer}', '{handle.stderr_buffer}' remain. Use drop_buffer to remove them."
         return {"ok": True, "process_id": handle.process_id, "title": handle.title, "exit_code": handle.exit_code, "dropped_buffers": False, "message": message}
 
@@ -198,10 +218,13 @@ class Basher(StreamBufferManager, AgenticObject):
         stdout = handle.process.stdout
         stderr = handle.process.stderr
 
+        # Stream: spin up two async line readers for stdout and stderr, writing each line to the respective buffer.
         async def read_stdout() -> None:
+            # Guard: no pipe means nothing to stream.
             if stdout is None:
                 return
             try:
+                # Drain: read lines until EOF, writing each to the stdout buffer.
                 while True:
                     line_bytes = await stdout.readline()
                     if not line_bytes:
@@ -209,12 +232,15 @@ class Basher(StreamBufferManager, AgenticObject):
                     line = line_bytes.decode("utf-8", errors="replace").rstrip("\n")
                     await self.write_buffer(handle.stdout_buffer, line)
             except asyncio.CancelledError:
+                # Silently absorb cancellation — the caller drives cleanup via gather.
                 pass
 
         async def read_stderr() -> None:
+            # Guard: no pipe means nothing to stream.
             if stderr is None:
                 return
             try:
+                # Drain: read lines until EOF, writing each to the stderr buffer.
                 while True:
                     line_bytes = await stderr.readline()
                     if not line_bytes:
@@ -222,17 +248,24 @@ class Basher(StreamBufferManager, AgenticObject):
                     line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
                     await self.write_buffer(handle.stderr_buffer, line)
             except asyncio.CancelledError:
+                # Silently absorb cancellation — the caller drives cleanup via gather.
                 pass
 
+        # Wait: drive both stream readers to completion or cancellation, then clean up.
         out_task = asyncio.create_task(read_stdout())
         err_task = asyncio.create_task(read_stderr())
         try:
+            # Wait: drive both stream readers to completion.
             await asyncio.gather(out_task, err_task)
+
         except asyncio.CancelledError:
+            # Propagate: cancel both reader tasks before re-raising.
             out_task.cancel()
             err_task.cancel()
             raise
+
         finally:
+            # Clean up: mark the handle closed, reap the subprocess, refresh the processes listing.
             handle.closed = True
             if handle.process:
                 handle.exit_code = handle.process.returncode
@@ -240,6 +273,8 @@ class Basher(StreamBufferManager, AgenticObject):
                     await handle.process.wait()
                 except asyncio.CancelledError:
                     pass
+
             else:
                 handle.exit_code = None
-            self._refresh_bash_processes_buffer()
+            
+            await self._refresh_bash_processes_buffer()
