@@ -72,10 +72,17 @@ def _start_stream_notification_timer(obj: StreamProcessor, loop: asyncio.Abstrac
     return task
 
 
-class ConditionNotFound(Exception):
-    def __init__(self, condition: str) -> None:
+class RoutingConditionError(Exception):
+    def __init__(self, condition: str, routing_table: str | None = None, reason: str | None = None) -> None:
         self.condition = condition
-        super().__init__(f"condition not found: {condition}")
+        self.routing_table = routing_table
+        self.reason = reason
+        parts = [f"condition '{condition}'"]
+        if routing_table:
+            parts.append(f"routing_table='{routing_table}'")
+        if reason:
+            parts.append(f"reason={reason}")
+        super().__init__(", ".join(parts))
 
 
 @dataclass
@@ -540,21 +547,29 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         """Private hook: evaluate incoming data against the routing table conditions.
         First matching condition writes the data to its output stream. No match = reported as FALLTHROUGH.
         """
+        # Guard: reject if the routing table does not exist.
         if routing_table not in self._routing_tables:
             fb_result = await self.write_buffer("stream:processor:feedback", f"ERROR: routing_table '{routing_table}' not found")
             if not fb_result.get("ok"):
                 raise RuntimeError(f"failed to write ERROR to feedback: {fb_result.get('error')}")
             return
 
+        # Resolve the table and annotate metadata with the routing table name for condition visibility.
         table = self._routing_tables[routing_table]
+        # TODO(timestamp-missing): ts below is always 0 — metadata has no timestamp.
+        # Real timestamp lives on BufferEntry.timestamp in BufferManager.write_buffer (text/buffer_manager.py:335).
+        # Fix: StreamBufferManager.write_buffer (stream/stream_buffer_manager.py:233) should pass the entry's timestamp into the hook.
         ts = metadata.get("timestamp", 0) if metadata else 0
+        metadata = {**(metadata or {}), "routing_table": routing_table}
+
+        # Evaluate condition lists top-to-bottom; first list where all sub-conditions match wins.
         for condition_list, output_stream in table.conditions:
             all_match = True
             for sub_condition in condition_list.split(","):
                 sc = sub_condition.strip()
                 try:
                     matched = await self._evaluate_condition(sc, text, metadata)
-                except ConditionNotFound as e:
+                except RoutingConditionError as e:
                     fb_result = await self.write_buffer("stream:processor:feedback", f"FALLTHROUGH source={table.input_stream} ts={ts} reason={e}")
                     if not fb_result.get("ok"):
                         raise RuntimeError(f"failed to write FALLTHROUGH to feedback: {fb_result.get('error')}")
@@ -567,6 +582,8 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
                 if not matched:
                     all_match = False
                     break
+
+            # All sub-conditions matched: write to the output stream and stop evaluation.
             if all_match:
                 sink_result = await self.write_buffer(output_stream, text)
                 if not sink_result.get("ok"):
@@ -575,34 +592,60 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
                         raise RuntimeError(f"failed to write SINK ERROR to feedback: {fb_result.get('error')}")
                     return
                 return
+
+        # No condition list matched: report FALLTHROUGH to the feedback stream.
         fb_result = await self.write_buffer("stream:processor:feedback", f"FALLTHROUGH source={table.input_stream} ts={ts}")
         if not fb_result.get("ok"):
             raise RuntimeError(f"failed to write FALLTHROUGH to feedback: {fb_result.get('error')}")
 
     async def _evaluate_condition(self, condition_name: str, text: str, metadata: dict | None = None) -> bool:
+        """Evaluate a single named condition against the given text and routing metadata.
+        Conditions are sandbox-decorated methods with signature (stream, text, metadata) -> bool
+        or (self, stream, text, metadata) -> bool. Prefix the name with "!" to negate the result.
+        The built-in names "true" and "false" return their respective boolean values.
+        Raises RoutingConditionError if the name is not registered as a @sandbox decorated method
+        or if the method signature is incompatible with (stream, text, metadata) -> bool.
+        or if the signature does not match the required form.
+        """
+        # Handle negation prefix: strip "!" and return the negated result of the inner condition.
         if condition_name.startswith("!"):
             inner = condition_name[1:]
             return not await self._evaluate_condition(inner, text, metadata)
 
+        # Handle the built-in "true" and "false" conditions.
         if condition_name.lower() == "true":
             return True
+        if condition_name.lower() == "false":
+            return False
 
+        # Locate the named condition method in the sandbox member registry.
         import inspect
         members = self._gather_sandbox_members()
         if condition_name not in members:
-            raise ConditionNotFound(condition_name)
+            raise RoutingConditionError(
+                condition=condition_name,
+                routing_table=(metadata or {}).get("routing_table"),
+                reason="not found in sandbox members",
+            )
 
         method = members[condition_name]
         sig = inspect.signature(method)
         params = list(sig.parameters.keys())
+
+        # Dispatch using the 3-arg or 4-arg signature form; validate return type is bool.
         if params[:3] == ["stream", "text", "metadata"] and sig.return_annotation in (bool, inspect.Parameter.empty):
             result = method(stream=condition_name, text=text, metadata=metadata or {})
         elif params[:4] == ["self", "stream", "text", "metadata"] and sig.return_annotation in (bool, inspect.Parameter.empty):
             result = method(self, stream=condition_name, text=text, metadata=metadata or {})
-        # check for Coroutine
+        else:
+            raise RoutingConditionError(
+                condition=condition_name,
+                routing_table=(metadata or {}).get("routing_table"),
+                reason=f"incompatible signature: {params}",
+            )
+
+        # Await the result if the condition is a coroutine.
         if asyncio.iscoroutine(result):
             result = await result
 
         return result
-
-        raise ConditionNotFound(condition_name)
