@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "petekit"
-version = "0.2.3"
+version = "0.3.0"
 description = "PeteOS Kit — agentic building blocks for streams, text, and images"
 requires-python = ">=3.10"
 dependencies = [
     "peteos",
     "diff-match-patch",
+    "jsonpatch",
 ]
 
 [project.optional-dependencies]

@@ -2,3 +2,4 @@ peteos
 diff-match-patch
 pytest
 pytest-asyncio
+jsonpatch
