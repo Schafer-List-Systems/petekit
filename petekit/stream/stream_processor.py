@@ -29,16 +29,21 @@ def _most_recent_persistent_thread(obj: AgenticObject) -> str | None:
     has the highest filesystem modification time. Returns None if no sessions
     exist or the agent base is not set.
     """
+    # Guard: require a populated thread store and a valid agent base directory.
     thread_store = getattr(obj, "_oap_thread_store", None)
     if not thread_store:
         return None
     agent_base = obj.agent.agent_base
     if not agent_base:
         return None
-    best_ptid: str | None = None
-    best_mtime = -1.0
+
+    # Resolve the base path under which per-role session directories live.
     role_name = obj._oap_role.name
     base_path = Path(agent_base) / role_name
+
+    # Scan each session, tracking whichever has the most recent filesystem mtime.
+    best_ptid: str | None = None
+    best_mtime = -1.0
     for ptid, session_uuid in thread_store.items():
         session_path = base_path / session_uuid
         if session_path.exists():
@@ -49,6 +54,8 @@ def _most_recent_persistent_thread(obj: AgenticObject) -> str | None:
                     best_ptid = ptid
             except OSError:
                 pass
+
+    # The ptid of the session with the highest filesystem mtime, or None if no sessions exist.
     return best_ptid
 
 
@@ -137,13 +144,13 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         self._stream_notification_configs: dict[str, _NotificationConfig] = {}
         self._stream_notification_timer: asyncio.Task | None = None
 
-        # Create the control buffer for routing table commands.
-        result = self.create_buffer("stream:processor:control", stream=True)
+        # Create the control buffer for routing table commands (sync, no hooks at construction).
+        result = self._create_buffer("stream:processor:control", stream=True)
         if not result.get("ok"):
             raise RuntimeError(f"failed to create stream:processor:control: {result.get('error')}")
 
-        # Create the feedback buffer for routing results and errors.
-        result = self.create_buffer("stream:processor:feedback", stream=True)
+        # Create the feedback buffer for routing results and errors (sync, no hooks at construction).
+        result = self._create_buffer("stream:processor:feedback", stream=True)
         if not result.get("ok"):
             raise RuntimeError(f"failed to create stream:processor:feedback: {result.get('error')}")
 
@@ -156,15 +163,14 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         if not hook_result.get("ok"):
             raise RuntimeError(f"failed to register system_processor hook: {hook_result.get('error')}")
 
-        # Refresh the routing tables buffer to populate the list.
-        refresh_result = self._refresh_routing_tables_buffer()
-        if not refresh_result.get("ok"):
-            raise RuntimeError(f"failed to refresh routing tables buffer: {refresh_result.get('error')}")
+        # Seed the routing tables listing and notification configs listing (sync, no hooks at construction).
+        result = self._create_buffer("system:list:routing_tables", text="[]")
+        if not result.get("ok"):
+            raise RuntimeError(f"failed to create routing tables buffer: {result.get('error')}")
 
-        # Refresh the notification configs buffer to populate the list.
-        refresh_result = self._refresh_notification_configs_buffer()
-        if not refresh_result.get("ok"):
-            raise RuntimeError(f"failed to refresh notification configs buffer: {refresh_result.get('error')}")
+        result = self._create_buffer("system:list:notification_configs", text="[]")
+        if not result.get("ok"):
+            raise RuntimeError(f"failed to create notification configs buffer: {result.get('error')}")
 
         # Start the global notification timer (sync — uses loop.create_task internally).
         self._stream_notification_timer = _start_stream_notification_timer(self, loop)
@@ -180,10 +186,10 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
             )
         )
 
-    def _refresh_routing_tables_buffer(self) -> dict[str, Any]:
+    async def _refresh_routing_tables_buffer(self) -> dict[str, Any]:
         """Refresh the system:list:routing_tables buffer."""
         from petekit.utils.text_formatters import format_dict_list_for_buffer
-        return self.create_buffer(
+        return await self.create_buffer(
             "system:list:routing_tables",
             text=format_dict_list_for_buffer(self._list_routing_tables()),
             overwrite=True
@@ -197,7 +203,7 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
             for name, rt in self._routing_tables.items()
         ]
 
-    def _configure_notification(self, args: list[str]) -> dict[str, Any]:
+    async def _configure_notification(self, args: list[str]) -> dict[str, Any]:
         """Configure notification for any stream: configure_notification <stream> [batch_size=<N>] [interval_secs=<T>] [notify_on_empty=<bool>].
         The persistent_thread_id is auto-selected to the most recent thread (hack — see _most_recent_persistent_thread).
         The feedback stream is always configurable. Arbitrary streams must be enabled first with enable_notification."""
@@ -239,7 +245,7 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         if notify_on_empty is not None:
             cfg.notify_on_empty = notify_on_empty
 
-        refresh_result = self._refresh_notification_configs_buffer()
+        refresh_result = await self._refresh_notification_configs_buffer()
         if not refresh_result.get("ok"):
             return {"ok": False, "error": f"failed to refresh notification configs buffer: {refresh_result.get('error')}"}
 
@@ -257,10 +263,12 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
 
         # The GIL means we safely register the hook before storing config — if hook
         # registration fails we return error without any cleanup needed.
+        # TODO(investigate): _stream_notification_hook_async is a thin wrapper around _notify_if_ready.
+        # Could call _notify_if_ready directly here and remove the indirection.
         hook_result = self._set_stream_on_append_hook(
             stream,
             name=f"notification:{stream}",
-            hook=lambda s, t, m: self._stream_notification_hook_async(s, t, m),
+            hook=lambda stream, text, metadata: self._stream_notification_hook_async(stream, text, metadata),
         )
         if not hook_result.get("ok"):
             return {"ok": False, "error": f"failed to register hook: {hook_result.get('error')}"}
@@ -276,13 +284,13 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
             fb_result = await self.write_buffer("stream:processor:feedback", f"PERSISTENT THREAD DETECTION FAILED: {e}")
             cfg.persistent_thread_id = None
 
-        refresh_result = self._refresh_notification_configs_buffer()
+        refresh_result = await self._refresh_notification_configs_buffer()
         if not refresh_result.get("ok"):
             return {"ok": False, "error": f"failed to refresh notification configs buffer: {refresh_result.get('error')}"}
 
         return {"ok": True, "stream": stream, "batch_size": cfg.batch_size, "interval_secs": cfg.interval_secs, "notify_on_empty": cfg.notify_on_empty}
 
-    def _disable_notification(self, stream: str) -> dict[str, Any]:
+    async def _disable_notification(self, stream: str) -> dict[str, Any]:
         """Disable notification on an arbitrary stream (fails for immutable streams like feedback)."""
         # Reject if not registered.
         if stream not in self._stream_notification_configs:
@@ -305,7 +313,7 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         # Config is removed last so on unhook failure we return without modifying state.
         del self._stream_notification_configs[stream]
 
-        refresh_result = self._refresh_notification_configs_buffer()
+        refresh_result = await self._refresh_notification_configs_buffer()
         if not refresh_result.get("ok"):
             return {"ok": False, "error": f"failed to refresh notification configs buffer: {refresh_result.get('error')}"}
 
@@ -331,24 +339,24 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
             try:
                 if cmd == "new" and len(parts) >= 3:
                     routing_table, input_stream = parts[1], parts[2]
-                    result = self._routing_table_new(routing_table, input_stream)
+                    result = await self._routing_table_new(routing_table, input_stream)
                 elif cmd == "drop" and len(parts) >= 2:
                     routing_table = parts[1]
-                    result = self._routing_table_drop(routing_table)
+                    result = await self._routing_table_drop(routing_table)
                 elif cmd == "add" and len(parts) >= 4:
                     routing_table, condition_list, output_stream = parts[1], parts[2], " ".join(parts[3:])
                     result = await self._routing_table_add(routing_table, condition_list, output_stream)
                 elif cmd == "del" and len(parts) >= 4:
                     routing_table, condition_list, output_stream = parts[1], parts[2], " ".join(parts[3:])
-                    result = self._routing_table_del(routing_table, condition_list, output_stream)
+                    result = await self._routing_table_del(routing_table, condition_list, output_stream)
                 elif cmd == "configure_notification" and len(parts) >= 2:
-                    result = self._configure_notification(parts[1:])
+                    result = await self._configure_notification(parts[1:])
                 elif cmd == "enable_notification" and len(parts) >= 2:
                     stream_name = parts[1]
                     result = await self._enable_notification(stream_name)
                 elif cmd == "disable_notification" and len(parts) >= 2:
                     stream_name = parts[1]
-                    result = self._disable_notification(stream_name)
+                    result = await self._disable_notification(stream_name)
                 else:
                     fb_result = await self.write_buffer("stream:processor:feedback", f"unknown or malformed command: {line}")
                     if not fb_result.get("ok"):
@@ -366,79 +374,101 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
             if not fb_result.get("ok"):
                 raise RuntimeError(f"failed to write to feedback buffer: {fb_result.get('error')}")
 
-    @sandbox
-    def _routing_table_new(self, routing_table: str, input_stream: str) -> dict[str, Any]:
+    async def _routing_table_new(self, routing_table: str, input_stream: str) -> dict[str, Any]:
         """Create a routing table with a fixed input stream."""
+        # Guard: reject duplicate routing table names.
         table_name = _routing_table_key(routing_table)
         if routing_table in self._routing_tables or table_name in self._buffers:
             return {"ok": False, "error": f"routing table '{routing_table}' already exists"}
-        create_result = self.create_buffer(table_name)
+
+        # Create the routing table buffer to hold the rules.
+        create_result = await self.create_buffer(table_name)
         if not create_result.get("ok"):
             raise RuntimeError(f"failed to create routing table buffer '{table_name}': {create_result.get('error')}")
+
+        # Register the routing table and attach its dispatch hook to the input stream.
         self._routing_tables[routing_table] = RoutingTable(input_stream=input_stream)
         hook_result = self._set_stream_on_append_hook(
             input_stream,
             name=f"routing_table:{routing_table}",
-            hook=lambda stream_buffer, text, metadata: self._routing_table_dispatch(routing_table, text, metadata),
+            hook=lambda stream, text, metadata: self._routing_table_dispatch(routing_table, text, metadata),
         )
         if not hook_result.get("ok"):
+            # Roll back: unregister the table and drop its buffer.
             del self._routing_tables[routing_table]
-            self.drop_buffer(table_name)
+            await self.drop_buffer(table_name)
             raise RuntimeError(f"failed to hook input stream '{input_stream}': {hook_result.get('error')}")
-        refresh_result = self._refresh_routing_tables_buffer()
+
+        # Refresh the routing tables listing and propagate any failure.
+        refresh_result = await self._refresh_routing_tables_buffer()
         if not refresh_result.get("ok"):
             self._set_stream_on_append_hook(input_stream, name=f"routing_table:{routing_table}", hook=None)
             del self._routing_tables[routing_table]
-            self.drop_buffer(table_name)
+            await self.drop_buffer(table_name)
             raise RuntimeError(f"failed to refresh routing tables buffer: {refresh_result.get('error')}")
+
         return {"ok": True, "table": routing_table, "input_stream": input_stream}
 
-    @sandbox
-    def _routing_table_drop(self, routing_table: str) -> dict[str, Any]:
+    async def _routing_table_drop(self, routing_table: str) -> dict[str, Any]:
         """Delete a routing table and remove its input stream hook."""
+        # Guard: the table must exist before anything is mutated.
         table_name = _routing_table_key(routing_table)
         if routing_table not in self._routing_tables:
             return {"ok": False, "error": f"routing table '{routing_table}' not found"}
         input_stream = self._routing_tables[routing_table].input_stream
+
+        # Unhook removes the dispatch callback so the stream stops routing.
         unhook_result = self._set_stream_on_append_hook(input_stream, name=f"routing_table:{routing_table}", hook=None)
         if not unhook_result.get("ok"):
             return {"ok": False, "error": f"failed to unhook '{input_stream}': {unhook_result.get('error')}"}
+
+        # Mutate: remove the table and drop its buffer.
         del self._routing_tables[routing_table]
         if table_name in self._buffers:
-            self.drop_buffer(table_name)
-        refresh_result = self._refresh_routing_tables_buffer()
+            await self.drop_buffer(table_name)
+
+        # Refresh the routing tables listing and propagate any failure.
+        refresh_result = await self._refresh_routing_tables_buffer()
         if not refresh_result.get("ok"):
             raise RuntimeError(f"failed to refresh routing tables buffer: {refresh_result.get('error')}")
+
         return {"ok": True, "dropped": routing_table}
 
-    @sandbox
     async def _routing_table_add(self, routing_table: str, condition_list: str, output_stream: str) -> dict[str, Any]:
         """Append a condition->output entry to a routing table."""
+        # Guard: the table must already exist.
         table_name = _routing_table_key(routing_table)
         if routing_table not in self._routing_tables or table_name not in self._buffers:
             return {"ok": False, "error": f"routing table '{routing_table}' not found. Use 'new' first."}
+
+        # Format the entry and append it to the table buffer.
         entry = _format_routing_entry(condition_list, output_stream)
         append_result = await self.write_buffer(table_name, entry)
         if not append_result.get("ok"):
             raise RuntimeError(f"failed to append to routing table buffer: {append_result.get('error')}")
+
+        # Update in-memory state and refresh the routing tables listing.
         self._routing_tables[routing_table].conditions.append((condition_list, output_stream))
-        refresh_result = self._refresh_routing_tables_buffer()
+        refresh_result = await self._refresh_routing_tables_buffer()
         if not refresh_result.get("ok"):
             raise RuntimeError(f"failed to refresh routing tables buffer: {refresh_result.get('error')}")
+
         return {"ok": True, "table": routing_table, "condition_list": condition_list, "output": output_stream}
 
-    @sandbox
-    def _routing_table_del(self, routing_table: str, condition_list: str, output_stream: str) -> dict[str, Any]:
+    async def _routing_table_del(self, routing_table: str, condition_list: str, output_stream: str) -> dict[str, Any]:
         """Remove the first matching condition->output entry from a routing table."""
+        # Guard: the table must exist.
         table_name = _routing_table_key(routing_table)
         if routing_table not in self._routing_tables:
             return {"ok": False, "error": f"routing table '{routing_table}' not found"}
         table = self._routing_tables[routing_table]
+
+        # Locate and remove the first matching entry.
         for i, (cn, os) in enumerate(table.conditions):
             if cn == condition_list and os == output_stream:
                 del table.conditions[i]
                 entry = _format_routing_entry(condition_list, output_stream)
-                edit_result = self.edit_buffer(table_name, old_string=entry, new_string="")
+                edit_result = await self.edit_buffer(table_name, old_string=entry, new_string="")
                 if not edit_result.get("ok"):
                     error_msg = edit_result.get("error", "")
                     if "not found" in error_msg:
@@ -450,13 +480,16 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
     async def _stream_notification_timer_fire(self) -> None:
         """Notify all streams that are ready (called by the async timer loop)."""
         # HACK: feedback stream always uses the most recent persistent thread (refreshed on every tick).
+        # This must run on every tick to keep the config current.
         fb_cfg = self._stream_notification_configs.get("stream:processor:feedback")
         if fb_cfg is not None:
             try:
                 fb_cfg.persistent_thread_id = _most_recent_persistent_thread(self)
             except Exception:
                 pass
-            self._refresh_notification_configs_buffer()
+            await self._refresh_notification_configs_buffer()
+
+        # Notify each configured stream that is ready to deliver accumulated batched messages.
         for stream in list(self._stream_notification_configs.keys()):
             await self._notify_if_ready(stream)
 
@@ -518,11 +551,10 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
             if not fb_result.get("ok"):
                 pass
 
-    @sandbox
-    def _refresh_notification_configs_buffer(self) -> dict[str, Any]:
+    async def _refresh_notification_configs_buffer(self) -> dict[str, Any]:
         """Refresh the system:list:notification_configs buffer."""
         from petekit.utils.text_formatters import format_dict_list_for_buffer
-        return self.create_buffer(
+        return await self.create_buffer(
             "system:list:notification_configs",
             text=format_dict_list_for_buffer(self.list_notification_configs()),
             overwrite=True

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import difflib
 import os
 import re
@@ -177,7 +178,7 @@ class Buffer:
     modified_at: float
     _update_hooks: dict[str, UpdateHook] = field(default_factory=dict)
 
-    def _fire_update_hooks(self, old_text: str | None, start: int, end: int, new_text: str | None) -> bool | str:
+    async def _fire_update_hooks(self, old_text: str | None, start: int, end: int, new_text: str | None) -> bool | str:
         # Guard: return early if no hooks are registered.
         if not self._update_hooks:
             return True
@@ -185,6 +186,8 @@ class Buffer:
         # Fire each hook in registration order; stop and return the first rejection.
         for hook_name, hook in self._update_hooks.items():
             result = hook(self, old_text, start, end, new_text)
+            if asyncio.iscoroutine(result):
+                result = await result
             if result is not None and result is not True:
                 return result
 
@@ -274,17 +277,31 @@ class BufferManager(AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._buffers: dict[str, Buffer] = {}
-        refresh_result = self._refresh_buffers_buffer()
-        if not refresh_result.get("ok"):
-            raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
+        loop = asyncio.get_running_loop()
+        loop.create_task(self._refresh_buffers_buffer())
 
-    def _refresh_buffers_buffer(self) -> dict[str, Any]:
+    async def _refresh_buffers_buffer(self) -> dict[str, Any]:
         records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
         text = format_dict_list_for_buffer(records)
-        return self.create_buffer("system:list:buffers", text=text, overwrite=True)
+        return await self.create_buffer("system:list:buffers", text=text, overwrite=True)
+
+    def _create_buffer(self, name: str, text: str | None = None) -> dict[str, Any]:
+        """Protected buffer creation for initialization only.
+        Always overwrites. Does not fire hooks.
+        Used by __init__ and constructors — not for agent-facing operations.
+        """
+        ts = time.time()
+        self._buffers[name] = Buffer(lines=[], created_at=ts, modified_at=ts)
+        lines = 0
+
+        if text:
+            self._buffers[name].lines = [BufferEntry(data=line, timestamp=ts, seen=True) for line in text.splitlines()]
+            lines = len(self._buffers[name].lines)
+
+        return {"ok": True, "lines": lines}
 
     @tool
-    def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False) -> dict[str, Any]:
+    async def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False) -> dict[str, Any]:
         """Create a new buffer with the given name.
         Optionally provide initial text.
         Use overwrite=True to replace an existing buffer.
@@ -300,22 +317,17 @@ class BufferManager(AgenticObject):
         if existed:
             buf = self._buffers[name]
             old_text = "\n".join(e.data for e in buf.lines) + "\n"
-            hook_result = buf._fire_update_hooks(old_text, 0, len(buf.lines), None)
+            hook_result = await buf._fire_update_hooks(old_text, 0, len(buf.lines), None)
             if hook_result is not True and hook_result is not None:
                 return {"ok": False, "error": str(hook_result)}
 
         # Create a fresh Buffer with no lines and the current timestamp; it starts with zero hooks.
-        self._buffers[name] = Buffer(lines=[], created_at=ts, modified_at=ts)
-        lines = 0
-
-        # Populate lines from the provided text, stamping each entry with the creation timestamp.
-        if text:
-            self._buffers[name].lines = [BufferEntry(data=line, timestamp=ts, seen=True) for line in text.splitlines()]
-            lines = len(self._buffers[name].lines)
+        # Delegated to protected creation — hooks are not fired here.
+        create_result = self._create_buffer(name, text)
 
         # Refresh the system buffer listing so the new buffer is visible to the agent.
         if name != "system:list:buffers":
-            refresh_result = self._refresh_buffers_buffer()
+            refresh_result = await self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already created and registered — rolling back would require
                 # deleting from self._buffers. Until a rollback strategy is defined, raising the
@@ -323,10 +335,10 @@ class BufferManager(AgenticObject):
                 raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
 
         # Signal whether this was a fresh creation or an overwrite, and how many lines were written.
-        return {"ok": True, "created": not existed, "overwritten": existed, "lines": lines}
+        return {"ok": True, "created": not existed, "overwritten": existed, "lines": create_result.get("lines", 0)}
 
     @tool
-    def copy_buffer(self, source_name: str, target_name: str, overwrite: bool = False) -> dict[str, Any]:
+    async def copy_buffer(self, source_name: str, target_name: str, overwrite: bool = False) -> dict[str, Any]:
         """Copy a buffer to a new name.
         Copies all lines by value. Timestamps of individual lines are preserved.
         Set overwrite=True to replace an existing target buffer.
@@ -340,7 +352,7 @@ class BufferManager(AgenticObject):
         new_entries = [BufferEntry(data=e.data, timestamp=e.timestamp, seen=e.seen) for e in src.lines]
         self._buffers[target_name] = Buffer(lines=new_entries, created_at=now, modified_at=now)
         if target_name != "system:list:buffers":
-            refresh_result = self._refresh_buffers_buffer()
+            refresh_result = await self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already created and registered — rolling back would require
                 # deleting from self._buffers. Until a rollback strategy is defined, raising the
@@ -349,7 +361,7 @@ class BufferManager(AgenticObject):
         return {"ok": True, "target": target_name, "source": source_name, "lines": len(new_entries)}
 
     @tool
-    def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
+    async def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
         """Overwrite the text in the range [start, end) of an existing buffer.
         A trailing newline is always appended, so a blank line in the input
         creates a blank line in the buffer. Omitting start means start=END.
@@ -376,7 +388,7 @@ class BufferManager(AgenticObject):
         # The hook sees the exact slice that will be replaced and the proposed replacement.
         old_text = "\n".join(buf.lines[i].data for i in range(start, min(end, total))) + "\n"
         new_text = text + "\n"
-        hook_result = buf._fire_update_hooks(old_text, start, end, new_text)
+        hook_result = await buf._fire_update_hooks(old_text, start, end, new_text)
         if hook_result is not True and hook_result is not None:
             return {"ok": False, "error": str(hook_result)}
 
@@ -387,7 +399,7 @@ class BufferManager(AgenticObject):
 
         # Refresh the buffer registry to keep the system listing current.
         if name != "system:list:buffers":
-            refresh_result = self._refresh_buffers_buffer()
+            refresh_result = await self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already modified — rolling back would require restoring prior
                 # content. Until a rollback strategy is defined, raising the error leaves the
@@ -396,7 +408,7 @@ class BufferManager(AgenticObject):
         return {"ok": True, "lines_written": len(new_entries), "total_lines": len(buf.lines)}
 
     @tool
-    def drop_buffer(self, name: str) -> dict[str, Any]:
+    async def drop_buffer(self, name: str) -> dict[str, Any]:
         """Drop (delete) a buffer by name.
         The buffer and its content are discarded.
         """
@@ -412,13 +424,13 @@ class BufferManager(AgenticObject):
         # Fire update hooks with the full buffer content and None for new_text (signals drop).
         # Rejection means the drop is denied and the buffer must not be deleted.
         old_text = "\n".join(e.data for e in buf.lines) + "\n"
-        hook_result = buf._fire_update_hooks(old_text, 0, len(buf.lines), None)
+        hook_result = await buf._fire_update_hooks(old_text, 0, len(buf.lines), None)
         if hook_result is not True and hook_result is not None:
             return {"ok": False, "error": str(hook_result)}
 
         # Delete the buffer and refresh the system listing.
         del self._buffers[name]
-        refresh_result = self._refresh_buffers_buffer()
+        refresh_result = await self._refresh_buffers_buffer()
         if not refresh_result.get("ok"):
             # TODO(design): buffer already deleted from self._buffers — rolling back would require
             # restoring from a snapshot. Until a rollback strategy is defined, raising the error
@@ -432,28 +444,28 @@ class BufferManager(AgenticObject):
         or a string reason to reject. Multiple hooks per buffer are supported; the first
         rejection blocks the operation. old_text=None signals buffer creation,
         new_text=None signals buffer drop."""
-        
+
         # Guard: reject unknown buffers to keep hook registration consistent.
         if buffer_name not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{buffer_name}'."}
         buf = self._buffers[buffer_name]
-        
+
         # Guard: reject overwrites to keep hook registration consistent; use unregister first.
         if hook_name in buf._update_hooks:
             return {"ok": False, "error": f"hook '{hook_name}' already registered on '{buffer_name}'. Unregister first."}
         buf._update_hooks[hook_name] = hook
-        
+
         return {"ok": True, "buffer": buffer_name, "hook": hook_name, "hook_count": len(buf._update_hooks)}
 
     def unregister_buffer_update_hook(self, buffer_name: str, hook_name: str) -> dict[str, Any]:
         """Remove a named update hook from a buffer. Silently succeeds if the hook or buffer
         does not exist — the caller does not need to know whether the hook was registered."""
-        
+
         # Guard: reject unknown buffers to keep hook registration consistent.
         if buffer_name not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{buffer_name}'."}
         buf = self._buffers[buffer_name]
-        
+
         # Silently succeed if the named hook is not registered on this buffer.
         if hook_name not in buf._update_hooks:
             return {"ok": False, "error": f"no hook named '{hook_name}' on '{buffer_name}'"}
@@ -484,7 +496,7 @@ class BufferManager(AgenticObject):
         }
 
     @tool
-    def grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | None = None) -> dict[str, Any]:
+    async def grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | None = None) -> dict[str, Any]:
         """Search a buffer for a regex pattern.
         Searches the full buffer by default, or a [start, end) range if provided.
         Returns a dict with ok/error or ok/matches.
@@ -526,7 +538,7 @@ class BufferManager(AgenticObject):
         }
 
     @tool
-    def read_buffer(
+    async def read_buffer(
         self,
         name: str,
         start: int = 0,
@@ -590,7 +602,7 @@ class BufferManager(AgenticObject):
         }
 
     @tool
-    def edit_buffer(self, name: str, old_string: str, new_string: str, start: int = 0, end: int | None = None, replace_all: bool = False) -> dict[str, Any]:
+    async def edit_buffer(self, name: str, old_string: str, new_string: str, start: int = 0, end: int | None = None, replace_all: bool = False) -> dict[str, Any]:
         """Replace old_string with new_string in the buffer content within a [start, end) range.
         Both old_string and new_string can span multiple lines.
         Editing fails when old_string is found more than once. Set replace_all=True to replace ALL occurrences.
@@ -727,7 +739,7 @@ class BufferManager(AgenticObject):
 
         # Fire update hooks with the old segment and the computed new content.
         # Rejection means the edit is denied and the buffer must not be modified.
-        hook_result = buf._fire_update_hooks(segment_text, lo, hi, new_content)
+        hook_result = await buf._fire_update_hooks(segment_text, lo, hi, new_content)
         if hook_result is not True and hook_result is not None:
             return {"ok": False, "error": str(hook_result)}
 
@@ -737,7 +749,7 @@ class BufferManager(AgenticObject):
         return {"ok": True, "count": len(char_ranges), "old_string": old_string}
 
     @tool
-    def diff_buffers(self, a: str, b: str, overwrite: bool = False) -> dict[str, Any]:
+    async def diff_buffers(self, a: str, b: str, overwrite: bool = False) -> dict[str, Any]:
         """Diff two buffers line-by-line using a unified diff.
         Stores the result in a target buffer named diff:a→b.
         Use overwrite=True to overwrite an existing diff buffer.
@@ -773,7 +785,7 @@ class BufferManager(AgenticObject):
             lineterm="",
         ))
         diff_text = "\n".join(diff_lines) + "\n"
-        create_result = self.create_buffer(diff_name, text=diff_text, overwrite=True)
+        create_result = await self.create_buffer(diff_name, text=diff_text, overwrite=True)
         if not create_result.get("ok"):
             return create_result
         return {"ok": True, "buffer": diff_name, "lines": create_result.get("lines", 0)}

@@ -70,52 +70,95 @@ class StreamBufferManager(BufferManager, AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.stream_buffer_configs: dict[str, StreamBufferConfig] = {}
-        buffers_result = self._refresh_stream_buffers_buffer()
-        if not buffers_result.get("ok"):
-            raise RuntimeError(f"failed to refresh stream buffers list: {buffers_result.get('error')}")
-        hooks_result = self._refresh_stream_buffer_hooks()
-        if not hooks_result.get("ok"):
-            raise RuntimeError(f"failed to refresh stream buffer hooks: {hooks_result.get('error')}")
+        loop = asyncio.get_running_loop()
+
+        # Bootstrap the stream-buffers and stream-buffer-hooks listings.
+        # Two sequential tasks, each verified before the next starts.
+        buffers_task = loop.create_task(self._refresh_stream_buffers_buffer())
+
+        def _on_buffers_ready(t):
+            try:
+                buffers_result = t.result()
+            except Exception as e:
+                raise RuntimeError(f"failed to refresh stream buffers list: {e}")
+            if not buffers_result.get("ok"):
+                raise RuntimeError(f"failed to refresh stream buffers list: {buffers_result.get('error')}")
+
+            hooks_task = loop.create_task(self._refresh_stream_buffer_hooks())
+
+            def _on_hooks_ready(t):
+                try:
+                    hooks_result = t.result()
+                except Exception as e:
+                    raise RuntimeError(f"failed to refresh stream buffer hooks: {e}")
+                if not hooks_result.get("ok"):
+                    raise RuntimeError(f"failed to refresh stream buffer hooks: {hooks_result.get('error')}")
+
+            hooks_task.add_done_callback(_on_hooks_ready)
+
+        buffers_task.add_done_callback(_on_buffers_ready)
+
+    def _create_buffer(self, name: str, text: str | None = None, stream: bool = False) -> dict[str, Any]:
+        """Protected buffer creation for initialization only.
+        Always overwrites. Does not fire hooks.
+        Used by __init__ and constructors — not for agent-facing operations.
+        """
+        # Delegate to the BufferManager protected creator to populate self._buffers.
+        result = super()._create_buffer(name, text)
+        if not result.get("ok", False):
+            return result
+
+        # Register the stream config entry so hooks and stream-aware lookups work correctly.
+        if stream:
+            if not name.startswith("stream:"):
+                return {"ok": False, "error": "stream name must start with 'stream:' prefix"}
+            self.stream_buffer_configs[name] = StreamBufferConfig()
+
+        return result
 
     @tool
-    def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False, stream: bool = False) -> dict[str, Any]:
+    async def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False, stream: bool = False) -> dict[str, Any]:
         """Create a new named buffer, optionally populated with text.
         Pass stream=True to create a stream buffer with hook support."""
+        # Guard: stream names must carry the stream: prefix.
         if stream:
             if not name.startswith("stream:"):
                 return {"ok": False, "error": "stream name must start with 'stream:' prefix"}
             if name in self.stream_buffer_configs and not overwrite:
                 return {"ok": False, "error": f"stream '{name}' already exists. Use overwrite=True to replace it."}
 
-        result = super().create_buffer(name, text=text, overwrite=overwrite)
+        # Delegate to the parent BufferManager — this fires hooks and updates the buffers listing.
+        result = await super().create_buffer(name, text=text, overwrite=overwrite)
 
         if not result.get("ok", False):
             return result
 
+        # Register the stream config entry and refresh the stream-buffers listing.
         if stream:
             self.stream_buffer_configs[name] = StreamBufferConfig()
-            refresh_result = self._refresh_stream_buffers_buffer()
+            refresh_result = await self._refresh_stream_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): stream_buffer_configs entry already registered — rolling back would require
                 # deleting the entry and restoring the super() state. Until a rollback strategy is defined,
                 # raising the error leaves the StreamBufferManager in an inconsistent state.
                 raise RuntimeError(f"failed to refresh stream buffers list: {refresh_result.get('error')}")
+
         return result
 
     @tool
-    def drop_buffer(self, name: str) -> dict[str, Any]:
+    async def drop_buffer(self, name: str) -> dict[str, Any]:
         """Delete a named buffer.
         Automatically cleans up stream metadata if it was a stream buffer."""
         is_stream = name in self.stream_buffer_configs  # detect before super() removes it
 
-        result = super().drop_buffer(name)
+        result = await super().drop_buffer(name)
 
         if not result.get("ok", False):
             return result
 
         if is_stream:
             del self.stream_buffer_configs[name]
-            refresh_result = self._refresh_stream_buffers_buffer()
+            refresh_result = await self._refresh_stream_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already deleted from parent and stream config removed — rolling back
                 # would require restoring both. Until a rollback strategy is defined, raising the error
@@ -135,12 +178,12 @@ class StreamBufferManager(BufferManager, AgenticObject):
             for name, cfg in self.stream_buffer_configs.items()
         ]
 
-    def _refresh_stream_buffers_buffer(self) -> dict[str, Any]:
+    async def _refresh_stream_buffers_buffer(self) -> dict[str, Any]:
         """Refresh the system:list:stream_buffers buffer, one JSON dict per line."""
         text = format_dict_list_for_buffer(self.list_stream_buffers())
-        return self.create_buffer("system:list:stream_buffers", text=text, overwrite=True)
+        return await self.create_buffer("system:list:stream_buffers", text=text, overwrite=True)
 
-    def _refresh_stream_buffer_hooks(self) -> dict[str, Any]:
+    async def _refresh_stream_buffer_hooks(self) -> dict[str, Any]:
         """Refresh the system:list:stream_buffer_hooks buffer with all hook states."""
         records = [
             {
@@ -155,7 +198,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         ]
         records.sort(key=lambda r: (r["stream"], -r["priority"]))
         text = format_dict_list_for_buffer(records)
-        return self.create_buffer("system:list:stream_buffer_hooks", text=text, overwrite=True)
+        return await self.create_buffer("system:list:stream_buffer_hooks", text=text, overwrite=True)
 
     def _resolve_time(self, ts: float, anchor: float) -> float:
         """Resolve a relative (negative) or absolute float timestamp to an absolute one.
@@ -165,7 +208,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         return anchor + ts if ts < 0 else ts
 
     @tool
-    def read_buffer(self, name: str, start: int | float = 0, end: int | float | None = None, show_timestamps: bool = False, show_line_numbers: bool = False, raw: bool = False) -> dict[str, Any] | str:
+    async def read_buffer(self, name: str, start: int | float = 0, end: int | float | None = None, show_timestamps: bool = False, show_line_numbers: bool = False, raw: bool = False) -> dict[str, Any] | str:
         """Read a range of lines from a buffer.
         Omit start to read from the beginning; omit end to read to the last line.
         Float values trigger time-based reading on stream buffers (int for line-based).
@@ -202,7 +245,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
 
             show_timestamps = True
 
-        return super().read_buffer(name, start=start, end=end, show_timestamps=show_timestamps, show_line_numbers=show_line_numbers, raw=raw)
+        return await super().read_buffer(name, start=start, end=end, show_timestamps=show_timestamps, show_line_numbers=show_line_numbers, raw=raw)
 
     @tool
     async def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
@@ -222,7 +265,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
             return {"ok": False, "error": f"Cannot write into the middle of stream '{name}'. Streams are append-only."}
         
         # write the data into the buffer
-        result = super().write_buffer(name, text, start, end)
+        result = await super().write_buffer(name, text, start, end)
         if not result.get("ok") or not name in self.stream_buffer_configs:
             return result
         
@@ -249,28 +292,30 @@ class StreamBufferManager(BufferManager, AgenticObject):
         priority: int = 0,
     ) -> dict[str, Any]:
         """Set or remove a named hook on a stream. Set hook to a callable to register; omit hook to remove the named hook. The hook is called with (stream_buffer, text, metadata) after every write. Higher priority fires first. Both async and sync callables are supported."""
+        # Guard: reject unknown stream buffers.
         if stream_buffer not in self.stream_buffer_configs:
             return {"ok": False, "error": f"no stream named '{stream_buffer}'", "stream_buffer": stream_buffer}
+
+        # Branch: removing an existing hook, or registering a new one.
         if hook is None:
             if name in self.stream_buffer_configs[stream_buffer].hooks:
                 del self.stream_buffer_configs[stream_buffer].hooks[name]
-                refresh_result = self._refresh_stream_buffer_hooks()
-                if not refresh_result.get("ok"):
-                    # TODO(design): hook already removed from config — rolling back would require
-                    # restoring it. Until a rollback strategy is defined, raising the error
-                    # leaves the StreamBufferManager in an inconsistent state (hook gone, listing stale).
-                    raise RuntimeError(f"failed to refresh stream buffer hooks: {refresh_result.get('error')}")
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._refresh_stream_buffer_hooks())
+                # TODO(design): refresh is fire-and-forget here — errors are silently dropped.
+                # A done callback could surface the failure if needed.
                 return {"ok": True, "removed": name, "stream_buffer": stream_buffer}
             return {"ok": False, "error": f"no hook named '{name}' on '{stream_buffer}'", "stream_buffer": stream_buffer}
+
+        # Register: store the hook and schedule the hooks listing refresh.
         self.stream_buffer_configs[stream_buffer].hooks[name] = StreamBufferHook(
             callable_=hook,
             priority=priority,
         )
-        refresh_result = self._refresh_stream_buffer_hooks()
-        if not refresh_result.get("ok"):
-            # TODO(design): hook already registered in config — rolling back would require
-            # removing it. Until a rollback strategy is defined, raising the error leaves the
-            # StreamBufferManager in an inconsistent state (hook registered, listing stale).
-            raise RuntimeError(f"failed to refresh stream buffer hooks: {refresh_result.get('error')}")
+        loop = asyncio.get_running_loop()
+        loop.create_task(self._refresh_stream_buffer_hooks())
+        # TODO(design): refresh is fire-and-forget here — errors are silently dropped.
+        # A done callback could surface the failure if needed.
+
         return {"ok": True, "hook_count": len(self.stream_buffer_configs[stream_buffer].hooks), "name": name, "stream_buffer": stream_buffer}
 
