@@ -31,12 +31,12 @@ class Connector(StreamBufferManager, AgenticObject):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.connections: dict[str, ConnectionHandle] = {}
-        self._refresh_connections_buffer()
+        self._create_buffer("system:list:connections", "[]\n")
 
-    def _refresh_connections_buffer(self) -> None:
+    async def _refresh_connections_buffer(self) -> None:
         records = self.list_connections()
         text = format_dict_list_for_buffer(records)
-        self.create_buffer("system:list:connections", text=text, overwrite=True)
+        await self.create_buffer("system:list:connections", text=text, overwrite=True)
 
     @tool
     async def connect(self, name: str, host: str, port: int, ssl: bool = False) -> dict[str, Any]:
@@ -44,38 +44,45 @@ class Connector(StreamBufferManager, AgenticObject):
         if name in self.connections:
             return {"ok": False, "error": f"Connection '{name}' already exists."}
 
-        # Prepare stream buffers for incoming and outgoing data
+        # Guard: reject duplicate connection names before allocating resources.
+        # Prepare: name the stream buffers and teardown any stale ones from a prior session.
         now = time.time()
         in_buffer = f"stream:in:{_sanitize_title(name)}"
         out_buffer = f"stream:out:{_sanitize_title(name)}"
         for buf in (in_buffer, out_buffer):
             try:
-                self.drop_buffer(buf)
+                await self.drop_buffer(buf)
             except KeyError:
                 pass
-        self.create_buffer(in_buffer, stream=True)
+
+        # Provision: create the two stream buffers; on failure roll back the first.
+        await self.create_buffer(in_buffer, stream=True)
         try:
-            self.create_buffer(out_buffer, stream=True)
+            await self.create_buffer(out_buffer, stream=True)
         except KeyError:
-            self.drop_buffer(in_buffer)
+            await self.drop_buffer(in_buffer)
             raise
+
+        # Register: attach a hook on the out buffer so writes to it forward text to the socket.
         hook_result = self._set_stream_on_append_hook(
             out_buffer,
             name="connection_send",
             hook=lambda s, t, m: self._connection_send_hook(name, t),
         )
         if not hook_result.get("ok"):
-            self.drop_buffer(in_buffer)
-            self.drop_buffer(out_buffer)
+            await self.drop_buffer(in_buffer)
+            await self.drop_buffer(out_buffer)
             raise ConnectionError(f"failed to register connection_send hook: {hook_result.get('error')}")
 
+        # Connect: open the TCP socket.
         try:
             reader, writer = await asyncio.open_connection(host, port, ssl=ssl)
         except Exception as e:
-            self.drop_buffer(in_buffer)
-            self.drop_buffer(out_buffer)
+            await self.drop_buffer(in_buffer)
+            await self.drop_buffer(out_buffer)
             raise
 
+        # Register: store the handle, schedule the read loop, and refresh the connections listing.
         handle = ConnectionHandle(
             host=host, port=port, ssl=ssl,
             reader=reader, writer=writer,
@@ -84,7 +91,8 @@ class Connector(StreamBufferManager, AgenticObject):
         )
         self.connections[name] = handle
         handle.task = asyncio.create_task(self._read_loop(name, handle))
-        self._refresh_connections_buffer()
+        await self._refresh_connections_buffer()
+
         message = f"Connected to {host}:{port} (ssl={ssl}) as '{name}'. Streams created at {now}. Receiving data into '{in_buffer}', sending data into '{out_buffer}'."
         return {"ok": True, "name": name, "in_buffer": in_buffer, "out_buffer": out_buffer, "message": message}
 
@@ -108,16 +116,21 @@ class Connector(StreamBufferManager, AgenticObject):
         if name not in self.connections:
             return {"ok": False, "error": f"No connection named '{name}'."}
         handle = self.connections.pop(name)
+
+        # Stop: cancel the read loop task and close the socket.
         if not handle.closed:
             handle.task.cancel()
             handle.writer.close()
         reason = f"({handle.close_reason})" if handle.closed else ""
-        self._refresh_connections_buffer()
+
+        # Refresh the connections listing and optionally drop the stream buffers.
+        await self._refresh_connections_buffer()
         if drop_buffers:
-            self.drop_buffer(handle.in_buffer)
-            self.drop_buffer(handle.out_buffer)
+            await self.drop_buffer(handle.in_buffer)
+            await self.drop_buffer(handle.out_buffer)
             message = f"Disconnected '{name}'. {reason}\nCleaned up stream buffers."
             return {"ok": True, "name": name, "dropped_buffers": True, "message": message}
+
         message = f"Disconnected '{name}'. {reason}\nStream buffers '{handle.in_buffer}', '{handle.out_buffer}' still exist for analysis. — drop them with drop_buffer before reconnecting."
         return {"ok": True, "name": name, "dropped_buffers": False, "message": message}
 
@@ -126,16 +139,22 @@ class Connector(StreamBufferManager, AgenticObject):
         if name not in self.connections:
             raise KeyError(f"No connection named '{name}'.")
         handle = self.connections[name]
+
+        # Guard: reject sends on already-closed connections.
         if handle.closed:
             await self.disconnect(name, cleanup=True)
             raise ConnectionError(f"Connection '{name}' is closed. {handle.close_reason}")
+
+        # Send: encode text and write to the socket; optionally fix CRLF and drain.
         try:
             if text:
                 if fix_crlf:
+                    # CRLF fix: replace bare LF with CRLF as required by HTTP and similar protocols.
                     text = text.replace("\n", "\r\n")
                 data = text.encode("utf-8")
                 handle.writer.write(data)
             if flush:
+                # Drain: flush the write buffer to ensure data is actually sent over the wire.
                 await handle.writer.drain()
         except Exception as e:
             hint = await self.disconnect(name, cleanup=False)
