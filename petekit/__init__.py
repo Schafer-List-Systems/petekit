@@ -6,6 +6,7 @@ from petekit.stream import (
     SandboxedBasher,
     StreamProcessor,
 )
+from petekit.stream.pattern_matchers import RegexConditionFactory
 from petekit.image import (
     ImageBufferManager,
     CameraObserver,
@@ -24,6 +25,7 @@ __all__ = [
     "Connector",
     "SandboxedBasher",
     "StreamProcessor",
+    "RegexConditionFactory",
     "ImageBufferManager",
     "CameraObserver",
     "Screenshooter",

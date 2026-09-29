@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import time
 from dataclasses import dataclass, field
@@ -103,9 +104,8 @@ def _refresh_list_buffer(fm: FunctionManager) -> None:
 
     # Format and persist the flat catalog to the function:list buffer for agent browsing.
     text = format_dict_list_for_buffer(records)
-    result = fm.write_buffer(_FUNCTION_LIST_BUFFER, text=text, start=0)
-    if not result.get("ok"):
-        raise RuntimeError(f"failed to refresh function list: {result.get('error')}")
+    loop = asyncio.get_running_loop()
+    loop.create_task(fm.write_buffer(_FUNCTION_LIST_BUFFER, text=text, start=0))
 
 
 class FunctionManager(BufferManager, AgenticObject):
@@ -118,11 +118,10 @@ class FunctionManager(BufferManager, AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._functions: dict[str, FunctionEntry] = {}
-        # Bootstrap the catalog buffer so write_buffer can overwrite it from the first refresh onward.
-        self.create_buffer(_FUNCTION_LIST_BUFFER, text="[]", overwrite=True)
+        self._create_buffer(_FUNCTION_LIST_BUFFER, text="[]")
 
     @tool
-    def create_function(
+    async def create_function(
         self,
         name: str,
         callable: Callable,
@@ -166,7 +165,7 @@ class FunctionManager(BufferManager, AgenticObject):
 
         # Mirror the function entry into a text buffer the agent can read and search;
         # create_buffer with overwrite=True fires existing buffer hooks automatically.
-        buf_result = self.create_buffer(_build_buffer_name(name), text=_build_function_buffer(entry), overwrite=True)
+        buf_result = await self.create_buffer(_build_buffer_name(name), text=_build_function_buffer(entry), overwrite=True)
         if not buf_result.get("ok"):
             return {
                 "ok": False,
@@ -187,14 +186,14 @@ class FunctionManager(BufferManager, AgenticObject):
         }
 
     @tool
-    def drop_function(self, name: str) -> dict[str, Any]:
+    async def drop_function(self, name: str) -> dict[str, Any]:
         # Guard: reject unknown names to keep the namespace consistent.
         if name not in self._functions:
             return {"ok": False, "error": f"No function named '{name}'."}
 
         # Drop the function's buffer; a hook rejection prevents the drop and returns the error.
         buf_name = _build_buffer_name(name)
-        drop_result = self.drop_buffer(buf_name)
+        drop_result = await self.drop_buffer(buf_name)
         if not drop_result.get("ok"):
             return drop_result
 
