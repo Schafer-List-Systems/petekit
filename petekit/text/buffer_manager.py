@@ -289,15 +289,31 @@ class BufferManager(AgenticObject):
         Optionally provide initial text.
         Use overwrite=True to replace an existing buffer.
         """
+        # Reject new creation if the name is already taken and overwrite is not requested.
         if name in self._buffers and not overwrite:
             return {"ok": False, "error": f"Buffer '{name}' already exists. Use overwrite=True to replace it."}
+
         ts = time.time()
         existed = name in self._buffers
+
+        # Gate overwrite through the existing buffer's drop hooks; a rejection blocks the replacement.
+        if existed:
+            buf = self._buffers[name]
+            old_text = "\n".join(e.data for e in buf.lines) + "\n"
+            hook_result = buf._fire_update_hooks(old_text, 0, len(buf.lines), None)
+            if hook_result is not True and hook_result is not None:
+                return {"ok": False, "error": str(hook_result)}
+
+        # Create a fresh Buffer with no lines and the current timestamp; it starts with zero hooks.
         self._buffers[name] = Buffer(lines=[], created_at=ts, modified_at=ts)
         lines = 0
+
+        # Populate lines from the provided text, stamping each entry with the creation timestamp.
         if text:
             self._buffers[name].lines = [BufferEntry(data=line, timestamp=ts, seen=True) for line in text.splitlines()]
             lines = len(self._buffers[name].lines)
+
+        # Refresh the system buffer listing so the new buffer is visible to the agent.
         if name != "system:list:buffers":
             refresh_result = self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
@@ -305,6 +321,8 @@ class BufferManager(AgenticObject):
                 # deleting from self._buffers. Until a rollback strategy is defined, raising the
                 # error leaves BufferManager in an inconsistent state (buffer exists, listing stale).
                 raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
+
+        # Signal whether this was a fresh creation or an overwrite, and how many lines were written.
         return {"ok": True, "created": not existed, "overwritten": existed, "lines": lines}
 
     @tool

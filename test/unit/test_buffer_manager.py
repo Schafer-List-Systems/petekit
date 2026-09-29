@@ -473,3 +473,20 @@ class TestUpdateHooks(unittest.TestCase):
         self.assertIn("rejected by hook", result["error"])
         self.assertIn("test", self.bm._buffers)  # still exists
 
+    def test_create_buffer_overwrite_fires_drop_hooks(self):
+        self.bm.create_buffer("test", text="keep: me")
+        self.bm.register_buffer_update_hook("test", "nope", lambda *_: "no overwrite")
+        result = self.bm.create_buffer("test", text="new: thing", overwrite=True)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "no overwrite")
+        existing = self.bm.read_buffer("test", raw=True, show_line_numbers=False)
+        self.assertEqual(existing, "keep: me")
+
+    def test_create_buffer_overwrite_succeeds_without_hooks(self):
+        self.bm.create_buffer("test", text="old: thing")
+        result = self.bm.create_buffer("test", text="new: thing", overwrite=True)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["overwritten"])
+        existing = self.bm.read_buffer("test", raw=True, show_line_numbers=False)
+        self.assertEqual(existing, "new: thing")
+
