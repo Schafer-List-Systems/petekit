@@ -329,3 +329,147 @@ class TestEditBufferScopedRange(unittest.TestCase):
         self.assertGreater(result[1], 2.0)       # X touched
         self.assertGreater(result[2], 2.0)       # Y touched
         self.assertAlmostEqual(result[3], 3.0)  # C untouched (after range)
+
+
+class TestUpdateHooks(unittest.TestCase):
+    """Test the update hook infrastructure: register, unregister, and pre-mutation gating."""
+
+    def setUp(self):
+        self.bm = BufferManager()
+        self.calls: list = []
+
+    def _accepting_hook(self, buf, old_text, start, end, new_text):
+        self.calls.append((buf, old_text, start, end, new_text))
+        return True
+
+    def _rejecting_hook(self, buf, old_text, start, end, new_text):
+        return "rejected by hook"
+
+    def _reason_hook(self, buf, old_text, start, end, new_text):
+        return "custom rejection reason"
+
+    def test_register_hook_success(self):
+        self.bm.create_buffer("test")
+        result = self.bm.register_buffer_update_hook("test", "myhook", self._accepting_hook)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["hook"], "myhook")
+        self.assertEqual(result["hook_count"], 1)
+
+    def test_register_hook_no_overwrite(self):
+        self.bm.create_buffer("test")
+        self.bm.register_buffer_update_hook("test", "myhook", self._accepting_hook)
+        result = self.bm.register_buffer_update_hook("test", "myhook", self._accepting_hook)
+        self.assertFalse(result["ok"])
+        self.assertIn("already registered", result["error"])
+
+    def test_register_unknown_buffer(self):
+        result = self.bm.register_buffer_update_hook("nonexistent", "hook", self._accepting_hook)
+        self.assertFalse(result["ok"])
+        self.assertIn("No buffer named", result["error"])
+
+    def test_unregister_hook_success(self):
+        self.bm.create_buffer("test")
+        self.bm.register_buffer_update_hook("test", "myhook", self._accepting_hook)
+        result = self.bm.unregister_buffer_update_hook("test", "myhook")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["removed"], "myhook")
+
+    def test_unregister_unknown_silent(self):
+        self.bm.create_buffer("test")
+        result = self.bm.unregister_buffer_update_hook("test", "unknown")
+        self.assertFalse(result["ok"])
+
+    def test_write_buffer_hook_receives_correct_args(self):
+        self.bm.create_buffer("test", text="A\nB\nC")
+        self.bm.register_buffer_update_hook("test", "h", self._accepting_hook)
+        self.bm.write_buffer("test", "X\nY", start=1, end=2)
+        self.assertEqual(len(self.calls), 1)
+        buf, old_text, start, end, new_text = self.calls[0]
+        self.assertEqual(old_text, "B\n")  # line 1 replaced
+        self.assertEqual(start, 1)
+        self.assertEqual(end, 2)
+        self.assertEqual(new_text, "X\nY\n")
+
+    def test_edit_buffer_hook_receives_correct_args(self):
+        self.bm.create_buffer("test", text="A\nB\nC")
+        self.bm.register_buffer_update_hook("test", "h", self._accepting_hook)
+        self.bm.edit_buffer("test", "B", "X", start=1, end=2)
+        self.assertEqual(len(self.calls), 1)
+        buf, old_text, start, end, new_text = self.calls[0]
+        self.assertEqual(old_text, "B\n")
+        self.assertIn("X\n", new_text)
+
+    def test_drop_buffer_hook_receives_full_content_and_none(self):
+        self.bm.create_buffer("test", text="A\nB\nC")
+        self.bm.register_buffer_update_hook("test", "h", self._accepting_hook)
+        self.bm.drop_buffer("test")
+        self.assertEqual(len(self.calls), 1)
+        buf, old_text, start, end, new_text = self.calls[0]
+        self.assertIn("A\n", old_text)
+        self.assertIn("B\n", old_text)
+        self.assertEqual(new_text, None)
+
+    def test_hook_accept_true_allows_write(self):
+        self.bm.create_buffer("test", text="A\nB")
+        self.bm.register_buffer_update_hook("test", "h", lambda *_: True)
+        result = self.bm.write_buffer("test", "X", start=0)
+        self.assertTrue(result["ok"])
+        content = self.bm.read_buffer("test", raw=True, show_line_numbers=False)
+        self.assertEqual(content, "X")
+
+    def test_hook_accept_none_allows_write(self):
+        self.bm.create_buffer("test", text="A\nB")
+        self.bm.register_buffer_update_hook("test", "h", lambda *_: None)
+        result = self.bm.write_buffer("test", "X")
+        self.assertTrue(result["ok"])
+
+    def test_hook_reject_blocks_write(self):
+        self.bm.create_buffer("test", text="A\nB")
+        self.bm.register_buffer_update_hook("test", "h", self._rejecting_hook)
+        result = self.bm.write_buffer("test", "X")
+        self.assertFalse(result["ok"])
+        self.assertIn("rejected by hook", result["error"])
+        content = self.bm.read_buffer("test", raw=True, show_line_numbers=False)
+        self.assertEqual(content, "A\nB")  # unchanged
+
+    def test_hook_reason_string_rejected(self):
+        self.bm.create_buffer("test", text="A\nB")
+        self.bm.register_buffer_update_hook("test", "h", self._reason_hook)
+        result = self.bm.write_buffer("test", "X")
+        self.assertFalse(result["ok"])
+        self.assertIn("custom rejection reason", result["error"])
+
+    def test_multiple_hooks_first_rejection_blocks(self):
+        self.bm.create_buffer("test", text="A\nB")
+        self.bm.register_buffer_update_hook("test", "first", self._accepting_hook)
+        self.bm.register_buffer_update_hook("test", "second", self._rejecting_hook)
+        result = self.bm.write_buffer("test", "X")
+        self.assertFalse(result["ok"])
+        self.assertIn("rejected by hook", result["error"])
+
+    def test_hook_receives_buffer_reference(self):
+        captured: list = []
+        def spy(buf, old, start, end, new):
+            captured.append(buf.modified_at)
+            return True
+        self.bm.create_buffer("test", text="X")
+        self.bm.register_buffer_update_hook("test", "spy", spy)
+        self.bm.write_buffer("test", "Y")
+        self.assertGreater(captured[0], 0)
+
+    def test_hook_reject_blocks_edit(self):
+        self.bm.create_buffer("test", text="A\nB\nC")
+        self.bm.register_buffer_update_hook("test", "h", self._rejecting_hook)
+        result = self.bm.edit_buffer("test", "B", "X")
+        self.assertFalse(result["ok"])
+        content = self.bm.read_buffer("test", raw=True, show_line_numbers=False)
+        self.assertEqual(content, "A\nB\nC")  # unchanged
+
+    def test_hook_reject_blocks_drop(self):
+        self.bm.create_buffer("test", text="A\nB")
+        self.bm.register_buffer_update_hook("test", "h", self._rejecting_hook)
+        result = self.bm.drop_buffer("test")
+        self.assertFalse(result["ok"])
+        self.assertIn("rejected by hook", result["error"])
+        self.assertIn("test", self.bm._buffers)  # still exists
+
