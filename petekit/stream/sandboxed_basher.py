@@ -63,6 +63,7 @@ class SandboxedBasher(Basher, AgenticObject):
         Uses an existing workspace if available, otherwise creates a new
         temporary directory.
         """
+        # Provision: create a temp workspace on first use or after teardown.
         if self._workspace_dir is None or not self._workspace_dir.is_dir():
             self._workspace_dir = Path(tempfile.mkdtemp(prefix="bash_workspace_"))
             os.environ["HOME"] = str(self._workspace_dir)
@@ -70,6 +71,7 @@ class SandboxedBasher(Basher, AgenticObject):
 
     def _teardown_workspace(self) -> None:
         """Remove the workspace directory."""
+        # Teardown: recursively delete the temp workspace, then clear the reference.
         if self._workspace_dir and self._workspace_dir.is_dir():
             import shutil
             shutil.rmtree(self._workspace_dir, ignore_errors=True)
@@ -78,9 +80,12 @@ class SandboxedBasher(Basher, AgenticObject):
     @property
     def _env(self) -> dict[str, str]:
         """Build the sandbox environment with the workspace HOME."""
+        # Build: seed from the minimal env, then overlay the workspace home.
         env = {**_MINIMAL_ENV}
         if self._workspace_dir:
             env["HOME"] = str(self._workspace_dir)
+
+        # Overlay: inherit terminal and locale settings from the outer process.
         for key in ("TERM", "LANG", "LC_ALL"):
             val = os.environ.get(key)
             if val:
@@ -89,6 +94,7 @@ class SandboxedBasher(Basher, AgenticObject):
 
     def _is_safe_command(self, command: str) -> bool:
         """Check if the command (first word) is in the allowlist."""
+        # Allow /bin/sh and sh directly — used by bash_exec to fork the subprocess.
         first = command.strip().split()[0] if command.strip() else ""
         if first == "/bin/sh" or first == "sh":
             return True
@@ -96,7 +102,7 @@ class SandboxedBasher(Basher, AgenticObject):
         return base in _SAFE_COMMANDS
 
     @tool
-    async def exec(self, title: str, command: str) -> str:
+    async def bash_exec(self, title: str, command: str) -> str:
         """Execute a command in the sandboxed workspace after guardrail validation.
 
         Args:
@@ -110,19 +116,23 @@ class SandboxedBasher(Basher, AgenticObject):
         if not command.strip():
             return "Error: Empty command."
 
+        # Guard: block path traversal attempts.
         if ".." in command:
             return "Error: Path traversal is not allowed."
 
+        # Guard: reject shell metacharacters that enable arbitrary command injection.
         _blocked_chars = ("`", "$(")
         for bad in _blocked_chars:
             if bad in command:
                 return f"Error: The character or sequence '{bad}' is not allowed."
 
+        # Guard: enforce the allowlist of safe POSIX utilities.
         if not self._is_safe_command(command):
             base = os.path.basename(command.strip().split()[0])
             return f"Error: Command '{base}' is not allowed in the sandbox."
 
+        # Provision: set up the sandbox workspace and delegate to Basher.
         ws = self._setup_workspace()
         _logger.debug("[exec] workspace=%s, command=%r", ws, command)
 
-        return await super().exec(title, command, cwd=ws)
+        return await super().bash_exec(title, command, cwd=ws)
