@@ -30,12 +30,12 @@ regex:<condition_name>        — per-condition pattern store (JSON)
 A condition evaluates to True when the incoming text matches ANY of its patterns
 using fullmatch semantics — the entire line must match (^...$).
 
-Update the system:list:regex_conditions buffer to add a RegEx condition:
+Update the system:list:regex_conditions buffer to add an empty RegEx condition:
   {"name": "<name>", "config_buffer": "regex:<name>"}
 
 The factory automatically provisions the regex:<name> buffer on successful addition.
 
-Update the regex:<name> buffer to add a pattern to a RegEx condition:
+Update the regex:<name> buffer to add/update a pattern to a RegEx condition:
   {"pattern": "<regex>", "sample_line": "<example>"}
   The pattern is validated against sample_line immediately — a mismatch is rejected.
 """

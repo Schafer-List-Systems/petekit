@@ -9,6 +9,7 @@ import time
 from peteos import AgenticObject, sandbox
 from peteos.persona.agent import Agent
 from .stream_buffer_manager import StreamBufferManager
+from ..function.function_manager import FunctionManager
 import asyncio
 
 
@@ -109,7 +110,7 @@ class _NotificationConfig:
     notify_on_empty: bool = False
 
 
-class StreamProcessor(StreamBufferManager, AgenticObject):
+class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
     """You are a stream processor managing multiple routing tables.
     You also have a notification system for stream updates — it sends you automatic [NOTIFICATION] chat messages disguised as user messages.
     While stream buffer hooks allow you to execute functions automatically, the notification system allows you to get notified (chat messages) automatically.
@@ -650,17 +651,20 @@ class StreamProcessor(StreamBufferManager, AgenticObject):
         if condition_name.lower() == "false":
             return False
 
-        # Locate the named condition method in the sandbox member registry.
+        # Locate the condition — first in sandbox methods, then in hidden functions.
         import inspect
         members = self._gather_sandbox_members()
-        if condition_name not in members:
-            raise RoutingConditionError(
-                condition=condition_name,
-                routing_table=(metadata or {}).get("routing_table"),
-                reason="not found in sandbox members",
-            )
-
-        method = members[condition_name]
+        if condition_name in members:
+            method = members[condition_name]
+        else:
+            fn_result = self.get_function(condition_name)
+            if not fn_result.get("ok"):
+                raise RoutingConditionError(
+                    condition=condition_name,
+                    routing_table=(metadata or {}).get("routing_table"),
+                    reason=f"not found in sandbox members or function manager: {fn_result.get('error')}",
+                )
+            method = fn_result["callable"]
         sig = inspect.signature(method)
         params = list(sig.parameters.keys())
 
