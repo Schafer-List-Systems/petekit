@@ -322,9 +322,10 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
         except json.JSONDecodeError as e:
             return f"conditions list is not valid JSON: {e.msg}"
 
-        if idx < 0 or idx >= len(conditions_list):
-            return f"condition index {idx} is out of range (list has {len(conditions_list)} entries)"
-        entry = conditions_list[idx]
+        conditions = conditions_list.get("conditions", [])
+        if idx < 0 or idx >= len(conditions):
+            return f"condition index {idx} is out of range (list has {len(conditions)} entries)"
+        entry = conditions[idx]
         name = entry.get("name")
         config_buffer = entry.get("buffer")
         if not name or not config_buffer:

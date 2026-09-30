@@ -669,9 +669,14 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         params = list(sig.parameters.keys())
 
         # Dispatch using the 3-arg or 4-arg signature form; validate return type is bool.
-        if params[:3] == ["stream", "text", "metadata"] and sig.return_annotation in (bool, inspect.Parameter.empty):
+        _is_bool_return = (
+            sig.return_annotation is bool
+            or sig.return_annotation is inspect.Parameter.empty
+            or sig.return_annotation == "bool"
+        )
+        if params[:3] == ["stream", "text", "metadata"] and _is_bool_return:
             result = method(stream=condition_name, text=text, metadata=metadata or {})
-        elif params[:4] == ["self", "stream", "text", "metadata"] and sig.return_annotation in (bool, inspect.Parameter.empty):
+        elif params[:4] == ["self", "stream", "text", "metadata"] and _is_bool_return:
             result = method(self, stream=condition_name, text=text, metadata=metadata or {})
         else:
             raise RoutingConditionError(
