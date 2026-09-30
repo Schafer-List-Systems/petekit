@@ -28,7 +28,7 @@ class WebScraper(BufferManager, AgenticObject):
       2. web_render(buffer, ...) — fetch via headless Chrome into a buffer
       3. web_scrape(buffer, ...) / web_select_css(url, selector, attr) — carve structured derived buffers
       4. grep_buffer(buffer, ...) + read_buffer(url, ...) — search and read
-    - Use list_buffers to see loaded URLs and their derived buffers.
+    - Read the buffer list to see loaded URLs and their derived buffers.
     - Use (?i) at the start of a grep pattern for case-insensitive matching.
     """
 
