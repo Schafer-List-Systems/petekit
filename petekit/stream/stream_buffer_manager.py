@@ -191,7 +191,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
                 "name": hook_name,
                 "priority": hook.priority,
                 "fire_count": hook.fire_count,
-                "errors": [{"ts": e.timestamp, "msg": e.error} for e in hook.errors],
+                "errors": [{"ts": e.modified_at, "msg": e.error} for e in hook.errors],
             }
             for stream_name, cfg in self.stream_buffer_configs.items()
             for hook_name, hook in cfg.hooks.items()
@@ -226,8 +226,8 @@ class StreamBufferManager(BufferManager, AgenticObject):
             buf = self._buffers[name]
             if not buf.lines:
                 return {"ok": False, "error": f"Buffer '{name}' is empty."}
-            anchor = buf.lines[-1].timestamp
-            ts_list = [e.timestamp for e in buf.lines]
+            anchor = buf.lines[-1].modified_at
+            ts_list = [e.modified_at for e in buf.lines]
 
             if isinstance(start, float):
                 resolved_start = self._resolve_time(start, anchor)

@@ -164,10 +164,16 @@ class GrepResult:
 
 @dataclass
 class BufferEntry:
-    """A single line in a buffer with timestamp and seen flag."""
+    """A single line in a buffer with three temporal markers for observability.
+
+    modified_at — when the entry was created or last changed.
+    object_at   — when the entry was last touched by source code (read, not written).
+    agent_at    — when the entry was injected into an agent chat context; None means unseen by agent.
+    """
     data: str
-    timestamp: float
-    seen: bool = False
+    modified_at: float
+    object_at: float | None = None
+    agent_at: float | None = None
 
 
 @dataclass
@@ -215,9 +221,9 @@ class Buffer:
         segment = []
         for i, entry in enumerate(self.lines[start:end], start=start):
             if show_timestamps and show_line_numbers:
-                segment.append(f"{i}: ({entry.timestamp:.6f}) {entry.data}")
+                segment.append(f"{i}: ({entry.modified_at:.6f}) {entry.data}")
             elif show_timestamps:
-                segment.append(f"({entry.timestamp:.6f}) {entry.data}")
+                segment.append(f"({entry.modified_at:.6f}) {entry.data}")
             elif show_line_numbers:
                 segment.append(f"{i}: {entry.data}")
             else:
@@ -295,7 +301,7 @@ class BufferManager(AgenticObject):
         lines = 0
 
         if text:
-            self._buffers[name].lines = [BufferEntry(data=line, timestamp=ts, seen=True) for line in text.splitlines()]
+            self._buffers[name].lines = [BufferEntry(data=line, modified_at=ts, object_at=ts) for line in text.splitlines()]
             lines = len(self._buffers[name].lines)
 
         return {"ok": True, "lines": lines}
@@ -349,7 +355,7 @@ class BufferManager(AgenticObject):
             return {"ok": False, "error": f"Buffer '{target_name}' already exists. Use overwrite=True to replace it."}
         src = self._buffers[source_name]
         now = time.time()
-        new_entries = [BufferEntry(data=e.data, timestamp=e.timestamp, seen=e.seen) for e in src.lines]
+        new_entries = [BufferEntry(data=e.data, modified_at=e.modified_at, object_at=now) for e in src.lines]
         self._buffers[target_name] = Buffer(lines=new_entries, created_at=now, modified_at=now)
         if target_name != "system:list:buffers":
             refresh_result = await self._refresh_buffers_buffer()
@@ -393,7 +399,8 @@ class BufferManager(AgenticObject):
             return {"ok": False, "error": str(hook_result)}
 
         # Commit the mutation to the buffer and stamp the modification time.
-        new_entries = [BufferEntry(data=line, timestamp=time.time(), seen=True) for line in (text + "\n").splitlines()]
+        now = time.time()
+        new_entries = [BufferEntry(data=line, modified_at=now, object_at=now) for line in (text + "\n").splitlines()]
         buf.lines[start:end] = new_entries
         buf.modified_at = time.time()
 
@@ -561,9 +568,10 @@ class BufferManager(AgenticObject):
 
         # Within-size path: mark entries as seen by the agent and return content directly.
         if total_chars <= BufferManager._MAX_CHUNK_CHARS:
+            now = time.time()
             buf = self._buffers[name]
             for entry in buf.lines[result["start"]:result["end"]]:
-                entry.seen = True
+                entry.agent_at = now
             if raw:
                 return result["content"]
             return {"ok": True, "content": result["content"], "start": result["start"], "end": result["end"], "lines": result["line_count"]}
@@ -678,10 +686,10 @@ class BufferManager(AgenticObject):
                 replaced_line_indices.add(lo + li)
 
         old_entries = buf.lines
-        old_timestamps = [e.timestamp for e in old_entries]
+        old_timestamps = [e.modified_at for e in old_entries]
 
         # Walk each new line, tracking its position relative to original content so the
-        # correct timestamp can be assigned: replaced lines get the current timestamp;
+        # correct modified_at can be assigned: replaced lines get the current now;
         # untouched lines that match the original content at the same index keep theirs.
         char_offset = 0
         for new_i, line_text in enumerate(new_lines):
@@ -713,10 +721,10 @@ class BufferManager(AgenticObject):
                 if not (r_start <= remapped_pos < r_end):
                     in_replaced = False
 
-            # Assign timestamp: replaced lines get now; untouched preserved lines keep
-            # their original timestamp; novel content also gets now.
+            # Assign modified_at: replaced lines get now; untouched preserved lines keep
+            # their original modified_at; novel content also gets now.
             if in_replaced:
-                result_entries.append(BufferEntry(data=line_text, timestamp=now, seen=True))
+                result_entries.append(BufferEntry(data=line_text, modified_at=now, object_at=now))
             else:
                 mapped_pos = char_pos_new - effective_offset
                 if mapped_pos <= 0:
@@ -731,11 +739,11 @@ class BufferManager(AgenticObject):
                     and abs_mapped not in replaced_line_indices
                 ):
                     result_entries.append(
-                        BufferEntry(data=line_text, timestamp=old_timestamps[abs_mapped], seen=True)
+                        BufferEntry(data=line_text, modified_at=old_timestamps[abs_mapped], object_at=now)
                     )
                     used_old_indices.add(abs_mapped)
                 else:
-                    result_entries.append(BufferEntry(data=line_text, timestamp=now, seen=True))
+                    result_entries.append(BufferEntry(data=line_text, modified_at=now, object_at=now))
 
         # Fire update hooks with the old segment and the computed new content.
         # Rejection means the edit is denied and the buffer must not be modified.

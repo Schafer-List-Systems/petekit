@@ -107,7 +107,7 @@ class TextEditor(BufferManager, AgenticObject):
                         buf.modified_at = new_mtime
                         self.expected_file_state[abs_path] = ExpectedFileData(mtime=new_mtime, content=merged_text.splitlines())
                         merged_lines = merged_text.splitlines()
-                        buf.lines = [BufferEntry(data=line, timestamp=new_mtime, seen=True) for line in merged_lines]
+                        buf.lines = [BufferEntry(data=line, modified_at=new_mtime, object_at=new_mtime) for line in merged_lines]
                     except Exception as e:
                         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
                     if not had_conflicts:

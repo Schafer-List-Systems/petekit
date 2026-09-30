@@ -514,13 +514,14 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
             return
 
         # Gather unseen entries and current time for condition checks.
+        # Unseen = entries not yet injected into agent chat context (agent_at is None).
         now = time.time()
-        unseen = [e for e in buf.lines if not e.seen]
+        unseen = [e for e in buf.lines if e.agent_at is None]
 
         # Determine if notification should fire: batch threshold met OR interval elapsed since last fire.
         fire_due_to_batch = bool(unseen) and len(unseen) >= cfg.batch_size
         fire_due_to_interval = cfg.interval_secs is not None and cfg._last_fired > 0 and (now - cfg._last_fired >= cfg.interval_secs) and (bool(unseen) or cfg.notify_on_empty)
-        
+
         # Record fire time.
         cfg._last_fired = now
 
@@ -529,8 +530,8 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
 
         # Build notification prompt from unseen entries or last known entry.
         if unseen:
-            ts_start = unseen[0].timestamp
-            ts_end = unseen[-1].timestamp
+            ts_start = unseen[0].modified_at
+            ts_end = unseen[-1].modified_at
             prompt = (
                 f"[NOTIFICATION] Stream '{stream}' has {len(unseen)} new entries "
                 f"between {ts_start:.2f} and {ts_end:.2f}. "
@@ -538,11 +539,15 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         else:
             last_ts = 0.0
             if stream in self._buffers and self._buffers[stream].lines:
-                last_ts = self._buffers[stream].lines[-1].timestamp
+                last_ts = self._buffers[stream].lines[-1].modified_at
             prompt = (
                 f"[NOTIFICATION] Stream '{stream}' has 0 new entries. "
                 f"Last entry at {last_ts:.2f}. "
             )
+
+        # Mark entries as seen by the agent (stamped before injection).
+        for entry in unseen:
+            entry.agent_at = now
 
         # Invoke agent and report errors to feedback buffer.
         from peteos import Error
@@ -590,8 +595,8 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         # Resolve the table and annotate metadata with the routing table name for condition visibility.
         table = self._routing_tables[routing_table]
         # TODO(timestamp-missing): ts below is always 0 — metadata has no timestamp.
-        # Real timestamp lives on BufferEntry.timestamp in BufferManager.write_buffer (text/buffer_manager.py:335).
-        # Fix: StreamBufferManager.write_buffer (stream/stream_buffer_manager.py:233) should pass the entry's timestamp into the hook.
+        # Real timestamp lives on BufferEntry.modified_at in BufferManager.write_buffer (text/buffer_manager.py:335).
+        # Fix: StreamBufferManager.write_buffer (stream/stream_buffer_manager.py:233) should pass the entry's modified_at into the hook.
         ts = metadata.get("timestamp", 0) if metadata else 0
         metadata = {**(metadata or {}), "routing_table": routing_table}
 
