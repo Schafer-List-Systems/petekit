@@ -243,7 +243,8 @@ class StreamBufferManager(BufferManager, AgenticObject):
                     return {"ok": False, "error": f"No entries at or before {_fmt_ts(resolved_end)}."}
                 end = end_idx
 
-            show_timestamps = True
+            if not raw:
+                show_timestamps = True
 
         return await super().read_buffer(name, start=start, end=end, show_timestamps=show_timestamps, show_line_numbers=show_line_numbers, raw=raw)
 

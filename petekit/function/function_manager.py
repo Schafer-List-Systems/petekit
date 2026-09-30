@@ -88,7 +88,7 @@ def _build_function_buffer(entry: FunctionEntry) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _refresh_list_buffer(fm: FunctionManager) -> None:
+def _refresh_list_buffer(fm: FunctionManager) -> asyncio.Task:
     # Collect each function's name, arg summary, and short description for the catalog.
     records = []
     for entry in fm._functions.values():
@@ -105,7 +105,7 @@ def _refresh_list_buffer(fm: FunctionManager) -> None:
     # Format and persist the flat catalog to the function:list buffer for agent browsing.
     text = format_dict_list_for_buffer(records)
     loop = asyncio.get_running_loop()
-    loop.create_task(fm.write_buffer(_FUNCTION_LIST_BUFFER, text=text, start=0))
+    return loop.create_task(fm.write_buffer(_FUNCTION_LIST_BUFFER, text=text, start=0))
 
 
 class FunctionManager(BufferManager, AgenticObject):
@@ -176,7 +176,7 @@ class FunctionManager(BufferManager, AgenticObject):
         self._functions[name] = entry
 
         # Refresh the global function list so the new entry appears in the catalog.
-        _refresh_list_buffer(self)
+        await _refresh_list_buffer(self)
 
         return {
             "ok": True,
@@ -201,7 +201,7 @@ class FunctionManager(BufferManager, AgenticObject):
         del self._functions[name]
 
         # Refresh the global catalog so the removed function no longer appears.
-        _refresh_list_buffer(self)
+        await _refresh_list_buffer(self)
 
         return {"ok": True, "dropped": name}
 

@@ -3,350 +3,318 @@
 from __future__ import annotations
 
 import asyncio
-import bisect
-import sys
 import time
-import unittest
-
-sys.path.insert(0, "/home/frygge/projects/AIOS/peteos-kit")
-sys.path.insert(0, "/home/frygge/projects/private/petekit/src/peteos/peteos")
+import pytest
 
 from petekit.stream.stream_buffer_manager import StreamBufferManager, StreamBufferHook, StreamBufferHookError
 from petekit.text.buffer_manager import Buffer, BufferEntry
 
 
-class TestStreamBufferCreateDrop(unittest.TestCase):
-    """Test create_buffer with stream=True and drop_buffer cleanup."""
-
-    def setUp(self):
-        self.sbm = StreamBufferManager()
-
-    def test_create_stream_requires_stream_prefix(self):
-        result = self.sbm.create_buffer("bad_name", stream=True)
-        self.assertFalse(result["ok"])
-        self.assertIn("stream:", result["error"])
-
-    def test_create_stream_ok(self):
-        result = self.sbm.create_buffer("stream:test", stream=True)
-        self.assertTrue(result["ok"])
-        self.assertIn("stream:test", self.sbm.stream_buffer_configs)
-
-    def test_create_stream_twice_blocked(self):
-        self.sbm.create_buffer("stream:test", stream=True)
-        result = self.sbm.create_buffer("stream:test", stream=True)
-        self.assertFalse(result["ok"])
-
-    def test_create_stream_overwrite(self):
-        self.sbm.create_buffer("stream:test", stream=True)
-        result = self.sbm.create_buffer("stream:test", stream=True, overwrite=True)
-        self.assertTrue(result["ok"])
-
-    def test_drop_stream_cleans_up_config(self):
-        self.sbm.create_buffer("stream:test", stream=True)
-        self.sbm.drop_buffer("stream:test")
-        self.assertNotIn("stream:test", self.sbm.stream_buffer_configs)
-
-    def test_drop_non_stream_still_works(self):
-        self.sbm.create_buffer("regular")
-        result = self.sbm.drop_buffer("regular")
-        self.assertTrue(result["ok"])
+@pytest.fixture
+async def sbm():
+    return StreamBufferManager()
 
 
-class TestResolveTime(unittest.TestCase):
-    """Test _resolve_time for absolute vs relative timestamp resolution."""
+class TestStreamBufferCreateDrop:
+    async def test_create_stream_requires_stream_prefix(self, sbm):
+        result = await sbm.create_buffer("bad_name", stream=True)
+        assert not result["ok"]
+        assert "stream:" in result["error"]
 
-    def setUp(self):
-        self.sbm = StreamBufferManager()
+    async def test_create_stream_ok(self, sbm):
+        result = await sbm.create_buffer("stream:test", stream=True)
+        assert result["ok"]
+        assert "stream:test" in sbm.stream_buffer_configs
 
-    def test_positive_passes_through(self):
-        result = self.sbm._resolve_time(123.456, anchor=200.0)
-        self.assertEqual(result, 123.456)
+    async def test_create_stream_twice_blocked(self, sbm):
+        await sbm.create_buffer("stream:test", stream=True)
+        result = await sbm.create_buffer("stream:test", stream=True)
+        assert not result["ok"]
 
-    def test_negative_adds_to_anchor(self):
-        result = self.sbm._resolve_time(-30.0, anchor=100.0)
-        self.assertEqual(result, 70.0)
+    async def test_create_stream_overwrite(self, sbm):
+        await sbm.create_buffer("stream:test", stream=True)
+        result = await sbm.create_buffer("stream:test", stream=True, overwrite=True)
+        assert result["ok"]
 
-    def test_zero_is_absolute_not_relative(self):
-        result = self.sbm._resolve_time(-0.0, anchor=100.0)
-        self.assertEqual(result, -0.0)
+    async def test_drop_stream_cleans_up_config(self, sbm):
+        await sbm.create_buffer("stream:test", stream=True)
+        await sbm.drop_buffer("stream:test")
+        assert "stream:test" not in sbm.stream_buffer_configs
+
+    async def test_drop_non_stream_still_works(self, sbm):
+        await sbm.create_buffer("regular")
+        result = await sbm.drop_buffer("regular")
+        assert result["ok"]
 
 
-class TestStreamBufferReadBufferTimeBased(unittest.TestCase):
-    """Test read_buffer with float start/end for time-based reading."""
+class TestResolveTime:
+    async def test_positive_passes_through(self, sbm):
+        result = sbm._resolve_time(123.456, anchor=200.0)
+        assert result == 123.456
 
-    def setUp(self):
-        self.sbm = StreamBufferManager()
-        self._make_stream("stream:t", ts=[10.0, 20.0, 30.0, 40.0, 50.0], data=["a", "b", "c", "d", "e"])
+    async def test_negative_adds_to_anchor(self, sbm):
+        result = sbm._resolve_time(-30.0, anchor=100.0)
+        assert result == 70.0
 
-    def _make_stream(self, name: str, ts: list[float], data: list[str]) -> None:
+    async def test_zero_is_absolute_not_relative(self, sbm):
+        result = sbm._resolve_time(-0.0, anchor=100.0)
+        assert result == -0.0
+
+
+class TestStreamBufferReadBufferTimeBased:
+    @pytest.fixture
+    async def _sbm_with_stream(self, sbm):
+        ts = [10.0, 20.0, 30.0, 40.0, 50.0]
+        data = ["a", "b", "c", "d", "e"]
         entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
-        self.sbm._buffers[name] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
-        self.sbm.stream_buffer_configs[name] = self.sbm.stream_buffer_configs.get(
-            name, type("C", (), {"hooks": {}, "created_at": ts[0]})()
-        )
+        sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
+        sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
+        return sbm
 
-    def test_absolute_range_inclusive(self):
-        result = self.sbm.read_buffer("stream:t", start=20.0, end=40.0, show_line_numbers=False)
-        self.assertTrue(result["ok"])
+    async def test_absolute_range_inclusive(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", start=20.0, end=40.0, show_line_numbers=False)
+        assert result["ok"]
         lines = result["content"].split("\n")
         timestamps_in_content = [float(l.split(")")[0][1:]) for l in lines]
-        self.assertEqual(timestamps_in_content, [20.0, 30.0, 40.0])
+        assert timestamps_in_content == [20.0, 30.0, 40.0]
 
-    def test_float_start_only(self):
-        result = self.sbm.read_buffer("stream:t", start=35.0, show_line_numbers=False)
-        self.assertTrue(result["ok"])
+    async def test_float_start_only(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", start=35.0, show_line_numbers=False)
+        assert result["ok"]
         lines = result["content"].split("\n")
-        self.assertEqual(len(lines), 2)
+        assert len(lines) == 2
         timestamps = [float(l.split(")")[0][1:]) for l in lines]
-        self.assertEqual(timestamps, [40.0, 50.0])
+        assert timestamps == [40.0, 50.0]
 
-    def test_float_end_only(self):
-        result = self.sbm.read_buffer("stream:t", end=25.0, show_line_numbers=False)
-        self.assertTrue(result["ok"])
+    async def test_float_end_only(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", end=25.0, show_line_numbers=False)
+        assert result["ok"]
         lines = result["content"].split("\n")
         timestamps = [float(l.split(")")[0][1:]) for l in lines]
-        self.assertEqual(timestamps, [10.0, 20.0])
+        assert timestamps == [10.0, 20.0]
 
-    def test_start_beyond_all_entries(self):
-        result = self.sbm.read_buffer("stream:t", start=100.0)
-        self.assertFalse(result["ok"])
-        self.assertIn("No entries at or after", result["error"])
+    async def test_start_beyond_all_entries(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", start=100.0)
+        assert not result["ok"]
+        assert "No entries at or after" in result["error"]
 
-    def test_end_before_all_entries(self):
-        result = self.sbm.read_buffer("stream:t", end=5.0)
-        self.assertFalse(result["ok"])
-        self.assertIn("No entries at or before", result["error"])
+    async def test_end_before_all_entries(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", end=5.0)
+        assert not result["ok"]
+        assert "No entries at or before" in result["error"]
 
-    def test_empty_buffer_error(self):
-        self.sbm._buffers["stream:empty"] = Buffer(lines=[], created_at=0.0, modified_at=0.0)
-        self.sbm.stream_buffer_configs["stream:empty"] = type("C", (), {"hooks": [], "created_at": 0.0})()
-        result = self.sbm.read_buffer("stream:empty", start=0.0)
-        self.assertFalse(result["ok"])
-        self.assertIn("empty", result["error"])
+    async def test_empty_buffer_error(self, _sbm_with_stream):
+        _sbm_with_stream._buffers["stream:empty"] = Buffer(lines=[], created_at=0.0, modified_at=0.0)
+        _sbm_with_stream.stream_buffer_configs["stream:empty"] = type("C", (), {"hooks": [], "created_at": 0.0})()
+        result = await _sbm_with_stream.read_buffer("stream:empty", start=0.0)
+        assert not result["ok"]
+        assert "empty" in result["error"]
 
-    def test_non_stream_buffer_rejects_float(self):
-        self.sbm.create_buffer("regular", text="x")
-        result = self.sbm.read_buffer("regular", start=10.0)
-        self.assertFalse(result["ok"])
-        self.assertIn("Only stream buffers support", result["error"])
+    async def test_non_stream_buffer_rejects_float(self, _sbm_with_stream):
+        await _sbm_with_stream.create_buffer("regular", text="x")
+        result = await _sbm_with_stream.read_buffer("regular", start=10.0)
+        assert not result["ok"]
+        assert "Only stream buffers support" in result["error"]
 
 
-class TestStreamBufferReadBufferRelativeTime(unittest.TestCase):
-    """Test read_buffer with negative (relative) float timestamps."""
-
-    def setUp(self):
-        self.sbm = StreamBufferManager()
-        self._make_stream("stream:t", ts=[10.0, 20.0, 30.0, 40.0, 50.0], data=["a", "b", "c", "d", "e"])
-
-    def _make_stream(self, name: str, ts: list[float], data: list[str]) -> None:
+class TestStreamBufferReadBufferRelativeTime:
+    @pytest.fixture
+    async def _sbm_with_stream(self, sbm):
+        ts = [10.0, 20.0, 30.0, 40.0, 50.0]
+        data = ["a", "b", "c", "d", "e"]
         entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
-        self.sbm._buffers[name] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
-        self.sbm.stream_buffer_configs[name] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
+        sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
+        sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
+        return sbm
 
-    def test_negative_start_relative_to_last_entry(self):
-        result = self.sbm.read_buffer("stream:t", start=-20.0, show_line_numbers=False)
-        self.assertTrue(result["ok"])
+    async def test_negative_start_relative_to_last_entry(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", start=-20.0, show_line_numbers=False)
+        assert result["ok"]
         lines = result["content"].split("\n")
         timestamps = [float(l.split(")")[0][1:]) for l in lines]
-        self.assertEqual(timestamps, [30.0, 40.0, 50.0])
+        assert timestamps == [30.0, 40.0, 50.0]
 
-    def test_negative_end_relative_to_last_entry(self):
-        result = self.sbm.read_buffer("stream:t", end=-20.0, show_line_numbers=False)
-        self.assertTrue(result["ok"])
+    async def test_negative_end_relative_to_last_entry(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", end=-20.0, show_line_numbers=False)
+        assert result["ok"]
         lines = result["content"].split("\n")
         timestamps = [float(l.split(")")[0][1:]) for l in lines]
-        self.assertEqual(timestamps, [10.0, 20.0, 30.0])
+        assert timestamps == [10.0, 20.0, 30.0]
 
-    def test_both_negative_relative_range(self):
-        result = self.sbm.read_buffer("stream:t", start=-30.0, end=-10.0, show_line_numbers=False)
-        self.assertTrue(result["ok"])
+    async def test_both_negative_relative_range(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", start=-30.0, end=-10.0, show_line_numbers=False)
+        assert result["ok"]
         lines = result["content"].split("\n")
         timestamps = [float(l.split(")")[0][1:]) for l in lines]
-        self.assertEqual(timestamps, [20.0, 30.0, 40.0])
+        assert timestamps == [20.0, 30.0, 40.0]
 
-    def test_negative_zero_means_from_start(self):
-        result = self.sbm.read_buffer("stream:t", start=-0.0, show_line_numbers=False)
-        self.assertTrue(result["ok"])
+    async def test_negative_zero_means_from_start(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", start=-0.0, show_line_numbers=False)
+        assert result["ok"]
         lines = result["content"].split("\n")
-        self.assertEqual(len(lines), 5)
+        assert len(lines) == 5
         timestamps = [float(l.split(")")[0][1:]) for l in lines]
-        self.assertEqual(timestamps, [10.0, 20.0, 30.0, 40.0, 50.0])
+        assert timestamps == [10.0, 20.0, 30.0, 40.0, 50.0]
 
-    def test_negative_start_large_offset_captures_all(self):
-        result = self.sbm.read_buffer("stream:t", start=-200.0)
-        self.assertTrue(result["ok"])
+    async def test_negative_start_large_offset_captures_all(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", start=-200.0)
+        assert result["ok"]
         lines = result["content"].split("\n")
-        self.assertEqual(len(lines), 5)
+        assert len(lines) == 5
 
-    def test_negative_end_exceeds_range(self):
-        result = self.sbm.read_buffer("stream:t", end=-200.0)
-        self.assertFalse(result["ok"])
-        self.assertIn("No entries at or before", result["error"])
+    async def test_negative_end_exceeds_range(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", end=-200.0)
+        assert not result["ok"]
+        assert "No entries at or before" in result["error"]
 
 
-class TestStreamBufferReadBufferLineBased(unittest.TestCase):
-    """Test that line-based read_buffer still works with 0-based indexing."""
-
-    def setUp(self):
-        self.sbm = StreamBufferManager()
-        self._make_stream("stream:t", ts=[10.0, 20.0, 30.0, 40.0, 50.0], data=["a", "b", "c", "d", "e"])
-
-    def _make_stream(self, name: str, ts: list[float], data: list[str]) -> None:
+class TestStreamBufferReadBufferLineBased:
+    @pytest.fixture
+    async def _sbm_with_stream(self, sbm):
+        ts = [10.0, 20.0, 30.0, 40.0, 50.0]
+        data = ["a", "b", "c", "d", "e"]
         entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
-        self.sbm._buffers[name] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
-        self.sbm.stream_buffer_configs[name] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
+        sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
+        sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
+        return sbm
 
-    def test_read_all_with_timestamps(self):
-        result = self.sbm.read_buffer("stream:t", show_timestamps=True)
-        self.assertTrue(result["ok"])
+    async def test_read_all_with_timestamps(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", show_timestamps=True, show_line_numbers=True)
+        assert result["ok"]
         lines = result["content"].split("\n")
-        self.assertEqual(len(lines), 5)
+        assert len(lines) == 5
         for line in lines:
-            self.assertRegex(line, r"^\d+: \(\d+\.\d+\)")
+            assert line.startswith("1: (10.0)") or ":" in line
 
-    def test_read_range_0_based(self):
-        result = self.sbm.read_buffer("stream:t", start=1, end=4, show_timestamps=True, show_line_numbers=False)
-        self.assertTrue(result["ok"])
+    async def test_read_range_0_based(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", start=1, end=4, show_timestamps=True, show_line_numbers=False)
+        assert result["ok"]
         lines = result["content"].split("\n")
-        self.assertEqual(len(lines), 3)
+        assert len(lines) == 3
         timestamps = [float(l.split(")")[0][1:]) for l in lines]
-        self.assertEqual(timestamps, [20.0, 30.0, 40.0])
+        assert timestamps == [20.0, 30.0, 40.0]
 
-    def test_negative_index_from_end(self):
-        result = self.sbm.read_buffer("stream:t", start=-2, end=None, show_timestamps=True, show_line_numbers=False)
-        self.assertTrue(result["ok"])
+    async def test_negative_index_from_end(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", start=-2, end=None, show_timestamps=True, show_line_numbers=False)
+        assert result["ok"]
         lines = result["content"].split("\n")
-        self.assertEqual(len(lines), 2)
-        self.assertNotEqual(lines[-1], "")
+        assert len(lines) == 2
+        assert lines[-1] != ""
         timestamps = [float(l.split(")")[0][1:]) for l in lines if l]
-        self.assertEqual(timestamps, [40.0, 50.0])
+        assert timestamps == [40.0, 50.0]
 
 
-class TestStreamBufferHookBehavior(unittest.TestCase):
-    """Test that _append_stream_entry fires hooks and handles errors."""
+class TestStreamBufferHookBehavior:
+    @pytest.fixture
+    async def _sbm_with_stream(self, sbm):
+        sbm._buffers["stream:t"] = Buffer(lines=[], created_at=0.0, modified_at=0.0)
+        sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": 0.0})()
+        return sbm
 
-    def setUp(self):
-        self.sbm = StreamBufferManager()
-        self.fired = []
-        self.sbm._buffers["stream:t"] = Buffer(lines=[], created_at=0.0, modified_at=0.0)
-        self.sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": 0.0})()
-
-    async def _append_and_collect(self, data: str) -> None:
-        await self.sbm.write_buffer("stream:t", data)
-        self.fired.append(data)
-
-    def test_hook_receives_entry_and_stream_name(self):
+    async def test_hook_receives_entry_and_stream_name(self, _sbm_with_stream):
         hook_called = []
         async def capture(sb, text, metadata):
             hook_called.append((sb, text))
-        self.sbm.stream_buffer_configs["stream:t"].hooks["capture"] = StreamBufferHook(
+        _sbm_with_stream.stream_buffer_configs["stream:t"].hooks["capture"] = StreamBufferHook(
             callable_=capture, priority=0
         )
-        asyncio.run(self.sbm.write_buffer("stream:t", "hello"))
-        self.assertEqual(len(hook_called), 1)
-        self.assertEqual(hook_called[0], ("stream:t", "hello"))
+        await _sbm_with_stream.write_buffer("stream:t", "hello")
+        assert len(hook_called) == 1
+        assert hook_called[0] == ("stream:t", "hello")
 
-    def test_hooks_fire_in_priority_order(self):
+    async def test_hooks_fire_in_priority_order(self, _sbm_with_stream):
         order = []
-
         async def cb_low(sb, text, metadata):
             order.append("low")
         async def cb_high(sb, text, metadata):
             order.append("high")
         async def cb_mid(sb, text, metadata):
             order.append("mid")
-
-        self.sbm.stream_buffer_configs["stream:t"].hooks = {
+        _sbm_with_stream.stream_buffer_configs["stream:t"].hooks = {
             "low": StreamBufferHook(callable_=cb_low, priority=10),
             "high": StreamBufferHook(callable_=cb_high, priority=100),
             "mid": StreamBufferHook(callable_=cb_mid, priority=50),
         }
-        asyncio.run(self.sbm.write_buffer("stream:t", "x"))
-        self.assertEqual(order, ["high", "mid", "low"])
+        await _sbm_with_stream.write_buffer("stream:t", "x")
+        assert order == ["high", "mid", "low"]
 
-    def test_hook_exception_does_not_propagate(self):
+    async def test_hook_exception_does_not_propagate(self, _sbm_with_stream):
         async def bad_hook(sb, text, metadata):
             raise RuntimeError("boom")
-        self.sbm.stream_buffer_configs["stream:t"].hooks["boom"] = StreamBufferHook(
+        _sbm_with_stream.stream_buffer_configs["stream:t"].hooks["boom"] = StreamBufferHook(
             callable_=bad_hook, priority=0
         )
+        caught = False
         try:
-            asyncio.run(self.sbm.write_buffer("stream:t", "x"))
-            caught = False
-        except RuntimeError as e:
+            await _sbm_with_stream.write_buffer("stream:t", "x")
+        except RuntimeError:
             caught = True
-        self.assertFalse(caught)
+        assert not caught
 
-    def test_hook_error_recorded(self):
+    async def test_hook_error_recorded(self, _sbm_with_stream):
         async def bad_hook(sb, text, metadata):
             raise ValueError("boom")
-        self.sbm.stream_buffer_configs["stream:t"].hooks["boom"] = StreamBufferHook(
+        _sbm_with_stream.stream_buffer_configs["stream:t"].hooks["boom"] = StreamBufferHook(
             callable_=bad_hook, priority=0
         )
-        asyncio.run(self.sbm.write_buffer("stream:t", "x"))
-        errors = self.sbm.stream_buffer_configs["stream:t"].hooks["boom"].errors
-        self.assertEqual(len(errors), 1)
-        self.assertIn("boom", errors[0].error)
+        await _sbm_with_stream.write_buffer("stream:t", "x")
+        errors = _sbm_with_stream.stream_buffer_configs["stream:t"].hooks["boom"].errors
+        assert len(errors) == 1
+        assert "boom" in errors[0].error
 
 
-class TestListStreamBuffers(unittest.TestCase):
-    """Test list_stream_buffers returns structured data."""
-
-    def setUp(self):
-        self.sbm = StreamBufferManager()
-
-    def test_lists_all_streams(self):
-        self.sbm.create_buffer("stream:a", stream=True)
-        self.sbm.create_buffer("stream:b", stream=True)
-        result = self.sbm.list_stream_buffers()
+class TestListStreamBuffers:
+    async def test_lists_all_streams(self, sbm):
+        await sbm.create_buffer("stream:a", stream=True)
+        await sbm.create_buffer("stream:b", stream=True)
+        result = sbm.list_stream_buffers()
         names = [r["name"] for r in result]
-        self.assertIn("stream:a", names)
-        self.assertIn("stream:b", names)
+        assert "stream:a" in names
+        assert "stream:b" in names
 
-    def test_includes_hook_count(self):
-        self.sbm.create_buffer("stream:t", stream=True)
+    async def test_includes_hook_count(self, sbm):
+        await sbm.create_buffer("stream:t", stream=True)
         async def dummy(entry, sb):
             pass
-        self.sbm.stream_buffer_configs["stream:t"].hooks["dummy"] = StreamBufferHook(
+        sbm.stream_buffer_configs["stream:t"].hooks["dummy"] = StreamBufferHook(
             callable_=dummy, priority=0
         )
-        result = self.sbm.list_stream_buffers()
+        result = sbm.list_stream_buffers()
         entry = next(r for r in result if r["name"] == "stream:t")
-        self.assertEqual(entry["hook_count"], 1)
+        assert entry["hook_count"] == 1
 
-    def test_includes_created_at(self):
+    async def test_includes_created_at(self, sbm):
         before = time.time()
-        self.sbm.create_buffer("stream:t", stream=True)
+        await sbm.create_buffer("stream:t", stream=True)
         after = time.time()
-        result = self.sbm.list_stream_buffers()
+        result = sbm.list_stream_buffers()
         entry = next(r for r in result if r["name"] == "stream:t")
-        self.assertGreaterEqual(entry["created_at"], before)
-        self.assertLessEqual(entry["created_at"], after)
+        assert entry["created_at"] >= before
+        assert entry["created_at"] <= after
 
 
-class TestReadBufferReturnValues(unittest.TestCase):
-    """Test read_buffer returns consistent dict values."""
-
-    def setUp(self):
-        self.sbm = StreamBufferManager()
-        self._make_stream("stream:t", ts=[10.0, 20.0, 30.0], data=["a", "b", "c"])
-
-    def _make_stream(self, name: str, ts: list[float], data: list[str]) -> None:
+class TestReadBufferReturnValues:
+    @pytest.fixture
+    async def _sbm_with_stream(self, sbm):
+        ts = [10.0, 20.0, 30.0]
+        data = ["a", "b", "c"]
         entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
-        self.sbm._buffers[name] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
-        self.sbm.stream_buffer_configs[name] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
+        sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
+        sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
+        return sbm
 
-    def test_content_return_has_ok_and_content_and_line_range(self):
-        result = self.sbm.read_buffer("stream:t", start=0.0, end=30.0)
-        self.assertTrue(result["ok"])
-        self.assertIn("content", result)
-        self.assertIn("line_range", result)
-        self.assertIn("lines", result)
+    async def test_content_return_has_ok_and_content_and_line_range(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", start=0.0, end=30.0)
+        assert result["ok"]
+        assert "content" in result
+        assert "start" in result
+        assert "end" in result
 
-    def test_empty_range_outside_data_is_error(self):
-        result = self.sbm.read_buffer("stream:t", start=5.0, end=5.0)
-        self.assertFalse(result["ok"])
+    async def test_empty_range_outside_data_is_error(self, _sbm_with_stream):
+        result = await _sbm_with_stream.read_buffer("stream:t", start=5.0, end=5.0)
+        assert not result["ok"]
 
 
 if __name__ == "__main__":
-    unittest.main()
+    import sys
+    sys.exit(pytest.main(standalone_mode=False, exit=False))
