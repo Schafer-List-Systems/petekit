@@ -5,7 +5,23 @@ import json
 
 import jsonpatch
 
-from petekit.text.buffer_manager import Buffer, UpdateHook
+from petekit.text.buffer_manager import Buffer, UpdateHook, _resolve_line_range
+
+
+def _describe_write_scenario(buf: Buffer, start: int, end: int | None) -> str:
+    total = len(buf.lines)
+    resolved = _resolve_line_range(total, start, end)
+    if isinstance(resolved, dict):
+        return "You wrote an unknown range."
+    resolved_start, resolved_end = resolved
+    if resolved_start >= total:
+        return "You appended new text at the end of the buffer."
+    if resolved_start == 0 and resolved_end >= total:
+        return "You replaced the entire buffer."
+    if resolved_start < resolved_end:
+        boundary = buf.lines[resolved_start].data if resolved_start < total else ""
+        return f"You replaced lines {resolved_start}–{resolved_end - 1} in the buffer (overwritten text started: {boundary!r})."
+    return f"You inserted text at line {resolved_start}."
 
 
 def make_json_codec(inner: Callable[..., bool | str]) -> UpdateHook:
@@ -34,7 +50,11 @@ def make_json_codec(inner: Callable[..., bool | str]) -> UpdateHook:
             try:
                 new_json = json.loads(full_new)
             except json.JSONDecodeError as e:
-                return f"new text is not valid JSON: {e.msg} at line {e.lineno}, char {e.colno}"
+                scenario = _describe_write_scenario(buf, start, end)
+                return (
+                    f"{scenario}\n"
+                    f"The resulting text is not valid JSON: {e.msg} at line {e.lineno}, char {e.colno}"
+                )
 
         # Compute the RFC 6906 JSON Patch diff between the two parsed structures.
         patch = jsonpatch.make_patch(old_json, new_json)
