@@ -522,11 +522,11 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         fire_due_to_batch = bool(unseen) and len(unseen) >= cfg.batch_size
         fire_due_to_interval = cfg.interval_secs is not None and cfg._last_fired > 0 and (now - cfg._last_fired >= cfg.interval_secs) and (bool(unseen) or cfg.notify_on_empty)
 
-        # Record fire time.
-        cfg._last_fired = now
-
         if not fire_due_to_batch and not fire_due_to_interval:
             return
+
+        # Record fire time.
+        cfg._last_fired = now
 
         # Build notification prompt from unseen entries or last known entry.
         if unseen:
@@ -561,7 +561,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
                 )
 
         task = asyncio.create_task(
-            self.invoke_agent(prompt, persistent_thread_id=cfg.persistent_thread_id)
+            self.invoke_agent(prompt, persistent_thread_id=cfg.persistent_thread_id, timeout=30.0)
         )
         task.add_done_callback(_on_notification_done)
 
