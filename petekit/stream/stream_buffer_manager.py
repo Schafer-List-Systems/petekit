@@ -211,7 +211,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
     async def read_buffer(self, name: str, start: int | float = 0, end: int | float | None = None, show_timestamps: bool = False, show_line_numbers: bool = False, raw: bool = False) -> dict[str, Any] | str:
         """Read a range of lines from a buffer.
         Omit start to read from the beginning; omit end to read to the last line.
-        Float values trigger time-based reading on stream buffers (int for line-based).
+        Integer values trigger line-based reading; float values trigger time-based reading on stream buffers (Unix epoch: timestamp 0.0 is 1970).
         Negative floats (e.g. start=-60.0) are relative to the last entry: -60.0 means '60s ago'.
         Set show_timestamps=True to prefix each line with its timestamp.
         Set show_line_numbers=True to prefix each line with its 0-based line index.
