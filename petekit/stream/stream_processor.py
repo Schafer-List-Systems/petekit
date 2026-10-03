@@ -549,21 +549,11 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         for entry in unseen:
             entry.agent_at = now
 
-        # Fire-and-forget: invoke agent without waiting so the notifier loop stays responsive.
-        # Errors from the agent are logged via done callback; errors writing to feedback are ignored.
-        def _on_notification_done(t: asyncio.Task) -> None:
-            exc = t.exception()
-            if exc:
-                asyncio.get_running_loop().call_soon_threadsafe(
-                    lambda: asyncio.create_task(
-                        self.write_buffer("stream:processor:feedback", f"NOTIFICATION ERROR: {exc}")
-                    )
-                )
-
-        task = asyncio.create_task(
-            self.invoke_agent(prompt, persistent_thread_id=cfg.persistent_thread_id, timeout=30.0)
-        )
-        task.add_done_callback(_on_notification_done)
+        # Fire-and-forget: inject the notification directly into the parked runner.
+        try:
+            await self.notify_agent(prompt, persistent_thread_id=cfg.persistent_thread_id)
+        except Exception as exc:
+            await self.write_buffer("stream:processor:feedback", f"NOTIFICATION ERROR: {exc}")
 
     async def _refresh_notification_configs_buffer(self) -> dict[str, Any]:
         """Refresh the system:list:notification_configs buffer."""
