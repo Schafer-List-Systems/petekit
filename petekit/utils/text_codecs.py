@@ -20,7 +20,7 @@ def _describe_write_scenario(buf: Buffer, start: int, end: int | None) -> str:
         return "You replaced the entire buffer."
     if resolved_start < resolved_end:
         boundary = buf.lines[resolved_start].data if resolved_start < total else ""
-        return f"You replaced lines {resolved_start}–{resolved_end - 1} in the buffer (overwritten text started: {boundary!r})."
+        return f"You replaced lines {resolved_start}–{resolved_end - 1} in the buffer (overwritten text started with: {boundary!r})."
     return f"You inserted text at line {resolved_start}."
 
 

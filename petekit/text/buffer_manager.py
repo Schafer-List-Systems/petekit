@@ -630,6 +630,10 @@ class BufferManager(AgenticObject):
             return resolved
         lo, hi = resolved
 
+        # Guard: empty range — agent requested a range that resolves to no lines.
+        if lo == hi:
+            return {"ok": False, "error": f"The range you specified is empty (start=end={lo}). Nothing was replaced."}
+
         # Extract the target segment text and collect its entries.
         segment_entries = buf.lines[lo:hi]
         segment_text = "\n".join(e.data for e in segment_entries) + "\n"

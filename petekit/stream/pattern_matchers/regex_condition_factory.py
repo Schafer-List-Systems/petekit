@@ -16,28 +16,55 @@ from ...utils.text_formatters import format_dict_list_for_buffer
 _CONDITION_LIST_BUFFER = "system:list:regex_conditions"
 _REGEX_DOC_BUFFER = "doc:regex"
 
+
+def _diff_keys(old: dict, new: dict) -> tuple[set[str], set[str], set[str]]:
+    # Compute which keys were added, removed, or changed between two dictionaries.
+    removed = set(old.keys()) - set(new.keys())
+    added = set(new.keys()) - set(old.keys())
+    changed = {k for k in set(old.keys()) & set(new.keys()) if old[k] != new[k]}
+    return (added, removed, changed)
+
 _REGEX_DOC = """\
 ## Schema
 
-system:list:regex_conditions  — catalog of all condition descriptors (JSON list)
-    [{"name": "...", "buffer": "regex:...", "patterns": N}, ...]
+system:list:regex_conditions  — catalog of all condition descriptors (JSON)
+    {
+        "conditions": {
+            "<condition_name>": {
+                "buffer": "regex:<condition_name>",
+                "patterns": N
+            }
+        }
+    }
 
-regex:<condition_name>        — per-condition pattern store (JSON)
-    {"name": "<name>", "patterns": [{"pattern": "<regex>", "sample_line": "..."}]}
+regex:<condition_name>        — per-condition pattern dictionary (JSON)
+    {
+        "name": "<name>",
+        "patterns": {
+            "<pattern_name>": {
+                "regex": "<regex>",
+                "sample_line": "..."
+            }
+        }
+    }
 
 ## Usage
 
 A condition evaluates to True when the incoming text matches ANY of its patterns
 using fullmatch semantics — the entire line must match (^...$).
 
-Update the system:list:regex_conditions buffer to add an empty RegEx condition:
-  {"name": "<name>", "config_buffer": "regex:<name>"}
+To add a condition, add an entry to the conditions dictionary in the condition buffer:
+    "conditions": {"<condition_name>": {"buffer": "regex:<condition_name>"}}
+- The buffer name defaults to regex:<condition_name> if omitted — an empty dict auto-provisions it.
+- The regex:<condition_name> buffer is created automatically!
 
-The factory automatically provisions the regex:<name> buffer on successful addition.
+To remove a condition, remove its entry from the conditions dictionary.
 
-Update the regex:<name> buffer to add/update a pattern to a RegEx condition:
-  {"pattern": "<regex>", "sample_line": "<example>"}
-  The pattern is validated against sample_line immediately — a mismatch is rejected.
+To add or update a pattern in the pattern dictionary of regex:<condition_name>, write an entry:
+    "<pattern_name>": {"regex": "<regex>", "sample_line": "<example>"}
+    The regex is validated against sample_line immediately — a mismatch is rejected.
+
+To remove a pattern, remove its entry from the pattern dictionary.
 """
 
 PatternId: type = int
@@ -70,51 +97,6 @@ def _condition_buffer_name(condition_name: str) -> str:
     return f"regex:{condition_name}"
 
 
-def _list_conditions(registry: dict[str, RegexCondition]) -> list[dict]:
-    # Serialize the condition registry into discoverable summary records for the agent.
-    return [
-        {
-            "name": name,
-            "buffer": _condition_buffer_name(name),
-            "patterns": len(cond._patterns),
-        }
-        for name, cond in registry.items()
-    ]
-
-
-def _refresh_conditions_buffer(factory, registry: dict) -> dict[str, Any]:
-    # Persist the condition registry summary into the system:list:regex_conditions buffer.
-    return factory.create_buffer(
-        _CONDITION_LIST_BUFFER,
-        text=format_dict_list_for_buffer(_list_conditions(registry)),
-        overwrite=True,
-    )
-
-
-def _refresh_condition_buffer(factory, registry: dict, condition_name: str) -> dict[str, Any]:
-    # Guard: reject unknown condition names to keep the agent-facing view consistent.
-    cond = registry.get(condition_name)
-    if cond is None:
-        return {"ok": False, "error": f"condition '{condition_name}' not found"}
-    
-    # Serialize the RegexCondition state into JSON for agent inspection.
-    import json
-    patterns = [
-        {"id": p.id, "pattern": p.pattern.pattern, "sample_line": p.sample_line}
-        for p in cond._patterns.values()
-    ]
-    text = json.dumps({"name": condition_name, "patterns": patterns}, indent=2)
-    return factory.create_buffer(_condition_buffer_name(condition_name), text=text, overwrite=True)
-
-
-def _parse_condition_index(path: str) -> int:
-    # Extract the integer index from a condition-level patch path like "/conditions/0".
-    if not path.startswith("/conditions/"):
-        raise ValueError(f"path '{path}' does not reference a condition")
-    idx_str = path[len("/conditions/"):].split("/")[0]
-    return int(idx_str)
-
-
 def _condition_closure(config_buffer: str, read_buffer_fn: callable) -> callable:
     # Build a closure that reads the named config buffer and fullmatches text against all patterns.
     def condition(stream: str, text: str, metadata: dict) -> bool:
@@ -126,37 +108,46 @@ def _condition_closure(config_buffer: str, read_buffer_fn: callable) -> callable
             data = json.loads(read_result["content"])
         except json.JSONDecodeError:
             return False
-        for pat in data.get("patterns", []):
-            compiled = re.compile(pat.get("pattern", ""))
+
+        # Iterate over pattern entry values — patterns is now a dict keyed by pattern name.
+        for pat in data.get("patterns", {}).values():
+            compiled = re.compile(pat.get("regex", ""))
             if compiled.fullmatch(text):
                 return True
+
         return False
+
     return condition
 
 
 def _guard_pattern_value(op_type: str, value) -> re.Pattern | str:
-    # Validate that value is a dict with 'pattern' and 'sample_line'; compile and validate the pattern.
-    # Returns the compiled re.Pattern on success, or an error string on any failure.
-    if not isinstance(value, dict) or "pattern" not in value:
-        return f"pattern {op_type} must supply a dict with 'pattern' key, got: {type(value).__name__} — see doc:regex"
+    # Reject non-dict values and values missing the required 'regex' key.
+    if not isinstance(value, dict) or "regex" not in value:
+        return f"regex {op_type} must supply a dict with 'regex' key, got: {type(value).__name__} — see doc:regex"
+
+    # Reject entries missing 'sample_line' — validation requires a sample to test against.
     if "sample_line" not in value:
-        return f"pattern {op_type} must supply 'sample_line' — the pattern cannot be validated without a sample — see doc:regex"
-    validation = _validate_pattern_against_sample(value["pattern"], value["sample_line"])
+        return f"regex {op_type} must supply 'sample_line' — the regex cannot be validated without a sample — see doc:regex"
+
+    # Validate the regex against its sample_line; propagate validation errors upward.
+    validation = _validate_pattern_against_sample(value["regex"], value["sample_line"])
     if isinstance(validation, str):
         return f"{validation} — see doc:regex"
+
     return validation
 
 
 def _validate_pattern_against_sample(pattern: str, sample_line: str) -> re.Pattern | str:
-    # Fail-fast: compile the pattern first so a SyntaxError is caught before matching.
+    # Compile the pattern first to catch SyntaxErrors early.
     try:
         compiled = re.compile(pattern)
     except re.error as e:
         return f"invalid regex in pattern: {e.msg} at position {e.pos}"
 
-    # Guard: the pattern must fullmatch the entire sample_line — partial matches are rejected.
+    # Reject the pattern if it does not fullmatch the entire sample_line.
     m = compiled.fullmatch(sample_line)
     if m is None:
+        # Return a clear error so the agent knows what went wrong.
         return (
             f"sample_line does not match pattern '{pattern}'. "
             f"Match failed — pattern did not match the entire line.\n"
@@ -169,70 +160,108 @@ def _validate_pattern_against_sample(pattern: str, sample_line: str) -> re.Patte
 
 
 def _pattern_update_hook(factory, buf, old_json: dict, new_json: dict, patch) -> bool | str:
-    # Walk each patch operation and dispatch pattern add/remove/replace within a condition's config buffer.
-    # Only /patterns patches are accepted. The buffer name encodes the condition name.
-    try:
-        for op in patch:
-            op_type = op.get("op")
-            path = op.get("path", "")
-            value = op.get("value")
+    # Compute the diff between old and new patterns to find which are added, removed, or changed.
+    added, removed, changed = _diff_keys(
+        old_json.get("patterns", {}),
+        new_json.get("patterns", {}),
+    )
 
-            # Guard: reject any patch targeting a non-pattern path.
-            if not path.startswith("/patterns"):
-                return f"unsupported patch path: {path} — only /patterns/* is allowed"
+    # Collect all touched pattern names - skipping validation for removals
+    touched_patterns = added | changed
 
-            # Dispatch by operation type.
-            if op_type == "add":
-                validation = _guard_pattern_value("add", value)
-                if isinstance(validation, str):
-                    return validation
+    # Validate each touched pattern against its sample_line in the new state.
+    patterns = new_json.get("patterns", {})
+    for name in sorted(touched_patterns):
+        pattern_entry = patterns.get(name)
 
-            elif op_type == "replace":
-                validation = _guard_pattern_value("replace", value)
-                if isinstance(validation, str):
-                    return validation
-
-            elif op_type == "remove":
-                # Removals are always safe — the list preserves valid patterns.
-                continue
-
-            else:
-                return f"unsupported patch operation: {op_type} — see doc:regex"
-
-    except Exception as e:
-        return str(e)
+        # Reject the patch if the regex does not match its sample_line.
+        validation = _guard_pattern_value("replace", pattern_entry)
+        if isinstance(validation, str):
+            return validation
 
     return True
 
 
-async def _factory_update_hook(factory, buf, old_json: dict, new_json: dict, patch) -> bool | str:
-    # Walk each patch operation and dispatch to its handler.
-    # A malformed path or out-of-range index rejects the entire batch in one exception.
-    try:
-        for op in patch:
-            op_type = op.get("op")
-            path = op.get("path", "")
-            value = op.get("value")
+async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: dict, patch) -> bool | str:
+    # Compute the diff between old and new conditions to find which are added, removed, or changed.
+    added, removed, changed = _diff_keys(
+        old_json.get("conditions", {}),
+        new_json.get("conditions", {}),
+    )
 
-            if op_type == "add":
-                idx = _parse_condition_index(path)
-                result = await factory._handle_add(idx, value)
+    # Collect all touched condition names and track their intent.
+    touched_conditions: set[str] = added | removed | changed
 
-            elif op_type == "replace":
-                return "conditions list entries are immutable — drop and re-add to replace"
+    # Determine whether each touched condition is an add or a remove by consulting the new state.
+    # Dispatch add or remove accordingly so the final state drives the decision.
+    conditions = new_json.get("conditions", {})
+    for name in sorted(touched_conditions):
+        # Add if present in new state
+        if name in added:
+            # Resolve the config buffer name from the entry, defaulting to regex:{name} if omitted.
+            entry = conditions[name]
+            if not isinstance(entry, dict):
+                return f"condition '{name}' must be a dict, got: {type(entry).__name__}"
+            config_buffer = entry.get("buffer")
+            if not config_buffer:
+                config_buffer = _condition_buffer_name(name)
 
-            elif op_type == "remove":
-                idx = _parse_condition_index(path)
-                result = await factory._handle_remove(idx)
+            # Provision the config buffer with an empty patterns list.
+            import json
+            init_content = json.dumps({"name": name, "patterns": {}}) + "\n"
+            create_result = await factory.create_buffer(config_buffer, text=init_content)
+            if not create_result.get("ok"):
+                return (
+                    f"condition '{name}' could not be created due to a cascading error "
+                    f"when creating its config buffer: "
+                    f"{create_result.get('error', 'unknown error when creating its config buffer')}"
+                )
 
-            else:
-                result = f"unsupported patch operation: {op_type}"
+            # Register the pattern management update hook on the new config buffer.
+            hook_result = factory.register_buffer_update_hook(
+                config_buffer,
+                "factory",
+                make_json_codec(
+                    lambda buf, old_json, new_json, patch: _pattern_update_hook(
+                        factory, buf, old_json, new_json, patch
+                    )
+                ),
+            )
+            if not hook_result.get("ok"):
+                return (
+                    f"condition '{name}' could not be added: "
+                    f"pattern hook could not be registered on '{config_buffer}': "
+                    f"{hook_result.get('error')}"
+                )
 
-            if result is not True:
-                return result
+            # Create and register the condition closure so the routing table can evaluate it by name.
+            condition_fn = _condition_closure(config_buffer, factory._read_buffer)
+            func_result = await factory.create_function(
+                name=name,
+                callable=condition_fn,
+                short_description=f"matches lines against patterns in '{config_buffer}'",
+                long_description=(
+                    f"Evaluates the incoming text against all regex patterns registered in '{config_buffer}'. "
+                    f"All patterns must fullmatch for this condition to return True."
+                ),
+            )
+            if not func_result.get("ok"):
+                return f"condition '{name}' could not be added: {func_result.get('error')}"
 
-    except Exception as e:
-        return str(e)
+        # Remove — the condition is absent from the new state.
+        elif name in removed:
+            # Remove — the condition is absent from the new state.
+            # Resolve the actual buffer name from the old state in case a custom buffer was used.
+            old_entry = old_json.get("conditions", {}).get(name, {})
+            buf_name = old_entry.get("buffer") or _condition_buffer_name(name)
+
+            # Drop the function and its config buffer — the condition is being removed.
+            drop_fn_result = await factory.drop_function(name)
+            if not drop_fn_result.get("ok"):
+                return f"condition '{name}' could not be removed: {drop_fn_result.get('error')}"
+            drop_buf_result = await factory.drop_buffer(buf_name)
+            if not drop_buf_result.get("ok"):
+                return f"condition '{name}' could not be removed: {drop_buf_result.get('error')}"
 
     return True
 
@@ -248,7 +277,7 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
         import json
         cond_result = self._create_buffer(
             _CONDITION_LIST_BUFFER,
-            text=json.dumps({"conditions": []}) + "\n",
+            text=json.dumps({"conditions": {}}) + "\n",
         )
         if not cond_result.get("ok"):
             raise RuntimeError(f"failed to create condition list buffer: {cond_result.get('error')}")
@@ -258,7 +287,7 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
             _CONDITION_LIST_BUFFER,
             "factory",
             make_json_codec(
-                lambda buf, old_json, new_json, patch: _factory_update_hook(
+                lambda buf, old_json, new_json, patch: _condition_list_update_hook(
                     self, buf, old_json, new_json, patch
                 )
             ),
@@ -273,27 +302,47 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
         # Validate the incoming value is a dict with name and config_buffer keys.
         # Reject early if the shape does not match what the factory needs to provision the condition.
         if not isinstance(value, dict):
-            return f"conditions list entry must be a dict with keys 'name' (string) and 'config_buffer' (string), got: {type(value).__name__}"
+            return (
+                f"conditions list entry must be a dict "
+                f"with keys 'name' (string) and 'config_buffer' (string), "
+                f"got: {type(value).__name__}"
+            )
         name = value.get("name")
         config_buffer = value.get("config_buffer")
         if not name or not config_buffer:
-            return f"conditions list entries must be objects with 'name' and 'config_buffer' keys. Got: {value}"
+            return (
+                f"conditions list entries must be objects "
+                f"with 'name' and 'config_buffer' keys. "
+                f"Got: {value}"
+            )
 
         # Provision the config buffer with an empty patterns list.
         import json
-        init_content = json.dumps({"name": name, "patterns": []}) + "\n"
+        init_content = json.dumps({"name": name, "patterns": {}}) + "\n"
         create_result = await self.create_buffer(config_buffer, text=init_content)
         if not create_result.get("ok"):
-            return f"condition '{name}' could not be created due to a cascading error when creating its config buffer: {create_result.get('error', 'unknown error when creating its config buffer')}"
+            return (
+                f"condition '{name}' could not be created due to a cascading error "
+                f"when creating its config buffer: "
+                f"{create_result.get('error', 'unknown error when creating its config buffer')}"
+            )
 
         # Register the pattern management update hook on the new config buffer.
         hook_result = self.register_buffer_update_hook(
             config_buffer,
             "factory",
-            make_json_codec(lambda buf, old_json, new_json, patch: _pattern_update_hook(self, buf, old_json, new_json, patch)),
+            make_json_codec(
+                lambda buf, old_json, new_json, patch: _pattern_update_hook(
+                    self, buf, old_json, new_json, patch
+                )
+            ),
         )
         if not hook_result.get("ok"):
-            return f"condition '{name}' could not be added: pattern hook could not be registered on '{config_buffer}': {hook_result.get('error')}"
+            return (
+                f"condition '{name}' could not be added: "
+                f"pattern hook could not be registered on '{config_buffer}': "
+                f"{hook_result.get('error')}"
+            )
 
         # Create and register the condition closure so the routing table can evaluate it by name.
         condition_fn = _condition_closure(config_buffer, self._read_buffer)
@@ -443,7 +492,7 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
     #    return [
     #        {
     #            "id": rp.id,
-    #            "pattern": rp.pattern.pattern,
+    #            "regex": rp.pattern.pattern,
     #            "sample_line": rp.sample_line,
     #        }
     #        for rp in group.values()

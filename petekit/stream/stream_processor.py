@@ -520,7 +520,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
 
         # Determine if notification should fire: batch threshold met OR interval elapsed since last fire.
         fire_due_to_batch = bool(unseen) and len(unseen) >= cfg.batch_size
-        fire_due_to_interval = cfg.interval_secs is not None and cfg._last_fired > 0 and (now - cfg._last_fired >= cfg.interval_secs) and (bool(unseen) or cfg.notify_on_empty)
+        fire_due_to_interval = cfg.interval_secs is not None and (now - cfg._last_fired >= cfg.interval_secs) and (bool(unseen) or cfg.notify_on_empty)
 
         if not fire_due_to_batch and not fire_due_to_interval:
             return
