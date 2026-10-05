@@ -4,13 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "petekit"
-version = "0.3.7"
+version = "0.3.8"
 description = "PeteOS Kit — agentic building blocks for streams, text, and images"
 requires-python = ">=3.10"
 dependencies = [
     "peteos",
     "diff-match-patch",
     "jsonpatch",
+    "mss",
+    "pytest",
+    "pytest-asyncio",
+    "setuptools",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "beautifulsoup4",
+    "lxml"
+
 ]
 
 [project.optional-dependencies]
