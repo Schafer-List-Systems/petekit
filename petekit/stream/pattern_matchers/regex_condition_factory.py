@@ -32,7 +32,7 @@ system:list:regex_conditions  — catalog of all condition descriptors (JSON)
         "conditions": {
             "<condition_name>": {
                 "buffer": "regex:<condition_name>",
-                "patterns": N
+                "pattern_count": N
             }
         }
     }
@@ -160,6 +160,19 @@ def _validate_pattern_against_sample(pattern: str, sample_line: str) -> re.Patte
 
 
 def _pattern_update_hook(factory, buf, old_json: dict, new_json: dict, patch) -> bool | str:
+    # Guard: new_json is None when drop_buffer fires hooks before deleting the buffer.
+    # Use the buffer's name to derive the condition name and check whether the authorized
+    # cascade is running: if the condition still exists in factory._conditions, the agent
+    # tried an unauthorized direct delete and must be blocked.
+    if new_json is None:
+        condition_name = buf.name.replace("regex:", "", 1)
+        if condition_name in factory._conditions:
+            return (
+                f"Cannot delete the pattern buffer for '{condition_name}' directly. "
+                f"Remove the condition from system:list:regex_conditions instead."
+            )
+        return True
+
     # Compute the diff between old and new patterns to find which are added, removed, or changed.
     added, removed, changed = _diff_keys(
         old_json.get("patterns", {}),
@@ -178,6 +191,33 @@ def _pattern_update_hook(factory, buf, old_json: dict, new_json: dict, patch) ->
         validation = _guard_pattern_value("replace", pattern_entry)
         if isinstance(validation, str):
             return validation
+
+    # Refresh the conditions listing buffer so that pattern counts stay current.
+    # To that, we read the buffer as the source of truth.
+    import json
+    read_result = factory._read_buffer(_CONDITION_LIST_BUFFER)
+    if not read_result.get("ok"):
+        return f"conditions buffer could not be read: {read_result.get('error')} — the conditions buffer '{_CONDITION_LIST_BUFFER}' may have been deleted or is inaccessible"
+    try:
+        data = json.loads(read_result["content"])
+    except json.JSONDecodeError as e:
+        return f"conditions buffer is not valid JSON: {e.msg} — expected a JSON object with a 'conditions' key in '{_CONDITION_LIST_BUFFER}'"
+
+    # Update only the affected entry, write back.
+    conditions = data.get("conditions", {})
+    condition_name = new_json.get("name")
+    if condition_name and condition_name in conditions:
+        conditions[condition_name]["pattern_count"] = len(new_json.get("patterns", {}))
+        data["conditions"] = conditions
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(factory.create_buffer(
+                _CONDITION_LIST_BUFFER,
+                text=json.dumps(data, indent=2) + "\n",
+                overwrite=True,
+            ))
+        except Exception:
+            pass  # best-effort: non-critical bookkeeping update
 
     return True
 

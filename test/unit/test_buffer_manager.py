@@ -75,6 +75,7 @@ class TestEditBufferTimestampSemantics:
             ts = timestamps[i] if timestamps and i < len(timestamps) else now
             entries.append(BufferEntry(data=line, modified_at=ts))
         bm._buffers["t"] = Buffer(
+            name="t",
             lines=entries,
             created_at=now,
             modified_at=now,
@@ -169,6 +170,7 @@ class TestEditBufferTimestampSemantics:
 
     async def test_empty_buffer_replace(self, bm):
         bm._buffers["t"] = Buffer(
+            name="t",
             lines=[],
             created_at=0.0,
             modified_at=0.0,
@@ -243,6 +245,7 @@ class TestEditBufferScopedRange:
             ts = timestamps[i] if timestamps and i < len(timestamps) else now
             entries.append(BufferEntry(data=line, modified_at=ts))
         bm._buffers["t"] = Buffer(
+            name="t",
             lines=entries,
             created_at=now,
             modified_at=now,

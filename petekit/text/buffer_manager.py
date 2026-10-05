@@ -208,6 +208,7 @@ class BufferEntry:
 @dataclass
 class Buffer:
     """A buffer holding a list of line entries with creation and modification timestamps."""
+    name: str
     lines: list[BufferEntry]
     created_at: float
     modified_at: float
@@ -327,7 +328,7 @@ class BufferManager(AgenticObject):
         Used by __init__ and constructors — not for agent-facing operations.
         """
         ts = time.time()
-        self._buffers[name] = Buffer(lines=[], created_at=ts, modified_at=ts)
+        self._buffers[name] = Buffer(name=name, lines=[], created_at=ts, modified_at=ts)
         lines = 0
 
         if text:
@@ -393,7 +394,7 @@ class BufferManager(AgenticObject):
         src = self._buffers[source_name]
         now = time.time()
         new_entries = [BufferEntry(data=e.data, modified_at=e.modified_at, object_at=now) for e in src.lines]
-        self._buffers[target_name] = Buffer(lines=new_entries, created_at=now, modified_at=now)
+        self._buffers[target_name] = Buffer(name=target_name, lines=new_entries, created_at=now, modified_at=now)
         if target_name != "system:list:buffers":
             refresh_result = await self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):

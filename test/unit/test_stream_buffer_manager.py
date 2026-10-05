@@ -67,7 +67,7 @@ class TestStreamBufferReadBufferTimeBased:
         ts = [10.0, 20.0, 30.0, 40.0, 50.0]
         data = ["a", "b", "c", "d", "e"]
         entries = [BufferEntry(data=d, modified_at=t) for t, d in zip(ts, data)]
-        sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
+        sbm._buffers["stream:t"] = Buffer(name="stream:t", lines=entries, created_at=ts[0], modified_at=ts[-1])
         sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
         return sbm
 
@@ -104,7 +104,7 @@ class TestStreamBufferReadBufferTimeBased:
         assert "No entries at or before" in result["error"]
 
     async def test_empty_buffer_error(self, _sbm_with_stream):
-        _sbm_with_stream._buffers["stream:empty"] = Buffer(lines=[], created_at=0.0, modified_at=0.0)
+        _sbm_with_stream._buffers["stream:empty"] = Buffer(name="stream:empty", lines=[], created_at=0.0, modified_at=0.0)
         _sbm_with_stream.stream_buffer_configs["stream:empty"] = type("C", (), {"hooks": [], "created_at": 0.0})()
         result = await _sbm_with_stream.read_buffer("stream:empty", start=0.0)
         assert not result["ok"]
@@ -123,7 +123,7 @@ class TestStreamBufferReadBufferRelativeTime:
         ts = [10.0, 20.0, 30.0, 40.0, 50.0]
         data = ["a", "b", "c", "d", "e"]
         entries = [BufferEntry(data=d, modified_at=t) for t, d in zip(ts, data)]
-        sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
+        sbm._buffers["stream:t"] = Buffer(name="stream:t", lines=entries, created_at=ts[0], modified_at=ts[-1])
         sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
         return sbm
 
@@ -174,7 +174,7 @@ class TestStreamBufferReadBufferLineBased:
         ts = [10.0, 20.0, 30.0, 40.0, 50.0]
         data = ["a", "b", "c", "d", "e"]
         entries = [BufferEntry(data=d, modified_at=t) for t, d in zip(ts, data)]
-        sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
+        sbm._buffers["stream:t"] = Buffer(name="stream:t", lines=entries, created_at=ts[0], modified_at=ts[-1])
         sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
         return sbm
 
@@ -207,7 +207,7 @@ class TestStreamBufferReadBufferLineBased:
 class TestStreamBufferHookBehavior:
     @pytest.fixture
     async def _sbm_with_stream(self, sbm):
-        sbm._buffers["stream:t"] = Buffer(lines=[], created_at=0.0, modified_at=0.0)
+        sbm._buffers["stream:t"] = Buffer(name="stream:t", lines=[], created_at=0.0, modified_at=0.0)
         sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": 0.0})()
         return sbm
 
@@ -299,7 +299,7 @@ class TestReadBufferReturnValues:
         ts = [10.0, 20.0, 30.0]
         data = ["a", "b", "c"]
         entries = [BufferEntry(data=d, modified_at=t) for t, d in zip(ts, data)]
-        sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
+        sbm._buffers["stream:t"] = Buffer(name="stream:t", lines=entries, created_at=ts[0], modified_at=ts[-1])
         sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
         return sbm
 
