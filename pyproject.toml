@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "petekit"
-version = "0.3.6"
+version = "0.3.7"
 description = "PeteOS Kit — agentic building blocks for streams, text, and images"
 requires-python = ">=3.10"
 dependencies = [
@@ -21,4 +21,4 @@ dev = ["pytest", "pytest-asyncio"]
 asyncio_mode = "auto"
 
 [tool.setuptools.packages.find]
-where = ["petekit"]
+include = ["petekit", "petekit.*"]
