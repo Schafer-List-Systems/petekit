@@ -652,6 +652,7 @@ class BufferManager(AgenticObject):
     async def edit_buffer(self, name: str, old_string: str, new_string: str, start: int = 0, end: int | str = "end", replace_all: bool = False) -> dict[str, Any]:
         """Replace old_string with new_string in the buffer content within a [start:end) range.
         Both old_string and new_string can span multiple lines.
+        To remove an entire line, remember to add the trailing new-line character '\n' at the end of `old_string`, i.e. `old_string="old line\n"`. Otherwise, you keep a blank line.
         Editing fails when old_string is found more than once. Set replace_all=True to replace ALL occurrences.
         """
         # Validate the named buffer exists.
