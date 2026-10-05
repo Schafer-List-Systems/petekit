@@ -134,6 +134,8 @@ def _cluster_lines_to_ranges(
 
     # Sum the char counts of two adjacent clusters plus the gap between them.
     def span_chars(start: int, end: int) -> int:
+        if buf_lines is _NO_BUFFER_:
+            return 0
         return sum(len(buf_lines[i].data) + 1 for i in range(start, end + 1))
 
     def neighbor_distance(i: int) -> int:
