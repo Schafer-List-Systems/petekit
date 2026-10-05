@@ -99,7 +99,7 @@ def _time_ref_to_line(buf: Buffer, ts_ref: float, anchor: float, mode: str = "st
 
     # Reject out-of-range timestamps: "start" mode cannot be past the last entry,
     # and "end" mode cannot be before the first entry.
-    if idx >= len(ts_list):
+    if mode != "end" and idx >= len(ts_list):
         raise ValueError(f"No entries at or after {_fmt_ts(resolved)}.")
     if idx < 1 and mode == "end":
         raise ValueError(f"No entries at or before {_fmt_ts(resolved)}.")
@@ -268,6 +268,10 @@ class StreamBufferManager(BufferManager, AgenticObject):
             return {"ok": False, "error": f"Buffer '{name}' is empty."}
 
         # Coerce the line references.
+        if end is None:
+            end = "end"
+        if start is None:
+            start = "end"
         start = parse_data(start, float | int | str)
         end = parse_data(end, float | int | str)
 

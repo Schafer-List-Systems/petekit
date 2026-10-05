@@ -349,17 +349,24 @@ class BufferManager(AgenticObject):
         ts = time.time()
         existed = name in self._buffers
 
-        # Gate overwrite through the existing buffer's drop hooks; a rejection blocks the replacement.
+        # Gate overwrite through the existing buffer's hooks; a rejection blocks the replacement.
         if existed:
             buf = self._buffers[name]
             old_text = "\n".join(e.data for e in buf.lines) + "\n"
-            hook_result = await buf._fire_update_hooks(old_text, 0, len(buf.lines), None)
+            hook_result = await buf._fire_update_hooks(old_text, 0, len(buf.lines), (text + "\n") if text else "\n")
             if hook_result is not True and hook_result is not None:
                 return {"ok": False, "error": str(hook_result)}
 
+            # Overwrite the buffer's content in place, preserving the buffer object and its
+            # registered update hooks so that they survive across create_buffer overwrites.
+            buf.modified_at = ts
+            buf.lines = [BufferEntry(data=line, modified_at=ts, object_at=ts) for line in (text.splitlines() if text else [])]
+            create_result = {"ok": True, "lines": len(buf.lines)}
+
         # Create a fresh Buffer with no lines and the current timestamp; it starts with zero hooks.
         # Delegated to protected creation — hooks are not fired here.
-        create_result = self._create_buffer(name, text)
+        else:
+            create_result = self._create_buffer(name, text)
 
         # Refresh the system buffer listing so the new buffer is visible to the agent.
         if name != "system:list:buffers":

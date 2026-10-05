@@ -6,7 +6,7 @@ import asyncio
 import time
 import pytest
 
-from petekit.stream.stream_buffer_manager import StreamBufferManager, StreamBufferHook, StreamBufferHookError
+from petekit.stream.stream_buffer_manager import StreamBufferManager, StreamBufferHook, StreamBufferHookError, _resolve_time
 from petekit.text.buffer_manager import Buffer, BufferEntry
 
 
@@ -49,15 +49,15 @@ class TestStreamBufferCreateDrop:
 
 class TestResolveTime:
     async def test_positive_passes_through(self, sbm):
-        result = sbm._resolve_time(123.456, anchor=200.0)
+        result = _resolve_time(123.456, anchor=200.0)
         assert result == 123.456
 
     async def test_negative_adds_to_anchor(self, sbm):
-        result = sbm._resolve_time(-30.0, anchor=100.0)
+        result = _resolve_time(-30.0, anchor=100.0)
         assert result == 70.0
 
     async def test_zero_is_absolute_not_relative(self, sbm):
-        result = sbm._resolve_time(-0.0, anchor=100.0)
+        result = _resolve_time(-0.0, anchor=100.0)
         assert result == -0.0
 
 
