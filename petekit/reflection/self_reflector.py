@@ -40,9 +40,9 @@ class SelfReflector(BufferManager, AgenticObject):
 
         # Populate sandbox buffer at construction time with hardcoded @sandbox/@tool methods
         sandbox_text = format_dict_list_for_buffer(self._self_reflection_catalog.hardcoded)
-        self.create_buffer("docs:reflect:sandbox", text=sandbox_text)
+        self._create_buffer("docs:reflect:sandbox", text=sandbox_text)
         if self._self_reflection_catalog.dynamic_functions:
-            self.create_buffer("docs:reflect:dynamic", text="[]")
+            self._create_buffer("docs:reflect:dynamic", text="[]")
             # TODO: Hook registration: attach_class after_tool_execution for define_function / remove_function to rebuild sandbox_api buffer
 
     def _self_reflection_on_tool_executed(self, runner: Runner, tc: ContentPart, status: ExecStatus, ok: bool) -> None:
