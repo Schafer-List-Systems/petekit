@@ -304,7 +304,7 @@ class BufferManager(AgenticObject):
     - Use (?i) at the start of a grep pattern for case-insensitive matching.
     - All timestamps are rounded to 6 decimals.
     - **Be efficient!** Read only as much as you need instead of the entire buffer!
-    - **Be carefule!** Read before you write! Don't delete managed buffers.
+    - **Be careful!** Read before you write! Don't delete managed buffers.
     """
 
     _MAX_CHUNK_CHARS = 8000
