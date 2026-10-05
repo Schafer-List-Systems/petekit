@@ -11,8 +11,9 @@ from typing import Any, Coroutine
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos import sandbox, tool
+from peteos.utils._schema import parse_data
 from ..utils.text_formatters import format_dict_list_for_buffer
-from ..text.buffer_manager import Buffer, BufferEntry, BufferManager
+from ..text.buffer_manager import Buffer, BufferEntry, BufferManager, _resolve_line_number
 
 
 @dataclass
@@ -53,6 +54,57 @@ def _fmt_ts(ts: float, round_up: bool = False) -> str:
         if rounded > ts:
             ts = rounded - 0.000001
     return f"{ts:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def _resolve_time(ts: float, anchor: float) -> float:
+    """Resolve a relative (negative) or absolute float timestamp to an absolute one.
+
+    Negative values are offsets from `anchor`. Positive values (including 0.0) are
+    returned unchanged."""
+    return anchor + ts if ts < 0 else ts
+
+
+def _time_ref_to_line(buf: Buffer, ts_ref: float, anchor: float, mode: str = "start") -> int:
+    """Convert a float timestamp reference to a line index.
+
+    Args:
+        buf: The buffer whose lines provide timestamps.
+        ts_ref: The timestamp reference (absolute or negative/relative).
+        anchor: The reference point for relative timestamps (usually last entry's modified_at).
+        mode: "start" for lower-bound (bisect_left), "end" for upper-bound (bisect_right).
+
+    Returns:
+        The line index into buf.lines.
+
+    Raises:
+        ValueError: If the timestamp is out of range for any buffer entry.
+    """
+    # Validate that the buffer has entries; empty buffers are out of range for any
+    # time-based query, so this is a hard error rather than a silent fallback.
+    if not buf.lines:
+        raise ValueError("Buffer has no entries.")
+
+    # Build a sorted timestamp list so that bisect can locate the index corresponding
+    # to the requested time reference.
+    ts_list = [e.modified_at for e in buf.lines]
+
+    # Resolve the timestamp, handling relative (negative) and absolute (positive)
+    # values against the given anchor point.
+    resolved = _resolve_time(ts_ref, anchor)
+
+    # Select the bisect function: left for "start" (lower bound), right for "end"
+    # (upper bound), then locate the index of the first entry at or past the time.
+    bisect_fn = bisect.bisect_left if mode == "start" else bisect.bisect_right
+    idx = bisect_fn(ts_list, resolved)
+
+    # Reject out-of-range timestamps: "start" mode cannot be past the last entry,
+    # and "end" mode cannot be before the first entry.
+    if idx >= len(ts_list):
+        raise ValueError(f"No entries at or after {_fmt_ts(resolved)}.")
+    if idx < 1 and mode == "end":
+        raise ValueError(f"No entries at or before {_fmt_ts(resolved)}.")
+
+    return idx
 
 
 class StreamBufferManager(BufferManager, AgenticObject):
@@ -200,13 +252,6 @@ class StreamBufferManager(BufferManager, AgenticObject):
         text = format_dict_list_for_buffer(records)
         return await self.create_buffer("system:list:stream_buffer_hooks", text=text, overwrite=True)
 
-    def _resolve_time(self, ts: float, anchor: float) -> float:
-        """Resolve a relative (negative) or absolute float timestamp to an absolute one.
-
-        Negative values are offsets from `anchor` (e.g. last entry timestamp or now).
-        Positive values (including 0.0) are absolute unix timestamps and are returned unchanged."""
-        return anchor + ts if ts < 0 else ts
-
     @tool
     async def read_buffer(self, name: str, start: int | float = 0, end: int | float | str = "end", show_timestamps: bool = False, show_line_numbers: bool = False, raw: bool = False) -> dict[str, Any] | str:
         """Read a range of lines from a buffer.
@@ -217,55 +262,62 @@ class StreamBufferManager(BufferManager, AgenticObject):
         Set show_line_numbers=True to prefix each line with its 0-based line index.
         Returns a dict with ok/error or ok/content on success.
         Set raw=True to get the raw string instead of a dict — errors always return dict."""
-        time_based = isinstance(start, float) or isinstance(end, float)
+        # Return early on empty buffers.
+        buf = self._buffers[name]
+        if not buf.lines:
+            return {"ok": False, "error": f"Buffer '{name}' is empty."}
 
+        # Coerce the line references.
+        start = parse_data(start, float | int | str)
+        end = parse_data(end, float | int | str)
+
+        # Time-based line references are only suppported on stream buffers, as they ensure ordered time stamps.
+        time_based = isinstance(start, float) or isinstance(end, float)
         if time_based and name not in self.stream_buffer_configs:
             return {"ok": False, "error": f"No stream named '{name}'. Only stream buffers support time-based reading."}
 
+        # Resolve time-based line-references.
         if time_based:
-            buf = self._buffers[name]
-            if not buf.lines:
-                return {"ok": False, "error": f"Buffer '{name}' is empty."}
             anchor = buf.lines[-1].modified_at
-            ts_list = [e.modified_at for e in buf.lines]
 
             if isinstance(start, float):
-                resolved_start = self._resolve_time(start, anchor)
-                start_idx = bisect.bisect_left(ts_list, resolved_start)
-                if start_idx >= len(ts_list):
-                    return {"ok": False, "error": f"No entries at or after {_fmt_ts(resolved_start)}."}
-                start = start_idx
+                try:
+                    start = _time_ref_to_line(buf, start, anchor, "start")
+                except ValueError as e:
+                    return {"ok": False, "error": str(e)}
 
             if isinstance(end, float):
-                resolved_end = self._resolve_time(end, anchor)
-                end_idx = bisect.bisect_right(ts_list, resolved_end)
-                if end_idx < 1:
-                    return {"ok": False, "error": f"No entries at or before {_fmt_ts(resolved_end)}."}
-                end = end_idx
+                try:
+                    end = _time_ref_to_line(buf, end, anchor, "end")
+                except ValueError as e:
+                    return {"ok": False, "error": str(e)}
 
             if not raw:
                 show_timestamps = True
 
+        # Read the buffer with the line number-based references.
         return await super().read_buffer(name, start=start, end=end, show_timestamps=show_timestamps, show_line_numbers=show_line_numbers, raw=raw)
 
     @tool
-    async def write_buffer(self, name: str, text: str, pos: int | float | str = "end") -> dict[str, Any]:
+    async def write_buffer(self, name: str, text: str, pos: int | str = "end") -> dict[str, Any]:
         """Write into an existing text buffer.
         Default: APPEND
         A trailing newline is always appended, i.e., an empty input creates a blank line in the buffer.
         Set pos to an integer (0-based line index) to insert at that position.
         Negative indices are relative to the end (Python array style).
-        Set pos to a float to use a time-based index on stream buffers.
         Negative time values are relative to the end.
         Stream buffers are append-only.
         """
+        # Ensure that pos=="end" on stream buffers, so we always append to them.
         if name in self.stream_buffer_configs and pos != "end":
             return {"ok": False, "error": f"Cannot write into the middle of stream '{name}'. Streams are append-only."}
 
+        # Do the Insert or Append-Operation.
         result = await super().write_buffer(name, text, pos=pos)
         if not result.get("ok") or not name in self.stream_buffer_configs:
             return result
         
+        # Notify stream hooks about the update.
         cfg = self.stream_buffer_configs.get(name)
         ordered = sorted(cfg.hooks.values(), key=lambda h: h.priority, reverse=True)
         for sh in ordered:
@@ -277,7 +329,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
             except Exception as e:
                 sh.errors.append(StreamBufferHookError(timestamp=time.time(), error=str(e)))
 
-        # return the result from the super().write_buffer() call
+        # Return the result from the super().write_buffer() call.
         return result
 
     @sandbox

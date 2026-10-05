@@ -231,7 +231,7 @@ class Buffer:
     def read(
         self,
         start: int = 0,
-        end: int | None = None,
+        end: int | str = "end",
         show_timestamps: bool = False,
         show_line_numbers: bool = True,
     ) -> ReadBufferResult:
