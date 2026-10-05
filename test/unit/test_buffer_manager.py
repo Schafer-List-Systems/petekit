@@ -449,19 +449,23 @@ class TestClusterLinesToRanges:
 
     def test_fewer_lines_than_clusters(self):
         result = _cluster_lines_to_ranges([1, 2, 3], 5)
-        assert result == [(1, 1, 1), (2, 2, 1), (3, 3, 1)]
+        assert result == [
+            {"start": 1, "end": 1, "match_count": 1},
+            {"start": 2, "end": 2, "match_count": 1},
+            {"start": 3, "end": 3, "match_count": 1},
+        ]
 
     def test_clusters_without_buf_lines_does_not_crash(self):
         result = _cluster_lines_to_ranges([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 3)
         assert len(result) == 3
-        for start, end, count in result:
-            assert start <= end
-            assert count >= 1
+        for c in result:
+            assert c["start"] <= c["end"]
+            assert c["match_count"] >= 1
 
     def test_clusters_with_buf_lines(self):
         entries = [BufferEntry(data=f"line{i}", modified_at=0.0) for i in range(10)]
         result = _cluster_lines_to_ranges([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 3, buf_lines=entries)
         assert len(result) == 3
-        for start, end, count in result:
-            assert start <= end
-            assert count >= 1
+        for c in result:
+            assert c["start"] <= c["end"]
+            assert c["match_count"] >= 1

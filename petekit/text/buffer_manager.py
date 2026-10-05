@@ -113,18 +113,18 @@ def _cluster_lines_to_ranges(
     line_numbers: list[int],
     num_clusters: int,
     buf_lines: list[BufferEntry] | None = _NO_BUFFER_,
-) -> list[tuple[int, int, int]]:
+) -> list[dict[str, Any]]:
     """Cluster matching line numbers into num_clusters ranges by agglomerative neighbor merging.
 
     Each line starts as its own cluster. Repeatedly merges the pair of neighboring
     clusters with the smallest content-based distance (sum of both cluster char
     counts plus the char count of the lines between them). Stops when num_clusters
-    remain. Returns a list of (cluster_start, cluster_end, match_count).
+    remain. Returns a list of dicts with start, end, match_count keys.
     """
     if not line_numbers:
         return []
     if len(line_numbers) <= num_clusters:
-        return [(ln, ln, 1) for ln in line_numbers]
+        return [{"start": ln, "end": ln, "match_count": 1} for ln in line_numbers]
 
     # Bootstrap clusters, using buffer line lengths when a buffer is available.
     if buf_lines is _NO_BUFFER_:
@@ -163,7 +163,7 @@ def _cluster_lines_to_ranges(
         }
         clusters = clusters[:min_i] + [merged] + clusters[min_i + 2:]
 
-    return [(c['s'], c['e'], c['n']) for c in clusters]
+    return [{"start": c["s"], "end": c["e"], "match_count": c["n"]} for c in clusters]
 
 
 @dataclass
@@ -679,7 +679,7 @@ class BufferManager(AgenticObject):
         if not replace_all and len(all_ranges) > 1:
             line_numbers = [lo + i for i, e in enumerate(segment_entries) if old_string in e.data]
             clusters = _cluster_lines_to_ranges(line_numbers, 5, self._buffers[name].lines)
-            cluster_msgs = ", ".join(f"lines {s}–{e} ({n} occurrence(s))" for s, e, n in clusters)
+            cluster_msgs = ", ".join(f"lines {c['start']}–{c['end']} ({c['match_count']} occurrence(s))" for c in clusters)
             return {
                 "ok": False,
                 "error": (
