@@ -801,6 +801,63 @@ class BufferManager(AgenticObject):
         return {"ok": True, "count": len(char_ranges), "old_string": old_string}
 
     @tool
+    async def patch_buffer(self, name: str, patch_text: str) -> dict[str, Any]:
+        """Apply a unified diff to the buffer content.
+
+        The patch_text must be a valid unified diff. Lines starting with '-' are removed;
+        lines starting with '+' are added; context lines (prefixed with space) are used for
+        alignment. The buffer content is used as the "original" state that the patch is applied to.
+
+        If the patch cannot be applied (e.g. context lines no longer match), returns an error
+        with the failed hunk context so the caller can inspect and retry.
+        """
+        # Validate the named buffer exists.
+        if name not in self._buffers:
+            return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"system:list:buffers\" to see available buffers."}
+
+        # Import paatch; surface a clear error if it is not installed.
+        try:
+            import paatch
+        except ImportError:
+            return {"ok": False, "error": "paatch library not installed. Install it with: pip install paatch"}
+
+        # Reconstitute buffer text as a flat string so the unified diff applies over line-oriented content.
+        buf = self._buffers[name]
+        buf_text = "\n".join(e.data for e in buf.lines) + "\n"
+
+        # Parse the provided diff, returning a parse error if the format is unrecognizable.
+        if not isinstance(patch_text, bytes):
+            patch_bytes = patch_text.encode("utf-8")
+        else:
+            patch_bytes = patch_text
+        ps = paatch.fromstring(patch_bytes)
+        if not ps:
+            return {"ok": False, "error": "Could not parse patch: the unified diff format could not be recognized."}
+
+        # Apply the patch in-memory using patch_stream — paatch handles all context
+        # matching and hunk application internally.
+        from io import BytesIO
+        hunks = ps.items[0].hunks
+        try:
+            src = BytesIO(buf_text.encode("utf-8"))
+            patched_bytes = b"".join(ps.patch_stream(src, hunks))
+        except Exception as e:
+            return {"ok": False, "error": f"Could not apply patch: {e}."}
+
+        new_text = patched_bytes.decode("utf-8")
+        new_lines = new_text.splitlines()
+        now = time.time()
+        result_entries = [
+            BufferEntry(data=line, modified_at=now, object_at=now) for line in new_lines
+        ]
+
+        # Commit the patched lines back into the buffer.
+        buf.lines[:] = result_entries
+        buf.modified_at = now
+
+        return {"ok": True, "count": len(hunks), "old_string": ""}
+
+    @tool
     async def diff_buffers(self, a: str, b: str, overwrite: bool = False) -> dict[str, Any]:
         """Diff two buffers line-by-line using a unified diff.
         Stores the result in a target buffer named diff:a→b.

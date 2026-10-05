@@ -472,3 +472,100 @@ class TestClusterLinesToRanges:
         for c in result:
             assert c["start"] <= c["end"]
             assert c["match_count"] >= 1
+
+
+class TestPatchBuffer:
+
+    async def test_patch_buffer_nonexistent_buffer(self, bm):
+        result = await bm.patch_buffer("nonexistent", "--- a\n+++ a\n@@ -1 +1 @@\n")
+        assert not result["ok"]
+        assert "nonexistent" in result["error"]
+
+    async def test_patch_buffer_simple_replacement(self, bm):
+        await bm.create_buffer("test", text="line0\nfoo\nline2\n")
+        patch = """--- a
++++ a
+@@ -1,2 +1,2 @@
+ line0
+-foo
++bar
+ line2
+"""
+        result = await bm.patch_buffer("test", patch)
+        assert result["ok"]
+        content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        assert content == "line0\nbar\nline2"
+
+    async def test_patch_buffer_insertion(self, bm):
+        await bm.create_buffer("test", text="line0\nline1\n")
+        patch = """--- a
++++ a
+@@ -1,2 +1,3 @@
+ line0
++inserted
+ line1
+"""
+        result = await bm.patch_buffer("test", patch)
+        assert result["ok"]
+        content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        assert "inserted" in content
+
+    async def test_patch_buffer_deletion(self, bm):
+        await bm.create_buffer("test", text="line0\nremove me\nline2\n")
+        patch = """--- a
++++ a
+@@ -1,2 +1,1 @@
+ line0
+-remove me
+ line2
+"""
+        result = await bm.patch_buffer("test", patch)
+        assert result["ok"]
+        content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        assert "remove me" not in content
+        assert "line0" in content
+        assert "line2" in content
+
+    async def test_patch_buffer_multiple_hunks(self, bm):
+        await bm.create_buffer("test", text="line0\nfoo\nline2\nbar\nline4\n")
+        import difflib
+        original = ["line0", "foo", "line2", "bar", "line4"]
+        modified = ["line0", "bar", "line2", "baz", "line4"]
+        gen = difflib.unified_diff(original, modified, fromfile="a", tofile="b", n=3)
+        lines = [l + "\n" if not l.endswith("\n") else l for l in list(gen)]
+        patch = "".join(lines)
+        result = await bm.patch_buffer("test", patch)
+        assert result["ok"]
+        content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        assert "foo" not in content
+        assert "bar2" not in content
+        assert "bar" in content
+        assert "baz" in content
+        assert "foo2" not in content
+
+    async def test_patch_buffer_invalid_patch_format(self, bm):
+        await bm.create_buffer("test", text="line0\n")
+        result = await bm.patch_buffer("test", "not a valid unified diff at all")
+        assert not result["ok"]
+        assert "Could not parse patch" in result["error"]
+
+    async def test_patch_buffer_count_reflects_hunks(self, bm):
+        await bm.create_buffer("test", text="a\nb\nc\n")
+        patch = """--- a
++++ a
+@@ -1,2 +1,2 @@
+ a
+-b
++c
+"""
+        result = await bm.patch_buffer("test", patch)
+        assert result["ok"]
+        assert result["count"] == 1
+
+    async def test_patch_buffer_bytes_patch_text(self, bm):
+        await bm.create_buffer("test", text="line0\nfoo\nline2\n")
+        patch = b"""--- a\n+++ a\n@@ -1,2 +1,2 @@\n line0\n-foo\n+bar\n line2\n"""
+        result = await bm.patch_buffer("test", patch)
+        assert result["ok"]
+        content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        assert content == "line0\nbar\nline2"
