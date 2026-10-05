@@ -567,7 +567,8 @@ class BufferManager(AgenticObject):
             return {"ok": False, "error": result.error}
 
         # Surface the full untruncated content with resolved range metadata.
-        return {
+        skipped_tail = len(buf.lines) - result.end
+        resp = {
             "ok": True,
             "content": result.content,
             "start": result.start,
@@ -575,6 +576,9 @@ class BufferManager(AgenticObject):
             "total_chars": result.total_chars,
             "line_count": result.line_count,
         }
+        if skipped_tail:
+            resp["skipped_tail"] = skipped_tail
+        return resp
 
     @tool
     async def read_buffer(
@@ -606,7 +610,10 @@ class BufferManager(AgenticObject):
                 entry.agent_at = now
             if raw:
                 return result["content"]
-            return {"ok": True, "content": result["content"], "start": result["start"], "end": result["end"], "lines": result["line_count"]}
+            resp = {"ok": True, "content": result["content"], "start": result["start"], "end": result["end"], "lines": result["line_count"]}
+            if result.get("skipped_tail"):
+                resp["skipped_tail"] = result["skipped_tail"]
+            return resp
 
         # Split the formatted content into lines for heavy-line detection; this segment reflects the
         # pre-formatted text (with line numbers and timestamps as applicable) and its total char
