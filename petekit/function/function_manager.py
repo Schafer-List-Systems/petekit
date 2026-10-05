@@ -105,7 +105,7 @@ def _refresh_list_buffer(fm: FunctionManager) -> asyncio.Task:
     # Format and persist the flat catalog to the function:list buffer for agent browsing.
     text = format_dict_list_for_buffer(records)
     loop = asyncio.get_running_loop()
-    return loop.create_task(fm.write_buffer(_FUNCTION_LIST_BUFFER, text=text, start=0))
+    return loop.create_task(fm.write_buffer(_FUNCTION_LIST_BUFFER, text=text, pos=0))
 
 
 class FunctionManager(BufferManager, AgenticObject):

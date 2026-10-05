@@ -66,7 +66,7 @@ class TestStreamBufferReadBufferTimeBased:
     async def _sbm_with_stream(self, sbm):
         ts = [10.0, 20.0, 30.0, 40.0, 50.0]
         data = ["a", "b", "c", "d", "e"]
-        entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
+        entries = [BufferEntry(data=d, modified_at=t) for t, d in zip(ts, data)]
         sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
         sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
         return sbm
@@ -122,7 +122,7 @@ class TestStreamBufferReadBufferRelativeTime:
     async def _sbm_with_stream(self, sbm):
         ts = [10.0, 20.0, 30.0, 40.0, 50.0]
         data = ["a", "b", "c", "d", "e"]
-        entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
+        entries = [BufferEntry(data=d, modified_at=t) for t, d in zip(ts, data)]
         sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
         sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
         return sbm
@@ -173,7 +173,7 @@ class TestStreamBufferReadBufferLineBased:
     async def _sbm_with_stream(self, sbm):
         ts = [10.0, 20.0, 30.0, 40.0, 50.0]
         data = ["a", "b", "c", "d", "e"]
-        entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
+        entries = [BufferEntry(data=d, modified_at=t) for t, d in zip(ts, data)]
         sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
         sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
         return sbm
@@ -298,7 +298,7 @@ class TestReadBufferReturnValues:
     async def _sbm_with_stream(self, sbm):
         ts = [10.0, 20.0, 30.0]
         data = ["a", "b", "c"]
-        entries = [BufferEntry(data=d, timestamp=t, seen=False) for t, d in zip(ts, data)]
+        entries = [BufferEntry(data=d, modified_at=t) for t, d in zip(ts, data)]
         sbm._buffers["stream:t"] = Buffer(lines=entries, created_at=ts[0], modified_at=ts[-1])
         sbm.stream_buffer_configs["stream:t"] = type("C", (), {"hooks": {}, "created_at": ts[0]})()
         return sbm

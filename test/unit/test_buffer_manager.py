@@ -73,7 +73,7 @@ class TestEditBufferTimestampSemantics:
         now = time.time()
         for i, line in enumerate(text.split("\n")):
             ts = timestamps[i] if timestamps and i < len(timestamps) else now
-            entries.append(BufferEntry(data=line, timestamp=ts, seen=True))
+            entries.append(BufferEntry(data=line, modified_at=ts))
         bm._buffers["t"] = Buffer(
             lines=entries,
             created_at=now,
@@ -81,7 +81,7 @@ class TestEditBufferTimestampSemantics:
         )
 
     def _timestamps(self, bm) -> list[float]:
-        return [e.timestamp for e in bm._buffers["t"].lines]
+        return [e.modified_at for e in bm._buffers["t"].lines]
 
     async def test_simple_single_line_replace_preserves_untouched(self, bm):
         self._make(bm, "A\nB\nC", timestamps=[1.0, 2.0, 3.0])
@@ -175,7 +175,7 @@ class TestEditBufferTimestampSemantics:
         )
         result = await bm.edit_buffer("t", "A", "X")
         assert not result["ok"]
-        assert "not found" in result["error"]
+        assert "empty" in result["error"].lower() or "nothing was replaced" in result["error"]
 
     async def test_timestamp_precision_single_edit(self, bm):
         t0 = time.time()
@@ -241,7 +241,7 @@ class TestEditBufferScopedRange:
         now = time.time()
         for i, line in enumerate(text.split("\n")):
             ts = timestamps[i] if timestamps and i < len(timestamps) else now
-            entries.append(BufferEntry(data=line, timestamp=ts, seen=True))
+            entries.append(BufferEntry(data=line, modified_at=ts))
         bm._buffers["t"] = Buffer(
             lines=entries,
             created_at=now,
@@ -249,7 +249,7 @@ class TestEditBufferScopedRange:
         )
 
     def _timestamps(self, bm) -> list[float]:
-        return [e.timestamp for e in bm._buffers["t"].lines]
+        return [e.modified_at for e in bm._buffers["t"].lines]
 
     async def test_replace_only_within_range_untouched_outside(self, bm):
         self._make(bm, "A\nB\nC\nD\nE", timestamps=[1.0, 2.0, 3.0, 4.0, 5.0])
@@ -333,21 +333,6 @@ class TestUpdateHooks:
         result = bm.unregister_buffer_update_hook("test", "unknown")
         assert not result["ok"]
 
-    async def test_write_buffer_hook_receives_correct_args(self, bm):
-        await bm.create_buffer("test", text="A\nB\nC")
-        calls = []
-        def accepting_hook(buf, old_text, start, end, new_text):
-            calls.append((buf, old_text, start, end, new_text))
-            return True
-        bm.register_buffer_update_hook("test", "h", accepting_hook)
-        await bm.write_buffer("test", "X\nY", start=1, end=2)
-        assert len(calls) == 1
-        buf, old_text, start, end, new_text = calls[0]
-        assert old_text == "B\n"  # line 1 replaced
-        assert start == 1
-        assert end == 2
-        assert new_text == "X\nY\n"
-
     async def test_edit_buffer_hook_receives_correct_args(self, bm):
         await bm.create_buffer("test", text="A\nB\nC")
         calls = []
@@ -376,12 +361,12 @@ class TestUpdateHooks:
         assert new_text is None
 
     async def test_hook_accept_true_allows_write(self, bm):
-        await bm.create_buffer("test", text="A\nB")
+        await bm.create_buffer("test")
         bm.register_buffer_update_hook("test", "h", lambda *_: True)
-        result = await bm.write_buffer("test", "X", start=0)
+        result = await bm.write_buffer("test", "X\nY")
         assert result["ok"]
         content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
-        assert content == "X"
+        assert content == "X\nY"
 
     async def test_hook_accept_none_allows_write(self, bm):
         await bm.create_buffer("test", text="A\nB")

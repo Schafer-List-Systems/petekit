@@ -208,7 +208,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         return anchor + ts if ts < 0 else ts
 
     @tool
-    async def read_buffer(self, name: str, start: int | float = 0, end: int | float | None = None, show_timestamps: bool = False, show_line_numbers: bool = False, raw: bool = False) -> dict[str, Any] | str:
+    async def read_buffer(self, name: str, start: int | float = 0, end: int | float | str = "end", show_timestamps: bool = False, show_line_numbers: bool = False, raw: bool = False) -> dict[str, Any] | str:
         """Read a range of lines from a buffer.
         Omit start to read from the beginning; omit end to read to the last line.
         Integer values trigger line-based reading; float values trigger time-based reading on stream buffers (Unix epoch: timestamp 0.0 is 1970).
@@ -249,25 +249,20 @@ class StreamBufferManager(BufferManager, AgenticObject):
         return await super().read_buffer(name, start=start, end=end, show_timestamps=show_timestamps, show_line_numbers=show_line_numbers, raw=raw)
 
     @tool
-    async def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
-        """Write to a text buffer.
-        Overwrite the range [start, end) of an existing buffer. Default: APPEND
-        A trailing newline is always appended, so a blank line in the input
-        creates a blank line in the buffer. Omitting start means start=END.
-        Omitting end means end=END.
-        INSERT at line N: pass start=N and end=N.
-        APPEND: Omit both start and end.
-        OVERWRITE the whole buffer: pass start=0.
-        REPLACE lines M to N: pass start=M and end=N.
-        Write-mode for streams is append-only.
-        After appending, all registered hooks are fired once per batch."""
-        
-        # Make sure, streams are append-only
-        if name in self.stream_buffer_configs and (start is not None or end is not None):
+    async def write_buffer(self, name: str, text: str, pos: int | float | str = "end") -> dict[str, Any]:
+        """Write into an existing text buffer.
+        Default: APPEND
+        A trailing newline is always appended, i.e., an empty input creates a blank line in the buffer.
+        Set pos to an integer (0-based line index) to insert at that position.
+        Negative indices are relative to the end (Python array style).
+        Set pos to a float to use a time-based index on stream buffers.
+        Negative time values are relative to the end.
+        Stream buffers are append-only.
+        """
+        if name in self.stream_buffer_configs and pos != "end":
             return {"ok": False, "error": f"Cannot write into the middle of stream '{name}'. Streams are append-only."}
-        
-        # write the data into the buffer
-        result = await super().write_buffer(name, text, start, end)
+
+        result = await super().write_buffer(name, text, pos=pos)
         if not result.get("ok") or not name in self.stream_buffer_configs:
             return result
         

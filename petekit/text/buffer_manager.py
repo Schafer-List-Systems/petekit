@@ -17,19 +17,46 @@ from peteos import tool, sandbox
 from petekit.utils.text_formatters import format_dict_list_for_buffer
 
 
-def _resolve_line_range(total: int, start: int | None, end: int | None) -> dict[str, Any] | tuple[int, int]:
-    if start is None:
-        start = total
-    if end is None:
-        end = total
-    if start < -total or start > total:
-        return {"ok": False, "error": f"start={start} is out of range. Valid range: -total to total (i.e. -{total} to {total})."}
-    if end < -total or end > total:
-        return {"ok": False, "error": f"end={end} is out of range. Valid range: -total to total (i.e. -{total} to {total})."}
-    if start < 0:
-        start = total + start
-    if end < 0:
-        end = total + end
+def _resolve_line_number(total: int, pos: int  | str | None, arg: str = 'pos') -> dict[str, Any] | int:
+    # coerce to int
+    if pos is None:
+        pos = total
+    elif pos == "end" or isinstance(pos, str):
+        if pos == "end":
+            pos = total
+        else:
+            try:
+                pos = int(pos)
+            except ValueError:
+                return {"ok": False, "error": f"{arg} must be an integer or 'end', got '{pos}'."}
+
+    # check for valid rance
+    if pos < -total or pos > total:
+        return {"ok": False, "error": f"{arg}={pos} is out of range. Valid range: -total to total (i.e. -{total} to {total})."}
+
+    # python logic for negative line numbers
+    if pos < 0:
+        pos = total + pos
+
+    # return the resolve line number
+    return pos
+
+
+def _resolve_line_range(total: int, start: int | str | None, end: int | str | None) -> dict[str, Any] | tuple[int, int]:
+    # resolve start line number
+    start = _resolve_line_number(total, start, 'start')
+    if isinstance(start, dict):
+        return start
+
+    # resolve end line number
+    end = _resolve_line_number(total, end, 'end')
+    if isinstance(end, dict):
+        return end
+
+    # check for correct order of start and end
+    if start > end:
+        return {"ok": False, "error": f"Start line number and end line number resolve to {start} > {end}, which is not allowed."}
+
     return (start, end)
 
 
@@ -266,15 +293,16 @@ class Buffer:
 
 class BufferManager(AgenticObject):
     """You are a buffer manager. You hold multiple named buffers, each a list of lines in memory.
-    - You can create, write, search, read ranges from, and edit any named buffer.
+    - You can `create`, insert/append (`write`), search (`grep`), `read` ranges from, and `edit` any named buffer.
     - Read the "system:list:buffers" buffer to see what exists. Drop unused buffers when it becomes messy!
+      Read it to get a JSON array of {name, lines} for each buffer.
     - Line indices are 0-based, just like Python array indexing.
       Example: buf[0] is the first line, buf[-1] is the last line, buf[0:5] is the first 5 lines.
     - Ranges use [start, end) semantics: start is included, end is excluded. Omit end to read to the end of the buffer.
     - Use (?i) at the start of a grep pattern for case-insensitive matching.
-    - Always prefer read_buffer with start/end over reading entire buffers when working with large content.
     - All timestamps are rounded to 6 decimals.
-      Read it to get a JSON array of {name, lines} for each buffer.
+    - **Be efficient!** Read only as much as you need instead of the entire buffer!
+    - **Be carefule!** Read before you write! Don't delete managed buffers.
     """
 
     _MAX_CHUNK_CHARS = 8000
@@ -367,42 +395,35 @@ class BufferManager(AgenticObject):
         return {"ok": True, "target": target_name, "source": source_name, "lines": len(new_entries)}
 
     @tool
-    async def write_buffer(self, name: str, text: str, start: int | None = None, end: int | None = None) -> dict[str, Any]:
-        """Write to a text buffer.
-        Overwrite the range [start, end) of an existing buffer. Default: APPEND
-        A trailing newline is always appended, so a blank line in the input
-        creates a blank line in the buffer. Omitting start means start=END.
-        Omitting end means end=END.
-        INSERT at line N: pass start=N and end=N.
-        APPEND: Omit both start and end.
-        OVERWRITE the whole buffer: pass start=0.
-        REPLACE lines M to N: pass start=M and end=N."""
+    async def write_buffer(self, name: str, text: str, pos: int | str = 'end') -> dict[str, Any]:
+        """Write into an existing text buffer.
+        Default: APPEND
+        A trailing newline is always appended, i.e., an empty input creates a blank line in the buffer.
+        Set pos to an integer (0-based line index) to insert at that position.
+        Negative indices are relative to the end (Python array style).
+        """
         # Guard: reject unknown buffer names to keep write operations consistent.
         if name not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{name}'. Use create_buffer first."}
         buf = self._buffers[name]
 
-        # Resolve the requested range and validate it before any content is read.
+        # Resolve the line number range and validate it before any content is read.
         total = len(buf.lines)
-        resolved = _resolve_line_range(total, start, end)
+        resolved = _resolve_line_number(total, pos)
         if isinstance(resolved, dict):
             return resolved
-        start, end = resolved
-        if start > end:
-            return {"ok": False, "error": f"start ({start}) > end ({end})."}
+        pos = resolved
 
         # Capture old buffer content and compute new content, then fire update hooks.
         # The hook sees the exact slice that will be replaced and the proposed replacement.
-        old_text = "\n".join(buf.lines[i].data for i in range(start, min(end, total))) + "\n"
-        new_text = text + "\n"
-        hook_result = await buf._fire_update_hooks(old_text, start, end, new_text)
+        hook_result = await buf._fire_update_hooks("", pos, pos, text + "\n")
         if hook_result is not True and hook_result is not None:
             return {"ok": False, "error": str(hook_result)}
 
         # Commit the mutation to the buffer and stamp the modification time.
         now = time.time()
         new_entries = [BufferEntry(data=line, modified_at=now, object_at=now) for line in (text + "\n").splitlines()]
-        buf.lines[start:end] = new_entries
+        buf.lines[pos:pos] = new_entries
         buf.modified_at = time.time()
 
         # Refresh the buffer registry to keep the system listing current.
@@ -482,9 +503,9 @@ class BufferManager(AgenticObject):
         return {"ok": True, "buffer": buffer_name, "removed": hook_name}
 
     @sandbox
-    def _grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | None = None) -> dict[str, Any]:
+    def _grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | str = "end") -> dict[str, Any]:
         """Search a buffer for a regex pattern.
-        Searches the full buffer by default, or a [start, end) range if provided.
+        Searches the full buffer by default, or a [start:end) range if provided.
         Returns a dict with ok/error or ok/matches.
         Use (?i) at the start for case-insensitive matching.
         """
@@ -504,9 +525,9 @@ class BufferManager(AgenticObject):
         }
 
     @tool
-    async def grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | None = None) -> dict[str, Any]:
+    async def grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | str = "end") -> dict[str, Any]:
         """Search a buffer for a regex pattern.
-        Searches the full buffer by default, or a [start, end) range if provided.
+        Searches the full buffer by default, or a [start:end) range if provided.
         Returns a dict with ok/error or ok/matches.
         Use (?i) at the start for case-insensitive matching.
         """
@@ -520,7 +541,7 @@ class BufferManager(AgenticObject):
         return {"ok": True, "matches": clusters, "count": result["count"]}
 
     @sandbox
-    def _read_buffer(self, name: str, start: int = 0, end: int | None = None, show_timestamps: bool = False, show_line_numbers: bool = False) -> dict[str, Any]:
+    def _read_buffer(self, name: str, start: int = 0, end: int | str = "end", show_timestamps: bool = False, show_line_numbers: bool = False) -> dict[str, Any]:
         """Read a range of lines from a buffer.
         Omit start to read from the beginning; omit end to read to the last line.
         Set show_timestamps=True to prefix each line with its unix timestamp.
@@ -550,7 +571,7 @@ class BufferManager(AgenticObject):
         self,
         name: str,
         start: int = 0,
-        end: int | None = None,
+        end: int | str = "end",
         show_timestamps: bool = False,
         show_line_numbers: bool = False,
         raw: bool = False,
@@ -592,7 +613,7 @@ class BufferManager(AgenticObject):
             return {
                 "ok": False,
                 "error": (
-                    f"Range [{result['start']}–{result['end']}] is {total_chars} chars ({result['line_count']} lines). "
+                    f"Range [{result['start']}:{result['end']}) is {total_chars} chars ({result['line_count']} lines). "
                     f"Heaviest lines ({len(skip_lines)} totaling {sum(c for _, c in skip_lines)} chars): {skip_msg}. "
                     f"Consider re-reading with a narrower range to avoid them."
                 ),
@@ -604,15 +625,15 @@ class BufferManager(AgenticObject):
         return {
             "ok": False,
             "error": (
-                f"Range [{result['start']}–{result['end']}] is {total_chars} chars ({result['line_count']} lines) and exceeds the {BufferManager._MAX_CHUNK_CHARS}-char threshold. "
+                f"Range [{result['start']}:{result['end']}) is {total_chars} chars ({result['line_count']} lines) and exceeds the {BufferManager._MAX_CHUNK_CHARS}-char threshold. "
                 f"Reduce the read range to stay under the limit. "
                 f"Bucket distribution (start-end:chars): {bucket_msgs}."
             ),
         }
 
     @tool
-    async def edit_buffer(self, name: str, old_string: str, new_string: str, start: int = 0, end: int | None = None, replace_all: bool = False) -> dict[str, Any]:
-        """Replace old_string with new_string in the buffer content within a [start, end) range.
+    async def edit_buffer(self, name: str, old_string: str, new_string: str, start: int = 0, end: int | str = "end", replace_all: bool = False) -> dict[str, Any]:
+        """Replace old_string with new_string in the buffer content within a [start:end) range.
         Both old_string and new_string can span multiple lines.
         Editing fails when old_string is found more than once. Set replace_all=True to replace ALL occurrences.
         """
@@ -650,7 +671,7 @@ class BufferManager(AgenticObject):
 
         # Guard: no matches found in the segment.
         if len(all_ranges) == 0:
-            return {"ok": False, "error": f"Search pattern '{old_string}' not found in the range [{lo}, {end})."}
+            return {"ok": False, "error": f"Search pattern '{old_string}' not found in the range [{lo}:{hi})."}
 
         # Guard: multiple matches found but replace_all is False — report clusters and decline.
         if not replace_all and len(all_ranges) > 1:
