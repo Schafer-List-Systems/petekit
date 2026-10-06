@@ -296,7 +296,7 @@ class Buffer:
 
 class BufferManager(AgenticObject):
     """You are a buffer manager. You hold multiple named buffers, each a list of lines in memory.
-    - You can `create`, insert/append (`write`), search (`grep`), `read` ranges from, and `edit` any named buffer.
+    - You can `create`, insert/append (`write`), search (`grep`), `read` ranges from, and edit (`edit` and `patch`) any named buffer.
     - Read the "system:list:buffers" buffer to see what exists. Drop unused buffers when it becomes messy!
       Read it to get a JSON array of {name, lines} for each buffer.
     - Line indices are 0-based, just like Python array indexing.
