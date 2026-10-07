@@ -111,7 +111,7 @@ class _NotificationConfig:
 
 
 class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
-    """You are a stream processor managing multiple routing tables.
+    """You are a live stream processor managing multiple routing tables.
     You also have a notification system for stream updates — it sends you automatic [NOTIFICATION] chat messages disguised as user messages.
     While stream buffer hooks allow you to execute functions automatically, the notification system allows you to get notified (chat messages) automatically.
     - The set of routing tables is listed in the "system:list:routing_tables" buffer.

@@ -124,16 +124,16 @@ def _condition_closure(pattern_buffer: str, read_buffer_fn: callable) -> callabl
 def _guard_pattern_value(op_type: str, value) -> re.Pattern | str:
     # Reject non-dict values and values missing the required 'regex' key.
     if not isinstance(value, dict) or "regex" not in value:
-        return f"regex {op_type} must supply a dict with 'regex' key, got: {type(value).__name__} — see doc:regex"
+        return f"regex {op_type} must supply a dict with 'regex' key, got: {type(value).__name__} — see {_REGEX_DOC_BUFFER}"
 
     # Reject entries missing 'sample_line' — validation requires a sample to test against.
     if "sample_line" not in value:
-        return f"regex {op_type} must supply 'sample_line' — the regex cannot be validated without a sample — see doc:regex"
+        return f"regex {op_type} must supply 'sample_line' — the regex cannot be validated without a sample — see {_REGEX_DOC_BUFFER}"
 
     # Validate the regex against its sample_line; propagate validation errors upward.
     validation = _validate_pattern_against_sample(value["regex"], value["sample_line"])
     if isinstance(validation, str):
-        return f"{validation} — see doc:regex"
+        return f"{validation} — see {_REGEX_DOC_BUFFER}"
 
     return validation
 
@@ -315,7 +315,7 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
 
 
 class RegexConditionFactory(FunctionManager, AgenticObject):
-    """Regex-based pattern conditions. See doc:regex for details."""
+    f"""Regex-based pattern conditions. See {_REGEX_DOC_BUFFER} for details."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
