@@ -120,7 +120,7 @@ class FunctionManager(BufferManager, AgenticObject):
         self._functions: dict[str, FunctionEntry] = {}
         self._create_buffer(_FUNCTION_LIST_BUFFER, text="[]")
 
-    @tool
+    @sandbox
     async def create_function(
         self,
         name: str,
