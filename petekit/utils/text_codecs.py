@@ -1,5 +1,8 @@
 """Text codec hooks for buffer update hooks."""
 
+from __future__ import annotations
+
+import asyncio
 from typing import Callable
 import json
 
@@ -27,9 +30,10 @@ def _describe_write_scenario(buf: Buffer, start: int, end: int | None) -> str:
 def make_json_codec(inner: Callable[..., bool | str]) -> UpdateHook:
     """Build an UpdateHook that validates and diffs JSON-formatted buffer content.
     The inner callable receives (buf, old_json, new_json, patch) and returns bool|str.
+    Supports both sync and async inner callables.
     """
 
-    def codec(buf: Buffer, old_text: str | None, start: int, end: int, new_text: str | None) -> bool | str:
+    async def codec(buf: Buffer, old_text: str | None, start: int, end: int, new_text: str | None) -> bool | str:
         # Reconstruct the complete old buffer by replacing the [start, end) slice with the original slice text.
         # This gives the codec the full buffer state for a fair comparison.
         prefix_lines = [buf.lines[i].data for i in range(0, start)]
@@ -37,7 +41,6 @@ def make_json_codec(inner: Callable[..., bool | str]) -> UpdateHook:
         full_old = "\n".join(prefix_lines + [old_text or ""] + suffix_lines) + "\n"
 
         # Validate old_text: parse as JSON; if malformed, the buffer was already in an invalid state.
-        # TODO(design): decide how to handle pre-existing malformed JSON in the buffer.
         try:
             old_json = json.loads(full_old)
         except json.JSONDecodeError:
@@ -59,7 +62,10 @@ def make_json_codec(inner: Callable[..., bool | str]) -> UpdateHook:
         # Compute the RFC 6906 JSON Patch diff between the two parsed structures.
         patch = jsonpatch.make_patch(old_json, new_json)
 
-        # Delegate to the inner codec with the full old/new structures and the structured diff.
-        return inner(buf, old_json, new_json, patch)
+        # Delegate to the inner codec and await if the inner is async.
+        result = inner(buf, old_json, new_json, patch)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
 
     return codec
