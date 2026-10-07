@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-import asyncio
+import hmac
 import inspect
+import json
+import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from peteos import tool, sandbox
 from peteos.oap.agentic_object import AgenticObject
 
-from petekit.text.buffer_manager import Buffer, BufferEntry, BufferManager
-from petekit.utils.text_formatters import format_dict_list_for_buffer
+from petekit.text.buffer_manager import BufferManager
 
-_FUNCTION_LIST_BUFFER = "function:list"
+_FUNCTION_LIST_BUFFER = "system:list:functions"
 
 
 @dataclass
@@ -32,93 +33,112 @@ class FunctionEntry:
 
 def _build_buffer_name(name: str) -> str:
     # Prefix the function name so it lives in the function: namespace.
-    return f"function:{name}"
+    return f"function:{name}:meta"
 
 
-def _signature_str(sig: inspect.Signature) -> str:
-    params = []
-    for p in sig.parameters.values():
-        if p.default is inspect.Parameter.empty:
-            params.append(p.name)
-        else:
-            params.append(f"{p.name}={p.default!r}")
-    return ", ".join(params)
+def _compute_mac(fm: "FunctionManager", data: str) -> str:
+    """Produce an HMAC over the given data using the function manager's secret signing key."""
+    return hmac.new(
+        fm._function_manager_signing_key.encode(),
+        data.encode(),
+        "sha256",
+    ).hexdigest()
 
 
-def _return_str(ann: Any) -> str:
-    if ann is inspect.Parameter.empty:
-        return "None"
-    return str(ann)
+def _make_readonly_sentinel(fm: "FunctionManager"):
+    """Factory that produces a sentinel hook verifying the MAC on every buffer write.
+
+    The sentinel rejects any write whose content does not carry a valid HMAC signed
+    by the function manager, preventing external modifications to protected buffers.
+    """
+    def readonly_sentinel(buf: str, old_text: str, start: int, end: int, new_text: str) -> str | None:
+        # Parse the new_text as JSON and verify the HMAC signature.
+        try:
+            obj = json.loads(new_text)
+            signed = obj.get("data", "")
+            mac = obj.get("mac", "")
+            expect = _compute_mac(fm, json.dumps(signed, sort_keys=True))
+            if not hmac.compare_digest(mac, expect):
+                return "This buffer is protected by the FunctionManager!"
+        except Exception:
+            return "This buffer is protected by the FunctionManager!"
+        return None
+    return readonly_sentinel
 
 
-def _param_type_str(param: inspect.Parameter) -> str:
-    if param.annotation is inspect.Parameter.empty:
-        return "Any"
-    return str(param.annotation)
+def _sign_payload(fm: "FunctionManager", data: Any) -> str:
+    """Serialize data as HMAC-signed JSON with indent=2."""
+    signed = json.dumps(data, sort_keys=True)
+    mac = _compute_mac(fm, signed)
+    return json.dumps({"data": data, "mac": mac}, indent=2)
 
 
-def _build_function_buffer(entry: FunctionEntry) -> str:
-    # Serialize the full function entry into a text format the agent can read.
-    # This includes name, short/long description, parameter details,
-    # and return annotation — everything needed for the agent to use the function.
-    lines = [
-        f"# Function: {entry.name}",
-        f"# Short: {entry.short_description}",
-        f"# Created: {entry.created_at}",
-        f"# Modified: {entry.modified_at}",
-        "",
-        f"## Description",
-        entry.long_description,
-        "",
-        "## Signature",
-        f"def {entry.name}({_signature_str(entry.signature)}) -> {_return_str(entry.return_annotation)}:",
-        "",
-        "## Parameters",
-    ]
-    for param_name, param in entry.signature.parameters.items():
-        lines.append(f"#   {param_name}: {_param_type_str(param)}")
-        if param.default is inspect.Parameter.empty:
-            lines.append(f"#     default: (no default)")
-        else:
-            lines.append(f"#     default: {param.default!r}")
-    lines.extend([
-        "",
-        f"## Returns: {_return_str(entry.return_annotation)}",
-    ])
-    return "\n".join(lines) + "\n"
+def _build_function_meta(entry: FunctionEntry) -> dict[str, Any]:
+    # Collect the full function metadata as a dict for JSON serialization.
+    return {
+        "name": entry.name,
+        "short_description": entry.short_description,
+        "long_description": entry.long_description,
+        "signature": {
+            "parameters": [
+                {
+                    "name": p.name,
+                    "type": str(p.annotation) if p.annotation is not inspect.Parameter.empty else "Any",
+                    "default": repr(p.default) if p.default is not inspect.Parameter.empty else None,
+                }
+                for p in entry.signature.parameters.values()
+            ],
+            "return": (
+                str(entry.return_annotation)
+                if entry.return_annotation is not inspect.Parameter.empty
+                else "None"
+            ),
+        },
+        "created_at": entry.created_at,
+        "modified_at": entry.modified_at,
+    }
 
 
-def _refresh_list_buffer(fm: FunctionManager) -> asyncio.Task:
-    # Collect each function's name, arg summary, and short description for the catalog.
+async def _refresh_list_buffer(fm: "FunctionManager") -> None:
+    # Collect each function's name, args, and short description for the catalog.
     records = []
     for entry in fm._functions.values():
-        # Build an arg summary so the agent can see the function signature at a glance.
-        arg_summary = ", ".join(
-            p.name for p in entry.signature.parameters.values()
-        )
+        arg_summary = ", ".join(p.name for p in entry.signature.parameters.values())
         records.append({
             "name": entry.name,
             "args": f"({arg_summary})",
             "description": entry.short_description,
         })
-
-    # Format and persist the flat catalog to the function:list buffer for agent browsing.
-    text = format_dict_list_for_buffer(records)
-    loop = asyncio.get_running_loop()
-    return loop.create_task(fm.write_buffer(_FUNCTION_LIST_BUFFER, text=text, pos=0))
+    # Write the signed JSON catalog to the system:list:functions buffer, replacing existing content.
+    text = _sign_payload(fm, records)
+    await fm.create_buffer(_FUNCTION_LIST_BUFFER, text=text, overwrite=True)
 
 
 class FunctionManager(BufferManager, AgenticObject):
     """A BufferManager that also manages a namespace of runtime-created Callables.
-    Each function lives in self._functions and is mirrored to a function:<name> buffer
-    for agent introspection. A function:list buffer catalogs all registered functions
-    grouped by category.
+    Each function lives in self._functions and is mirrored to a function:<name>:meta buffer
+    (signed JSON) for agent introspection. A system:list:functions buffer catalogs all registered functions.
+    All buffers are HMAC-protected against external writes.
     """
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._functions: dict[str, FunctionEntry] = {}
-        self._create_buffer(_FUNCTION_LIST_BUFFER, text="[]")
+        self._function_manager_signing_key: str = secrets.token_hex(32)
+
+        # Create the initial catalog buffer.
+        init_result = self._create_buffer(_FUNCTION_LIST_BUFFER, text=_sign_payload(self, []))
+        if not isinstance(init_result, dict) or not init_result.get("ok"):
+            raise RuntimeError(f"failed to create function list buffer: {init_result.get('error')}")
+
+        # Guard the catalog buffer against unsigned writes.
+        hook_result = self.register_buffer_update_hook(
+            _FUNCTION_LIST_BUFFER,
+            "readonly_sentinel",
+            _make_readonly_sentinel(self),
+        )
+        if not isinstance(hook_result, dict) or not hook_result.get("ok"):
+            raise RuntimeError(f"failed to register readonly_sentinel on {_FUNCTION_LIST_BUFFER}: {hook_result.get('error')}")
 
     @sandbox
     async def create_function(
@@ -163,13 +183,29 @@ class FunctionManager(BufferManager, AgenticObject):
             modified_at=now,
         )
 
-        # Mirror the function entry into a text buffer the agent can read and search;
+        # Mirror the function entry into a signed JSON buffer the agent can read;
         # create_buffer with overwrite=True fires existing buffer hooks automatically.
-        buf_result = await self.create_buffer(_build_buffer_name(name), text=_build_function_buffer(entry), overwrite=True)
-        if not buf_result.get("ok"):
+        buf_result = await self.create_buffer(
+            _build_buffer_name(name),
+            text=_sign_payload(self, _build_function_meta(entry)),
+            overwrite=True,
+        )
+        if not isinstance(buf_result, dict) or not buf_result.get("ok"):
             return {
                 "ok": False,
-                "error": f"Cascaded error due to buffer creation for function description: {buf_result.get("error")}",
+                "error": f"Cascaded error due to buffer creation for function description: {buf_result.get('error')}",
+            }
+
+        # Guard the new meta buffer against unsigned writes.
+        hook_result = self.register_buffer_update_hook(
+            _build_buffer_name(name),
+            "readonly_sentinel",
+            _make_readonly_sentinel(self),
+        )
+        if not isinstance(hook_result, dict) or not hook_result.get("ok"):
+            return {
+                "ok": False,
+                "error": f"Function '{name}' created but could not be protected: {hook_result.get('error')}",
             }
 
         # Register the callable in the function namespace.
@@ -218,4 +254,3 @@ class FunctionManager(BufferManager, AgenticObject):
             "args": list(entry.signature.parameters.keys()),
             "returns": str(entry.return_annotation) if entry.return_annotation is not inspect.Parameter.empty else "None",
         }
-

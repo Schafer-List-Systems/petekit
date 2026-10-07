@@ -79,7 +79,7 @@ class TestFunctionManagerBasic:
 
         await fm.create_function("temp", temp)
         await fm.drop_function("temp")
-        assert "function:temp" not in fm._buffers
+        assert "function:temp:meta" not in fm._buffers
 
     async def test_drop_unknown_is_error(self, fm):
         result = await fm.drop_function("does_not_exist")
@@ -92,16 +92,19 @@ class TestFunctionManagerBasic:
         assert "No function named" in result["error"]
 
     async def test_function_buffer_contains_docstring(self, fm):
+        import json
         def documented(x: int) -> int:
             """Returns the input unchanged."""
             return x
 
         await fm.create_function("documented", documented)
-        content = await fm.read_buffer("function:documented", raw=True, show_line_numbers=False)
-        assert "documented" in content
-        assert "Returns the input unchanged" in content
+        content = await fm.read_buffer("function:documented:meta", raw=True, show_line_numbers=False)
+        obj = json.loads(content)
+        assert obj["data"]["name"] == "documented"
+        assert obj["data"]["long_description"] == "Returns the input unchanged."
 
     async def test_function_list_buffer_contains_functions(self, fm):
+        import json
         def fn1():
             pass
 
@@ -110,16 +113,18 @@ class TestFunctionManagerBasic:
 
         await fm.create_function("fn1", fn1)
         await fm.create_function("fn2", fn2)
-        content = await fm.read_buffer("function:list", raw=True, show_line_numbers=False)
-        assert "fn1" in content
-        assert "fn2" in content
+        content = await fm.read_buffer("system:list:functions", raw=True, show_line_numbers=False)
+        obj = json.loads(content)
+        names = [r["name"] for r in obj["data"]]
+        assert "fn1" in names
+        assert "fn2" in names
 
 
 class TestFunctionManagerHookGating:
     async def test_drop_function_blocked_by_hook(self):
         fm = FunctionManager()
         await fm.create_function("to_drop", lambda: None)
-        fm.register_buffer_update_hook("function:to_drop", "reject", lambda *_: "blocked by hook")
+        fm.register_buffer_update_hook("function:to_drop:meta", "reject", lambda *_: "blocked by hook")
         result = await fm.drop_function("to_drop")
         assert not result["ok"]
         assert "blocked by hook" in result["error"]
@@ -145,7 +150,7 @@ class TestFunctionManagerHookGating:
             return True
 
         await fm.create_function("target", target)
-        fm.register_buffer_update_hook("function:target", "spy", accepting_hook)
+        fm.register_buffer_update_hook("function:target:meta", "spy", accepting_hook)
         await fm.drop_function("target")
         assert len(calls) == 1
         _, old_text, start, end, new_text = calls[0]
