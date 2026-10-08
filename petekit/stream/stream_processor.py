@@ -16,6 +16,11 @@ import asyncio
 _MIN_NOTIFICATION_INTERVAL = 20.0
 _MAX_NOTIFICATION_INTERVAL = 600.0
 
+_LOG_BUFFER = "system:log:stream_processor"
+_CONTROL_BUFFER = "system:control:stream_processor"
+_ROUTING_TABLES_BUFFER = "system:config:routing_tables"
+_NOTIFICATION_CONFIGS_BUFFER = "system:config:notification_configs"
+
 
 # HACK: no clean API exists to get ptid by recency — only session dirs on disk carry mtime.
 # Feature request for PeteOS core: expose a method or property on Agent or AgenticObject
@@ -61,7 +66,7 @@ def _most_recent_persistent_thread(obj: AgenticObject) -> str | None:
 
 
 def _routing_table_key(name: str) -> str:
-    return f"system:routing_table:{name}"
+    return f"system:config:routing_table:{name}"
 
 
 def _format_routing_entry(condition_list: str, output_stream: str) -> str:
@@ -114,7 +119,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
     """You are a live stream processor managing multiple routing tables.
     You also have a notification system for stream updates — it sends you automatic [NOTIFICATION] chat messages disguised as user messages.
     While stream buffer hooks allow you to execute functions automatically, the notification system allows you to get notified (chat messages) automatically.
-    - The set of routing tables is listed in the "system:list:routing_tables" buffer.
+    - The set of routing tables is listed in the _ROUTING_TABLES_BUFFER buffer.
     - Each routing table is stored in an individual buffer containing rules [<condition_list>,<output_stream>]
     - Rules fire top-to-bottom; first match wins and stops evaluation.
     - Condition lists are comma-separated; each sub-condition must be true (AND semantics).
@@ -122,7 +127,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
     - The condition name "true" always matches (good for catch-all / fallback rule).
     - Condition names are sandbox-decorated methods with signature (stream: str, text: str, metadata: dict) -> bool.
       Discover available conditions in doc:reflect:sandbox (hardcoded) and doc:reflect:dynamic (runtime); use define_function to add your own.
-    - Control the stream processor by writing to "stream:processor:control":
+    - Control the stream processor by writing to _CONTROL_BUFFER:
       new <routing_table> <input_stream>  — create routing table
       drop <routing_table>              — delete routing table
       add <routing_table> <condition_list> <output_stream>  — add rule
@@ -130,8 +135,8 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
       enable_notification <stream>  — enable notification on a stream
       disable_notification <stream>  — disable notification on a stream
       configure_notification <stream> [batch_size=<N>] [interval_secs=<T>] [notify_on_empty=<bool>]  — configure notification
-    - The feedback stream "stream:processor:feedback" is always observed (immutable, cannot be disabled).
-    - Read feedback and streaming errors (command results, FALLTHROUGH) from "stream:processor:feedback".
+    - The feedback stream _LOG_BUFFER is always observed (immutable, cannot be disabled).
+    - Read feedback and streaming errors (command results, FALLTHROUGH) from _LOG_BUFFER.
     """
 
     def __init__(self, **kwargs) -> None:
@@ -146,18 +151,18 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         self._stream_notification_timer: asyncio.Task | None = None
 
         # Create the control buffer for routing table commands (sync, no hooks at construction).
-        result = self._create_buffer("stream:processor:control", stream=True)
+        result = self._create_buffer(_CONTROL_BUFFER, stream=True)
         if not result.get("ok"):
             raise RuntimeError(f"failed to create stream:processor:control: {result.get('error')}")
 
         # Create the feedback buffer for routing results and errors (sync, no hooks at construction).
-        result = self._create_buffer("stream:processor:feedback", stream=True)
+        result = self._create_buffer(_LOG_BUFFER, stream=True)
         if not result.get("ok"):
-            raise RuntimeError(f"failed to create stream:processor:feedback: {result.get('error')}")
+            raise RuntimeError(f"failed to create {_LOG_BUFFER}: {result.get('error')}")
 
         # Register the system processor hook to handle control stream commands.
         hook_result = self._set_stream_on_append_hook(
-            "stream:processor:control",
+            _CONTROL_BUFFER,
             name="system_processor",
             hook=lambda stream, text, metadata: self._system_processor_hook(stream, text, metadata),
         )
@@ -165,11 +170,11 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
             raise RuntimeError(f"failed to register system_processor hook: {hook_result.get('error')}")
 
         # Seed the routing tables listing and notification configs listing (sync, no hooks at construction).
-        result = self._create_buffer("system:list:routing_tables", text="[]")
+        result = self._create_buffer(_ROUTING_TABLES_BUFFER, text="[]")
         if not result.get("ok"):
             raise RuntimeError(f"failed to create routing tables buffer: {result.get('error')}")
 
-        result = self._create_buffer("system:list:notification_configs", text="[]")
+        result = self._create_buffer(_NOTIFICATION_CONFIGS_BUFFER, text="[]")
         if not result.get("ok"):
             raise RuntimeError(f"failed to create notification configs buffer: {result.get('error')}")
 
@@ -177,21 +182,21 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         self._stream_notification_timer = _start_stream_notification_timer(self, loop)
 
         # Register the immutable feedback notification (fire-and-forget).
-        task = loop.create_task(self._enable_notification("stream:processor:feedback", immutable=True))
+        task = loop.create_task(self._enable_notification(_LOG_BUFFER, immutable=True))
         task.add_done_callback(
             lambda t: (
                 asyncio.get_running_loop().call_soon_threadsafe(
-                    lambda: self.write_buffer("stream:processor:feedback", f"NOTIFICATION INIT FAILED: {t.exception()}")
+                    lambda: self.write_buffer(_LOG_BUFFER, f"NOTIFICATION INIT FAILED: {t.exception()}")
                 )
                 if t.exception() else None
             )
         )
 
     async def _refresh_routing_tables_buffer(self) -> dict[str, Any]:
-        """Refresh the system:list:routing_tables buffer."""
+        """Refresh the system:config:routing_tables buffer."""
         from petekit.utils.text_formatters import format_dict_list_for_buffer
         return await self.create_buffer(
-            "system:list:routing_tables",
+            _ROUTING_TABLES_BUFFER,
             text=format_dict_list_for_buffer(self._list_routing_tables()),
             overwrite=True
         )
@@ -282,7 +287,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         try:
             cfg.persistent_thread_id = _most_recent_persistent_thread(self)
         except Exception as e:
-            fb_result = await self.write_buffer("stream:processor:feedback", f"PERSISTENT THREAD DETECTION FAILED: {e}")
+            fb_result = await self.write_buffer(_LOG_BUFFER, f"PERSISTENT THREAD DETECTION FAILED: {e}")
             cfg.persistent_thread_id = None
 
         refresh_result = await self._refresh_notification_configs_buffer()
@@ -359,19 +364,19 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
                     stream_name = parts[1]
                     result = await self._disable_notification(stream_name)
                 else:
-                    fb_result = await self.write_buffer("stream:processor:feedback", f"unknown or malformed command: {line}")
+                    fb_result = await self.write_buffer(_LOG_BUFFER, f"unknown or malformed command: {line}")
                     if not fb_result.get("ok"):
                         raise RuntimeError(f"failed to write to feedback buffer: {fb_result.get('error')}")
                     continue
             except Exception as e:
-                fb_result = await self.write_buffer("stream:processor:feedback", f"SYSTEM ERROR: {e}")
+                fb_result = await self.write_buffer(_LOG_BUFFER, f"SYSTEM ERROR: {e}")
                 if not fb_result.get("ok"):
                     raise RuntimeError(f"failed to write system error to feedback buffer: {fb_result.get('error')}") from e
                 raise
 
             if not result.get("ok"):
                 raise RuntimeError(f"command '{cmd}' failed: {result.get('error')}")
-            fb_result = await self.write_buffer("stream:processor:feedback", str(result))
+            fb_result = await self.write_buffer(_LOG_BUFFER, str(result))
             if not fb_result.get("ok"):
                 raise RuntimeError(f"failed to write to feedback buffer: {fb_result.get('error')}")
 
@@ -482,7 +487,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         """Notify all streams that are ready (called by the async timer loop)."""
         # HACK: feedback stream always uses the most recent persistent thread (refreshed on every tick).
         # This must run on every tick to keep the config current.
-        fb_cfg = self._stream_notification_configs.get("stream:processor:feedback")
+        fb_cfg = self._stream_notification_configs.get(_LOG_BUFFER)
         if fb_cfg is not None:
             try:
                 fb_cfg.persistent_thread_id = _most_recent_persistent_thread(self)
@@ -553,13 +558,13 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         try:
             await self.notify_agent(prompt, persistent_thread_id=cfg.persistent_thread_id)
         except Exception as exc:
-            await self.write_buffer("stream:processor:feedback", f"NOTIFICATION ERROR: {exc}")
+            await self.write_buffer(_LOG_BUFFER, f"NOTIFICATION ERROR: {exc}")
 
     async def _refresh_notification_configs_buffer(self) -> dict[str, Any]:
-        """Refresh the system:list:notification_configs buffer."""
+        """Refresh the system:config:notification_configs buffer."""
         from petekit.utils.text_formatters import format_dict_list_for_buffer
         return await self.create_buffer(
-            "system:list:notification_configs",
+            _NOTIFICATION_CONFIGS_BUFFER,
             text=format_dict_list_for_buffer(self.list_notification_configs()),
             overwrite=True
         )
@@ -585,7 +590,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         """
         # Guard: reject if the routing table does not exist.
         if routing_table not in self._routing_tables:
-            fb_result = await self.write_buffer("stream:processor:feedback", f"ERROR: routing_table '{routing_table}' not found")
+            fb_result = await self.write_buffer(_LOG_BUFFER, f"ERROR: routing_table '{routing_table}' not found")
             if not fb_result.get("ok"):
                 raise RuntimeError(f"failed to write ERROR to feedback: {fb_result.get('error')}")
             return
@@ -606,12 +611,12 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
                 try:
                     matched = await self._evaluate_condition(sc, text, metadata)
                 except RoutingConditionError as e:
-                    fb_result = await self.write_buffer("stream:processor:feedback", f"FALLTHROUGH source={table.input_stream} ts={ts} reason={e}")
+                    fb_result = await self.write_buffer(_LOG_BUFFER, f"FALLTHROUGH source={table.input_stream} ts={ts} reason={e}")
                     if not fb_result.get("ok"):
                         raise RuntimeError(f"failed to write FALLTHROUGH to feedback: {fb_result.get('error')}")
                     return
                 except Exception as e:
-                    fb_result = await self.write_buffer("stream:processor:feedback", f"CONDITION ERROR condition='{sc}' text='{text[:40]}' error='{e}'")
+                    fb_result = await self.write_buffer(_LOG_BUFFER, f"CONDITION ERROR condition='{sc}' text='{text[:40]}' error='{e}'")
                     if not fb_result.get("ok"):
                         raise RuntimeError(f"failed to write CONDITION ERROR to feedback: {fb_result.get('error')}")
                     return
@@ -623,14 +628,14 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
             if all_match:
                 sink_result = await self.write_buffer(output_stream, text)
                 if not sink_result.get("ok"):
-                    fb_result = await self.write_buffer("stream:processor:feedback", f"SINK ERROR: failed to write to '{output_stream}': {sink_result.get('error')}")
+                    fb_result = await self.write_buffer(_LOG_BUFFER, f"SINK ERROR: failed to write to '{output_stream}': {sink_result.get('error')}")
                     if not fb_result.get("ok"):
                         raise RuntimeError(f"failed to write SINK ERROR to feedback: {fb_result.get('error')}")
                     return
                 return
 
         # No condition list matched: report FALLTHROUGH to the feedback stream.
-        fb_result = await self.write_buffer("stream:processor:feedback", f"FALLTHROUGH source={table.input_stream} ts={ts}")
+        fb_result = await self.write_buffer(_LOG_BUFFER, f"FALLTHROUGH source={table.input_stream} ts={ts}")
         if not fb_result.get("ok"):
             raise RuntimeError(f"failed to write FALLTHROUGH to feedback: {fb_result.get('error')}")
 

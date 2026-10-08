@@ -15,7 +15,7 @@ from peteos.oap.agentic_object import AgenticObject
 
 from petekit.text.buffer_manager import BufferManager
 
-_FUNCTION_LIST_BUFFER = "system:list:functions"
+_FUNCTION_STATUS_BUFFER = "system:status:functions"
 
 
 @dataclass
@@ -31,9 +31,9 @@ class FunctionEntry:
     modified_at: float
 
 
-def _build_buffer_name(name: str) -> str:
-    # Prefix the function name so it lives in the function: namespace.
-    return f"function:{name}:meta"
+def _function_status_name(name: str) -> str:
+    # Derive the canonical status buffer name for a single function.
+    return f"system:status:function:{name}"
 
 
 def _compute_mac(fm: "FunctionManager", data: str) -> str:
@@ -109,15 +109,15 @@ async def _refresh_list_buffer(fm: "FunctionManager") -> None:
             "args": f"({arg_summary})",
             "description": entry.short_description,
         })
-    # Write the signed JSON catalog to the system:list:functions buffer, replacing existing content.
+    # Write the signed JSON catalog to the _FUNCTION_STATUS_BUFFER, replacing existing content.
     text = _sign_payload(fm, records)
-    await fm.create_buffer(_FUNCTION_LIST_BUFFER, text=text, overwrite=True)
+    await fm.create_buffer(_FUNCTION_STATUS_BUFFER, text=text, overwrite=True)
 
 
 class FunctionManager(BufferManager, AgenticObject):
     """A BufferManager that also manages a namespace of runtime-created Callables.
-    Each function lives in self._functions and is mirrored to a function:<name>:meta buffer
-    (signed JSON) for agent introspection. A system:list:functions buffer catalogs all registered functions.
+    Each function lives in self._functions and is mirrored to a system:status:function:<name> buffer
+    (signed JSON) for agent introspection. A _FUNCTION_STATUS_BUFFER catalogs all registered functions.
     All buffers are HMAC-protected against external writes.
     """
 
@@ -127,18 +127,18 @@ class FunctionManager(BufferManager, AgenticObject):
         self._function_manager_signing_key: str = secrets.token_hex(32)
 
         # Create the initial catalog buffer.
-        init_result = self._create_buffer(_FUNCTION_LIST_BUFFER, text=_sign_payload(self, []))
+        init_result = self._create_buffer(_FUNCTION_STATUS_BUFFER, text=_sign_payload(self, []))
         if not isinstance(init_result, dict) or not init_result.get("ok"):
             raise RuntimeError(f"failed to create function list buffer: {init_result.get('error')}")
 
         # Guard the catalog buffer against unsigned writes.
         hook_result = self.register_buffer_update_hook(
-            _FUNCTION_LIST_BUFFER,
+            _FUNCTION_STATUS_BUFFER,
             "readonly_sentinel",
             _make_readonly_sentinel(self),
         )
         if not isinstance(hook_result, dict) or not hook_result.get("ok"):
-            raise RuntimeError(f"failed to register readonly_sentinel on {_FUNCTION_LIST_BUFFER}: {hook_result.get('error')}")
+            raise RuntimeError(f"failed to register readonly_sentinel on {_FUNCTION_STATUS_BUFFER}: {hook_result.get('error')}")
 
     @sandbox
     async def create_function(
@@ -156,7 +156,7 @@ class FunctionManager(BufferManager, AgenticObject):
             }
 
         # Guard: prevent the reserved catalog buffer name from being used as a function name.
-        if name == _FUNCTION_LIST_BUFFER:
+        if name == _FUNCTION_STATUS_BUFFER:
             return {
                 "ok": False,
                 "error": f"'{name}' is a reserved name.",
@@ -186,7 +186,7 @@ class FunctionManager(BufferManager, AgenticObject):
         # Mirror the function entry into a signed JSON buffer the agent can read;
         # create_buffer with overwrite=True fires existing buffer hooks automatically.
         buf_result = await self.create_buffer(
-            _build_buffer_name(name),
+            _function_status_name(name),
             text=_sign_payload(self, _build_function_meta(entry)),
             overwrite=True,
         )
@@ -198,7 +198,7 @@ class FunctionManager(BufferManager, AgenticObject):
 
         # Guard the new meta buffer against unsigned writes.
         hook_result = self.register_buffer_update_hook(
-            _build_buffer_name(name),
+            _function_status_name(name),
             "readonly_sentinel",
             _make_readonly_sentinel(self),
         )
@@ -228,7 +228,7 @@ class FunctionManager(BufferManager, AgenticObject):
             return {"ok": False, "error": f"No function named '{name}'."}
 
         # Drop the function's buffer; a hook rejection prevents the drop and returns the error.
-        buf_name = _build_buffer_name(name)
+        buf_name = _function_status_name(name)
 
         # Unregister the write guard before dropping — the sentinel would block the drop.
         self.unregister_buffer_update_hook(buf_name, "readonly_sentinel")

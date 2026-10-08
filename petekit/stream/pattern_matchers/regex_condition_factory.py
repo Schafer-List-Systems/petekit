@@ -10,8 +10,15 @@ from ...function.function_manager import FunctionManager
 from ...utils.text_codecs import make_json_codec
 
 
-_CONDITION_LIST_BUFFER = "system:list:regex_conditions"
+_CONDITION_LIST_BUFFER = "system:config:regex_conditions"
 _REGEX_DOC_BUFFER = "doc:regex_conditions"
+_REGEX_PATTERN_BUFFER = "system:config:regex_condition"
+
+
+def _pattern_buffer_name(condition_name: str) -> str:
+    # Derive the canonical buffer name for a single pattern buffer.
+    return f"{_REGEX_PATTERN_BUFFER}:{condition_name}"
+
 
 
 def _diff_keys(old: dict, new: dict) -> tuple[set[str], set[str], set[str]]:
@@ -24,7 +31,7 @@ def _diff_keys(old: dict, new: dict) -> tuple[set[str], set[str], set[str]]:
 _REGEX_DOC = """\
 ## Schema
 
-system:list:regex_conditions  — catalog of all condition descriptors (JSON)
+system:config:regex_conditions  — catalog of all condition descriptors (JSON)
     {
         "conditions": {
             "<condition_name>": {
@@ -34,7 +41,7 @@ system:list:regex_conditions  — catalog of all condition descriptors (JSON)
         }
     }
 
-function:<condition_name>:regex  — per-condition pattern dictionary (JSON)
+system:config:regex_condition:<condition_name>  — per-condition pattern dictionary (JSON)
     {
         "<pattern_name>": {
             "regex": "<regex>",
@@ -49,11 +56,11 @@ using fullmatch semantics — the entire line must match (^...$).
 
 To add a condition, add an entry to the conditions dictionary in the conditions list buffer:
     "conditions": {"<condition_name>": {"name": "<condition_name>"}}
-- The pattern buffer function:<condition_name>:regex is created automatically.
+- The pattern buffer system:config:regex_condition:<condition_name> is created automatically.
 
 To remove a condition, remove its entry from the conditions list buffer.
 
-To add or update a pattern in the pattern buffer function:<condition_name>:regex, write an entry:
+To add or update a pattern in the pattern buffer system:config:regex_condition:<condition_name>, write an entry:
     "<pattern_name>": {"regex": "<regex>", "sample_line": "<example>"}
     The regex is validated against sample_line immediately — a mismatch is rejected.
 
@@ -61,13 +68,8 @@ To remove a pattern, remove its entry from the pattern buffer.
 """
 
 
-def _pattern_buffer_name(condition_name: str) -> str:
-    # Derive the canonical buffer name for a single pattern buffer.
-    return f"function:{condition_name}:regex"
-
-
 def _drop_guard(buf, old_text: str | None, start: int, end: int, new_text: str | None) -> str | None:
-    """Block direct buffer drops. Remove entries via system:list:regex_conditions instead."""
+    """Block direct buffer drops. Remove entries via _CONDITION_LIST_BUFFER instead."""
     if new_text is None:
         return f"This buffer cannot be dropped. Remove entries via {_CONDITION_LIST_BUFFER} instead."
     return None
@@ -166,7 +168,7 @@ async def _pattern_update_hook(factory, buf, old_json: dict, new_json: dict | No
 
     # Derive the condition name from the buffer name and update its pattern count.
     conditions = data.get("conditions", {})
-    derived_name = buf.name.removeprefix("function:").removesuffix(":regex")
+    derived_name = buf.name.removeprefix("system:config:regex_condition:")
     if derived_name not in conditions:
         raise RuntimeError(f"condition '{derived_name}' not found in conditions list — internal state corruption")
     conditions[derived_name]["pattern_count"] = len(new_json)
@@ -268,13 +270,13 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
                     return f"condition '{name}' could not be added: {func_result.get('error')}"
 
                 # Guard the meta buffer against direct drops — remove via the conditions list.
-                meta_name = f"function:{name}:meta"
+                meta_name = f"system:status:function:{name}"
 
                 def _meta_drop_guard(buf, old_text, start, end, new_text):
                     if new_text is None:
                         return (
                             f"Buffer '{meta_name}' is managed by RegexConditionManager. "
-                            "Remove entries via system:list:regex_conditions instead."
+                            f"Remove entries via {_CONDITION_LIST_BUFFER} instead."
                         )
                     return None
 
@@ -294,7 +296,7 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
         elif name in removed:
             # Derive the pattern buffer name from the condition name — always deterministic.
             pattern_buffer_name = _pattern_buffer_name(name)
-            meta_name = f"function:{name}:meta"
+            meta_name = f"system:status:function:{name}"
 
             # Unregister our drop guard — we are authorized to drop, the sentinel must not block us.
             factory.unregister_buffer_update_hook(pattern_buffer_name, "drop_guard")
