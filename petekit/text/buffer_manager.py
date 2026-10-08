@@ -851,6 +851,11 @@ class BufferManager(AgenticObject):
             BufferEntry(data=line, modified_at=now, object_at=now) for line in new_lines
         ]
 
+        # Fire update hooks before committing — rejection blocks the patch.
+        hook_result = await buf._fire_update_hooks(buf_text, 0, len(buf.lines), new_text)
+        if hook_result is not True and hook_result is not None:
+            return {"ok": False, "error": str(hook_result)}
+
         # Commit the patched lines back into the buffer.
         buf.lines[:] = result_entries
         buf.modified_at = now
