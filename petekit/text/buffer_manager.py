@@ -27,6 +27,11 @@ def _diff_buffer_name(a: str, b: str) -> str:
     return f"{_DIFF_BUFFER_PREFIX}{a}→{b}"
 
 
+def _sanitize_buffer_name(name: str) -> str:
+    """Remove ASCII whitespace from a buffer name segment. Use this for any name derived from agent input."""
+    return "".join(c for c in name if c not in " \t\n\r")
+
+
 def _resolve_line_number(total: int, pos: int  | str | None, arg: str = 'pos') -> dict[str, Any] | int:
     # coerce to int
     if pos is None:

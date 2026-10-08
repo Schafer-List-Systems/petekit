@@ -5,7 +5,7 @@ from typing import Any
 
 from peteos import AgenticObject, sandbox, tool
 from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buffer
-from ..utils.text_formatters import _sanitize_title
+from ..text.buffer_manager import _sanitize_buffer_name
 
 
 # Managed buffer names — system:status: and stream: namespaces
@@ -16,12 +16,12 @@ _STREAM_OUT_PREFIX = "stream:out:"
 
 def _stream_in_buffer(name: str) -> str:
     # Derive the canonical inbound stream buffer name for a connection.
-    return f"{_STREAM_IN_PREFIX}{_sanitize_title(name)}"
+    return f"{_STREAM_IN_PREFIX}{_sanitize_buffer_name(name)}"
 
 
 def _stream_out_buffer(name: str) -> str:
     # Derive the canonical outbound stream buffer name for a connection.
-    return f"{_STREAM_OUT_PREFIX}{_sanitize_title(name)}"
+    return f"{_STREAM_OUT_PREFIX}{_sanitize_buffer_name(name)}"
 
 
 @dataclass

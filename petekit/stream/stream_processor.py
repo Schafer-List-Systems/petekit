@@ -10,6 +10,7 @@ from peteos import AgenticObject, sandbox
 from peteos.persona.agent import Agent
 from .stream_buffer_manager import StreamBufferManager
 from ..function.function_manager import FunctionManager
+from ..text.buffer_manager import _sanitize_buffer_name
 import asyncio
 
 
@@ -66,7 +67,7 @@ def _most_recent_persistent_thread(obj: AgenticObject) -> str | None:
 
 
 def _routing_table_key(name: str) -> str:
-    return f"system:config:routing_table:{name}"
+    return f"system:config:routing_table:{_sanitize_buffer_name(name)}"
 
 
 def _format_routing_entry(condition_list: str, output_stream: str) -> str:

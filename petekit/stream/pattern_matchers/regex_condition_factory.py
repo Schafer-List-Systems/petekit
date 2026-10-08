@@ -7,6 +7,7 @@ from typing import Any
 
 from peteos import AgenticObject
 from ...function.function_manager import FunctionManager, _FUNCTION_STATUS_NAME_BASE
+from ...text.buffer_manager import _sanitize_buffer_name
 from ...utils.text_codecs import make_json_codec
 
 
@@ -17,7 +18,7 @@ _REGEX_PATTERN_BUFFER = "system:config:regex_condition"
 
 def _pattern_buffer_name(condition_name: str) -> str:
     # Derive the canonical buffer name for a single pattern buffer.
-    return f"{_REGEX_PATTERN_BUFFER}:{condition_name}"
+    return f"{_REGEX_PATTERN_BUFFER}:{_sanitize_buffer_name(condition_name)}"
 
 
 

@@ -13,7 +13,7 @@ from typing import Any, Callable
 from peteos import tool, sandbox
 from peteos.oap.agentic_object import AgenticObject
 
-from petekit.text.buffer_manager import BufferManager
+from petekit.text.buffer_manager import BufferManager, _sanitize_buffer_name
 
 _FUNCTION_STATUS_BUFFER = "system:status:function"
 _FUNCTION_STATUS_NAME_BASE = "system:status:function:"
@@ -34,7 +34,7 @@ class FunctionEntry:
 
 def _function_status_name(name: str) -> str:
     # Derive the canonical status buffer name for a single function.
-    return f"{_FUNCTION_STATUS_NAME_BASE}{name}"
+    return f"{_FUNCTION_STATUS_NAME_BASE}{_sanitize_buffer_name(name)}"
 
 
 def _compute_mac(fm: "FunctionManager", data: str) -> str:
