@@ -155,11 +155,11 @@ class FunctionManager(BufferManager, AgenticObject):
                 "error": f"Function '{name}' already registered.",
             }
 
-        # Guard: prevent the reserved catalog buffer name from being used as a function name.
-        if name == _FUNCTION_STATUS_BUFFER:
+        # Guard: reject names that are not valid Python identifiers.
+        if not name.isidentifier():
             return {
                 "ok": False,
-                "error": f"'{name}' is a reserved name.",
+                "error": f"'{name}' is not a valid Python identifier.",
             }
 
         # Extract metadata from the callable; fall back to its docstring when descriptions are absent.
