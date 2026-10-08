@@ -22,8 +22,8 @@ class ReflectionCatalog:
 class SelfReflector(BufferManager, AgenticObject):
     """You maintain two buffers listing every member method you can call on self,
     i.e. for each definition `f(...)` in that list, you can call `self.f(...)` from within python.
-    - docs:reflect:sandbox — hardcoded @sandbox and @tool methods. Always present. Parse with json.loads.
-    - docs:reflect:dynamic — runtime-defined methods. Only present when the define_functions tool is available.
+    - doc:reflect:sandbox — hardcoded @sandbox and @tool methods. Always present. Parse with json.loads.
+    - doc:reflect:dynamic — runtime-defined methods. Only present when the define_functions tool is available.
     Consult these buffers before writing Python code so you know which methods are available on self."""
 
     def __init__(self, **kwargs):
@@ -40,9 +40,9 @@ class SelfReflector(BufferManager, AgenticObject):
 
         # Populate sandbox buffer at construction time with hardcoded @sandbox/@tool methods
         sandbox_text = format_dict_list_for_buffer(self._self_reflection_catalog.hardcoded)
-        self._create_buffer("docs:reflect:sandbox", text=sandbox_text)
+        self._create_buffer("doc:reflect:sandbox", text=sandbox_text)
         if self._self_reflection_catalog.dynamic_functions:
-            self._create_buffer("docs:reflect:dynamic", text="[]")
+            self._create_buffer("doc:reflect:dynamic", text="[]")
             # TODO: Hook registration: attach_class after_tool_execution for define_function / remove_function to rebuild sandbox_api buffer
 
     def _self_reflection_on_tool_executed(self, runner: Runner, tc: ContentPart, status: ExecStatus, ok: bool) -> None:
@@ -67,4 +67,4 @@ class SelfReflector(BufferManager, AgenticObject):
 
         # Refresh dynamic buffer to reflect current runtime catalog
         dynamic_text = format_dict_list_for_buffer(self._self_reflection_catalog.runtime)
-        self.create_buffer("docs:reflect:dynamic", text=dynamic_text, overwrite=True)
+        self.create_buffer("doc:reflect:dynamic", text=dynamic_text, overwrite=True)

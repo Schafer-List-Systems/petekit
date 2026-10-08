@@ -121,7 +121,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
     - Prefix a sub-condition with "!" to negate it.
     - The condition name "true" always matches (good for catch-all / fallback rule).
     - Condition names are sandbox-decorated methods with signature (stream: str, text: str, metadata: dict) -> bool.
-      Discover available conditions in docs:reflect:sandbox (hardcoded) and docs:reflect:dynamic (runtime); use define_function to add your own.
+      Discover available conditions in doc:reflect:sandbox (hardcoded) and doc:reflect:dynamic (runtime); use define_function to add your own.
     - Control the stream processor by writing to "stream:processor:control":
       new <routing_table> <input_stream>  — create routing table
       drop <routing_table>              — delete routing table
