@@ -229,6 +229,10 @@ class FunctionManager(BufferManager, AgenticObject):
 
         # Drop the function's buffer; a hook rejection prevents the drop and returns the error.
         buf_name = _build_buffer_name(name)
+
+        # Unregister the write guard before dropping — the sentinel would block the drop.
+        self.unregister_buffer_update_hook(buf_name, "readonly_sentinel")
+
         drop_result = await self.drop_buffer(buf_name)
         if not drop_result.get("ok"):
             return drop_result

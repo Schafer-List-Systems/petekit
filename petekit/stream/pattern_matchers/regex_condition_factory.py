@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from typing import Any
 
 from peteos import AgenticObject
@@ -60,30 +59,6 @@ To add or update a pattern in the pattern buffer function:<condition_name>:regex
 
 To remove a pattern, remove its entry from the pattern buffer.
 """
-
-PatternId: type = int
-
-
-@dataclass
-class RegexPattern:
-    """
-    A single regex pattern associated with the exact line it was created from.
-
-    Internal:
-    - id: auto-incrementing integer, unique within the group
-    - pattern: compiled re.Pattern (fullmatch semantics)
-    - sample_line: the line that originally triggered creation of this pattern
-    """
-    id: PatternId
-    pattern: re.Pattern
-    sample_line: str
-
-
-class RegexCondition:
-    """A named collection of regex patterns. All patterns must match for the table to fire."""
-
-    def __init__(self) -> None:
-        self._patterns: dict[str, RegexPattern] = {}
 
 
 def _pattern_buffer_name(condition_name: str) -> str:
@@ -296,14 +271,38 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
                 if not func_result.get("ok"):
                     return f"condition '{name}' could not be added: {func_result.get('error')}"
 
+                # Guard the meta buffer against direct drops — remove via the conditions list.
+                meta_name = f"function:{name}:meta"
+
+                def _meta_drop_guard(buf, old_text, start, end, new_text):
+                    if new_text is None:
+                        return (
+                            f"Buffer '{meta_name}' is managed by RegexConditionManager. "
+                            "Remove entries via system:list:regex_conditions instead."
+                        )
+                    return None
+
+                reg_result = factory.register_buffer_update_hook(
+                    meta_name,
+                    "regex_condition_meta_drop_guard",
+                    _meta_drop_guard,
+                )
+                if not reg_result.get("ok"):
+                    return (
+                        f"condition '{name}' could not be added: "
+                        f"meta drop guard could not be registered on '{meta_name}': "
+                        f"{reg_result.get('error')}"
+                    )
+
         # Remove — the condition is absent from the new state.
         elif name in removed:
             # Derive the pattern buffer name from the condition name — always deterministic.
             pattern_buffer_name = _pattern_buffer_name(name)
             meta_name = f"function:{name}:meta"
 
-            # Unregister our drop guards — we are authorized to drop, the sentinel must not block us.
+            # Unregister our drop guard — we are authorized to drop, the sentinel must not block us.
             factory.unregister_buffer_update_hook(pattern_buffer_name, "drop_guard")
+            factory.unregister_buffer_update_hook(meta_name, "regex_condition_meta_drop_guard")
 
             # Drop the function and its config buffer — the condition is being removed.
             drop_fn_result = await factory.drop_function(name)
@@ -321,7 +320,6 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._conditions: dict[str, RegexCondition] = {}
 
         # Seed the registry buffer with an empty conditions list.
         import json
