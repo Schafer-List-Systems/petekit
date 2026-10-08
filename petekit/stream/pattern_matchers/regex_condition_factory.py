@@ -29,43 +29,43 @@ def _diff_keys(old: dict, new: dict) -> tuple[set[str], set[str], set[str]]:
     changed = {k for k in set(old.keys()) & set(new.keys()) if old[k] != new[k]}
     return (added, removed, changed)
 
-_REGEX_DOC = """\
+_REGEX_DOC = f"""\
 ## Schema
 
-system:config:regex_condition  — catalog of all condition descriptors (JSON)
-    {
-        "conditions": {
-            "<condition_name>": {
+{_CONDITION_LIST_BUFFER}  — catalog of all condition descriptors (JSON)
+    {{
+        "conditions": {{
+            "<condition_name>": {{
                 "name": "<condition_name>",
                 "pattern_count": N
-            }
-        }
-    }
+            }}
+        }}
+    }}
 
-system:config:regex_condition:<condition_name>  — per-condition pattern dictionary (JSON)
-    {
-        "<pattern_name>": {
+{_REGEX_PATTERN_BUFFER}:<condition_name>  — per-condition pattern dictionary (JSON)
+    {{
+        "<pattern_name>": {{
             "regex": "<regex>",
             "sample_line": "..."
-        }
-    }
+        }}
+    }}
 
 ## Usage
 
 A condition evaluates to True when the incoming text matches ANY of its patterns
 using fullmatch semantics — the entire line must match (^...$).
 
-To add a condition, add an entry to the conditions dictionary in the conditions list buffer:
-    "conditions": {"<condition_name>": {"name": "<condition_name>"}}
-- The pattern buffer system:config:regex_condition:<condition_name> is created automatically.
+To add a condition, add an entry to the conditions catalog in "{_CONDITION_LIST_BUFFER}":
+- The pattern buffer {_REGEX_PATTERN_BUFFER}:<condition_name> is created automatically.
 
-To remove a condition, remove its entry from the conditions list buffer.
+To remove a condition, remove its entry from "{_CONDITION_LIST_BUFFER}".
 
-To add or update a pattern in the pattern buffer system:config:regex_condition:<condition_name>, write an entry:
-    "<pattern_name>": {"regex": "<regex>", "sample_line": "<example>"}
+To add or update a pattern in the pattern buffer {_REGEX_PATTERN_BUFFER}:<condition_name>, write an entry:
+    "<pattern_name>": {{"regex": "<regex>", "sample_line": "<example>"}}
     The regex is validated against sample_line immediately — a mismatch is rejected.
-
 To remove a pattern, remove its entry from the pattern buffer.
+
+Prefer beautified JSON format!
 """
 
 
