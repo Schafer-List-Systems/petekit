@@ -136,14 +136,6 @@ def _validate_pattern_against_sample(pattern: str, sample_line: str) -> re.Patte
 
 
 async def _pattern_update_hook(factory, buf, old_json: dict, new_json: dict, patch) -> bool | str:
-    # Guard: new_json is None when drop_buffer fires hooks before deleting the buffer.
-    # Block direct drops — the factory must remove conditions via the conditions list buffer.
-    if new_json is None:
-        return (
-            "Cannot delete this buffer directly. "
-            "Remove the condition from system:list:regex_conditions instead."
-        )
-
     # Compute the diff between old and new patterns to find which are added, removed, or changed.
     added, removed, changed = _diff_keys(old_json, new_json)
 
