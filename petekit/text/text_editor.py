@@ -12,7 +12,12 @@ from dataclasses import dataclass
 from peteos.oap.agentic_object import AgenticObject
 from peteos import tool
 
-from .buffer_manager import BufferEntry, BufferManager
+from .buffer_manager import BufferEntry, BufferManager, _DIFF_BUFFER_PREFIX
+
+
+def _diff_text_buffer_name(abs_path: str) -> str:
+    # Derive the diff buffer name for a file-backed buffer.
+    return f"{_DIFF_BUFFER_PREFIX}{abs_path}"
 
 
 @dataclass
@@ -194,7 +199,7 @@ class TextEditor(BufferManager, AgenticObject):
             return {"ok": True, "identical": True, "scope": scope, "scope_hint": scope_hint}
 
         # Guard against overwriting an existing diff buffer.
-        diff_name = f"diff:{abs_path}"
+        diff_name = _diff_text_buffer_name(abs_path)
         if diff_name in self._buffers and not overwrite:
             return {
                 "ok": False,

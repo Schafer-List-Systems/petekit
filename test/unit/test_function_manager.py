@@ -113,7 +113,7 @@ class TestFunctionManagerBasic:
 
         await fm.create_function("fn1", fn1)
         await fm.create_function("fn2", fn2)
-        content = await fm.read_buffer("system:status:functions", raw=True, show_line_numbers=False)
+        content = await fm.read_buffer("system:status:function", raw=True, show_line_numbers=False)
         obj = json.loads(content)
         names = [r["name"] for r in obj["data"]]
         assert "fn1" in names

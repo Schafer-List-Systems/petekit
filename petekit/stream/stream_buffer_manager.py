@@ -16,6 +16,11 @@ from ..utils.text_formatters import format_dict_list_for_buffer
 from ..text.buffer_manager import Buffer, BufferEntry, BufferManager, _resolve_line_number
 
 
+# Managed buffer names — system:status: namespace
+_STREAM_BUFFERS_STATUS_BUFFER = "system:status:stream_buffers"
+_STREAM_BUFFER_HOOKS_STATUS_BUFFER = "system:status:stream_buffer_hooks"
+
+
 @dataclass
 class StreamBufferHookError:
     timestamp: float = field(default_factory=time.time)  # when the error occurred
@@ -162,8 +167,6 @@ class StreamBufferManager(BufferManager, AgenticObject):
 
         # Register the stream config entry so hooks and stream-aware lookups work correctly.
         if stream:
-            if not name.startswith("stream:"):
-                return {"ok": False, "error": "stream name must start with 'stream:' prefix"}
             self.stream_buffer_configs[name] = StreamBufferConfig()
 
         return result
@@ -172,10 +175,8 @@ class StreamBufferManager(BufferManager, AgenticObject):
     async def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False, stream: bool = False) -> dict[str, Any]:
         """Create a new named buffer, optionally populated with text.
         Pass stream=True to create a stream buffer with hook support."""
-        # Guard: stream names must carry the stream: prefix.
+        # Guard: prevent duplicate stream buffer names.
         if stream:
-            if not name.startswith("stream:"):
-                return {"ok": False, "error": "stream name must start with 'stream:' prefix"}
             if name in self.stream_buffer_configs and not overwrite:
                 return {"ok": False, "error": f"stream '{name}' already exists. Use overwrite=True to replace it."}
 
@@ -233,7 +234,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
     async def _refresh_stream_buffers_buffer(self) -> dict[str, Any]:
         """Refresh the system:status:stream_buffers buffer, one JSON dict per line."""
         text = format_dict_list_for_buffer(self.list_stream_buffers())
-        return await self.create_buffer("system:status:stream_buffers", text=text, overwrite=True)
+        return await self.create_buffer(_STREAM_BUFFERS_STATUS_BUFFER, text=text, overwrite=True)
 
     async def _refresh_stream_buffer_hooks(self) -> dict[str, Any]:
         """Refresh the system:status:stream_buffer_hooks buffer with all hook states."""
@@ -250,7 +251,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         ]
         records.sort(key=lambda r: (r["stream"], -r["priority"]))
         text = format_dict_list_for_buffer(records)
-        return await self.create_buffer("system:status:stream_buffer_hooks", text=text, overwrite=True)
+        return await self.create_buffer(_STREAM_BUFFER_HOOKS_STATUS_BUFFER, text=text, overwrite=True)
 
     @tool
     async def read_buffer(self, name: str, start: int | float = 0, end: int | float | str = "end", show_timestamps: bool = False, show_line_numbers: bool = False, raw: bool = False) -> dict[str, Any] | str:

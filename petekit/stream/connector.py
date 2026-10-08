@@ -8,6 +8,22 @@ from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buf
 from ..utils.text_formatters import _sanitize_title
 
 
+# Managed buffer names — system:status: and stream: namespaces
+_CONNECTIONS_STATUS_BUFFER = "system:status:network:connections"
+_STREAM_IN_PREFIX = "stream:in:"
+_STREAM_OUT_PREFIX = "stream:out:"
+
+
+def _stream_in_buffer(name: str) -> str:
+    # Derive the canonical inbound stream buffer name for a connection.
+    return f"{_STREAM_IN_PREFIX}{_sanitize_title(name)}"
+
+
+def _stream_out_buffer(name: str) -> str:
+    # Derive the canonical outbound stream buffer name for a connection.
+    return f"{_STREAM_OUT_PREFIX}{_sanitize_title(name)}"
+
+
 @dataclass
 class ConnectionHandle:
     """Holds the connection details and handles for a named connection."""
@@ -31,12 +47,12 @@ class Connector(StreamBufferManager, AgenticObject):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.connections: dict[str, ConnectionHandle] = {}
-        self._create_buffer("system:status:network:connections", "[]\n")
+        self._create_buffer(_CONNECTIONS_STATUS_BUFFER, "[]\n")
 
     async def _refresh_connections_buffer(self) -> None:
         records = self.list_connections()
         text = format_dict_list_for_buffer(records)
-        await self.create_buffer("system:status:network:connections", text=text, overwrite=True)
+        await self.create_buffer(_CONNECTIONS_STATUS_BUFFER, text=text, overwrite=True)
 
     @tool
     async def connect(self, name: str, host: str, port: int, ssl: bool = False) -> dict[str, Any]:
@@ -47,8 +63,8 @@ class Connector(StreamBufferManager, AgenticObject):
         # Guard: reject duplicate connection names before allocating resources.
         # Prepare: name the stream buffers and teardown any stale ones from a prior session.
         now = time.time()
-        in_buffer = f"stream:in:{_sanitize_title(name)}"
-        out_buffer = f"stream:out:{_sanitize_title(name)}"
+        in_buffer = _stream_in_buffer(name)
+        out_buffer = _stream_out_buffer(name)
         for buf in (in_buffer, out_buffer):
             try:
                 await self.drop_buffer(buf)

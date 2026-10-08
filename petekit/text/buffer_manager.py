@@ -17,6 +17,16 @@ from peteos import tool, sandbox
 from petekit.utils.text_formatters import format_dict_list_for_buffer
 
 
+# Managed buffer names — system:status: namespace and diff namespace
+_STATUS_BUFFER = "system:status:buffers"
+_DIFF_BUFFER_PREFIX = "diff:"
+
+
+def _diff_buffer_name(a: str, b: str) -> str:
+    # Derive the canonical diff buffer name from two buffer identifiers.
+    return f"{_DIFF_BUFFER_PREFIX}{a}→{b}"
+
+
 def _resolve_line_number(total: int, pos: int  | str | None, arg: str = 'pos') -> dict[str, Any] | int:
     # coerce to int
     if pos is None:
@@ -320,7 +330,7 @@ class BufferManager(AgenticObject):
     async def _refresh_buffers_buffer(self) -> dict[str, Any]:
         records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
         text = format_dict_list_for_buffer(records)
-        return await self.create_buffer("system:status:buffers", text=text, overwrite=True)
+        return await self.create_buffer(_STATUS_BUFFER, text=text, overwrite=True)
 
     def _create_buffer(self, name: str, text: str | None = None) -> dict[str, Any]:
         """Protected buffer creation for initialization only.
@@ -370,7 +380,7 @@ class BufferManager(AgenticObject):
             create_result = self._create_buffer(name, text)
 
         # Refresh the system buffer listing so the new buffer is visible to the agent.
-        if name != "system:status:buffers":
+        if name != _STATUS_BUFFER:
             refresh_result = await self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already created and registered — rolling back would require
@@ -395,7 +405,7 @@ class BufferManager(AgenticObject):
         now = time.time()
         new_entries = [BufferEntry(data=e.data, modified_at=e.modified_at, object_at=now) for e in src.lines]
         self._buffers[target_name] = Buffer(name=target_name, lines=new_entries, created_at=now, modified_at=now)
-        if target_name != "system:status:buffers":
+        if target_name != _STATUS_BUFFER:
             refresh_result = await self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already created and registered — rolling back would require
@@ -437,7 +447,7 @@ class BufferManager(AgenticObject):
         buf.modified_at = time.time()
 
         # Refresh the buffer registry to keep the system listing current.
-        if name != "system:status:buffers":
+        if name != _STATUS_BUFFER:
             refresh_result = await self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already modified — rolling back would require restoring prior
@@ -457,8 +467,8 @@ class BufferManager(AgenticObject):
         buf = self._buffers[name]
 
         # Guard: the system listing buffer may not be dropped.
-        if name == "system:status:buffers":
-            return {"ok": False, "error": "Cannot drop the 'system:status:buffers' buffer."}
+        if name == _STATUS_BUFFER:
+            return {"ok": False, "error": f"Cannot drop the '{_STATUS_BUFFER}' buffer."}
 
         # Fire update hooks with the full buffer content and None for new_text (signals drop).
         # Rejection means the drop is denied and the buffer must not be deleted.
@@ -657,7 +667,7 @@ class BufferManager(AgenticObject):
         """
         # Validate the named buffer exists.
         if name not in self._buffers:
-            return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"system:status:buffers\" to see available buffers."}
+            return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"{_STATUS_BUFFER}\" to see available buffers."}
         if not old_string:
             return {"ok": False, "error": "old_string must not be empty."}
         buf = self._buffers[name]
@@ -813,7 +823,7 @@ class BufferManager(AgenticObject):
         """
         # Validate the named buffer exists.
         if name not in self._buffers:
-            return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"system:status:buffers\" to see available buffers."}
+            return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"{_STATUS_BUFFER}\" to see available buffers."}
 
         # Import paatch; surface a clear error if it is not installed.
         try:
@@ -881,7 +891,7 @@ class BufferManager(AgenticObject):
             return {"ok": True, "identical": True, "a": a, "b": b}
 
         # Guard against overwriting an existing diff buffer.
-        diff_name = f"diff:{a}→{b}"
+        diff_name = _diff_buffer_name(a, b)
         if diff_name in self._buffers and not overwrite:
             return {
                 "ok": False,

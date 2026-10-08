@@ -12,6 +12,11 @@ from petekit.text.buffer_manager import BufferManager
 from petekit.utils.text_formatters import format_dict_list_for_buffer
 
 
+# Managed buffer names — doc: namespace for reflection
+_REFLECT_SANDBOX_BUFFER = "doc:reflect:sandbox"
+_REFLECT_DYNAMIC_BUFFER = "doc:reflect:dynamic"
+
+
 @dataclass
 class ReflectionCatalog:
     hardcoded: list[dict]
@@ -40,9 +45,9 @@ class SelfReflector(BufferManager, AgenticObject):
 
         # Populate sandbox buffer at construction time with hardcoded @sandbox/@tool methods
         sandbox_text = format_dict_list_for_buffer(self._self_reflection_catalog.hardcoded)
-        self._create_buffer("doc:reflect:sandbox", text=sandbox_text)
+        self._create_buffer(_REFLECT_SANDBOX_BUFFER, text=sandbox_text)
         if self._self_reflection_catalog.dynamic_functions:
-            self._create_buffer("doc:reflect:dynamic", text="[]")
+            self._create_buffer(_REFLECT_DYNAMIC_BUFFER, text="[]")
             # TODO: Hook registration: attach_class after_tool_execution for define_function / remove_function to rebuild sandbox_api buffer
 
     def _self_reflection_on_tool_executed(self, runner: Runner, tc: ContentPart, status: ExecStatus, ok: bool) -> None:
@@ -67,4 +72,4 @@ class SelfReflector(BufferManager, AgenticObject):
 
         # Refresh dynamic buffer to reflect current runtime catalog
         dynamic_text = format_dict_list_for_buffer(self._self_reflection_catalog.runtime)
-        self.create_buffer("doc:reflect:dynamic", text=dynamic_text, overwrite=True)
+        self.create_buffer(_REFLECT_DYNAMIC_BUFFER, text=dynamic_text, overwrite=True)

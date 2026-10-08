@@ -6,11 +6,11 @@ import re
 from typing import Any
 
 from peteos import AgenticObject
-from ...function.function_manager import FunctionManager
+from ...function.function_manager import FunctionManager, _FUNCTION_STATUS_NAME_BASE
 from ...utils.text_codecs import make_json_codec
 
 
-_CONDITION_LIST_BUFFER = "system:config:regex_conditions"
+_CONDITION_LIST_BUFFER = "system:config:regex_condition"
 _REGEX_DOC_BUFFER = "doc:regex_conditions"
 _REGEX_PATTERN_BUFFER = "system:config:regex_condition"
 
@@ -31,7 +31,7 @@ def _diff_keys(old: dict, new: dict) -> tuple[set[str], set[str], set[str]]:
 _REGEX_DOC = """\
 ## Schema
 
-system:config:regex_conditions  — catalog of all condition descriptors (JSON)
+system:config:regex_condition  — catalog of all condition descriptors (JSON)
     {
         "conditions": {
             "<condition_name>": {
@@ -69,7 +69,7 @@ To remove a pattern, remove its entry from the pattern buffer.
 
 
 def _drop_guard(buf, old_text: str | None, start: int, end: int, new_text: str | None) -> str | None:
-    """Block direct buffer drops. Remove entries via _CONDITION_LIST_BUFFER instead."""
+    """Block direct buffer drops. Remove entries via "system:config:regex_condition" instead."""
     if new_text is None:
         return f"This buffer cannot be dropped. Remove entries via {_CONDITION_LIST_BUFFER} instead."
     return None
@@ -270,7 +270,7 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
                     return f"condition '{name}' could not be added: {func_result.get('error')}"
 
                 # Guard the meta buffer against direct drops — remove via the conditions list.
-                meta_name = f"system:status:function:{name}"
+                meta_name = f"{_FUNCTION_STATUS_NAME_BASE}{name}"
 
                 def _meta_drop_guard(buf, old_text, start, end, new_text):
                     if new_text is None:
@@ -296,7 +296,7 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
         elif name in removed:
             # Derive the pattern buffer name from the condition name — always deterministic.
             pattern_buffer_name = _pattern_buffer_name(name)
-            meta_name = f"system:status:function:{name}"
+            meta_name = f"{_FUNCTION_STATUS_NAME_BASE}{name}"
 
             # Unregister our drop guard — we are authorized to drop, the sentinel must not block us.
             factory.unregister_buffer_update_hook(pattern_buffer_name, "drop_guard")

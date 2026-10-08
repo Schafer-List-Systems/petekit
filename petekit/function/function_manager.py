@@ -15,7 +15,8 @@ from peteos.oap.agentic_object import AgenticObject
 
 from petekit.text.buffer_manager import BufferManager
 
-_FUNCTION_STATUS_BUFFER = "system:status:functions"
+_FUNCTION_STATUS_BUFFER = "system:status:function"
+_FUNCTION_STATUS_NAME_BASE = "system:status:function:"
 
 
 @dataclass
@@ -33,7 +34,7 @@ class FunctionEntry:
 
 def _function_status_name(name: str) -> str:
     # Derive the canonical status buffer name for a single function.
-    return f"system:status:function:{name}"
+    return f"{_FUNCTION_STATUS_NAME_BASE}{name}"
 
 
 def _compute_mac(fm: "FunctionManager", data: str) -> str:
@@ -115,10 +116,9 @@ async def _refresh_list_buffer(fm: "FunctionManager") -> None:
 
 
 class FunctionManager(BufferManager, AgenticObject):
-    """A BufferManager that also manages a namespace of runtime-created Callables.
-    Each function lives in self._functions and is mirrored to a system:status:function:<name> buffer
-    (signed JSON) for agent introspection. A _FUNCTION_STATUS_BUFFER catalogs all registered functions.
-    All buffers are HMAC-protected against external writes.
+    """I manage a namespace of runtime-created Callables via `create_function` and `drop_function`.
+    The "system:status:function" buffer catalogs all registered functions.
+    Each function is documented in a system:status:function:<name> buffer for introspection.
     """
 
     def __init__(self, **kwargs: Any) -> None:

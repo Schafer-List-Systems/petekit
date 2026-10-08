@@ -18,8 +18,8 @@ _MAX_NOTIFICATION_INTERVAL = 600.0
 
 _LOG_BUFFER = "system:log:stream_processor"
 _CONTROL_BUFFER = "system:control:stream_processor"
-_ROUTING_TABLES_BUFFER = "system:config:routing_tables"
-_NOTIFICATION_CONFIGS_BUFFER = "system:config:notification_configs"
+_ROUTING_TABLES_BUFFER = "system:config:routing_table"
+_NOTIFICATION_CONFIGS_BUFFER = "system:config:notification_config"
 
 
 # HACK: no clean API exists to get ptid by recency — only session dirs on disk carry mtime.
@@ -119,7 +119,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
     """You are a live stream processor managing multiple routing tables.
     You also have a notification system for stream updates — it sends you automatic [NOTIFICATION] chat messages disguised as user messages.
     While stream buffer hooks allow you to execute functions automatically, the notification system allows you to get notified (chat messages) automatically.
-    - The set of routing tables is listed in the _ROUTING_TABLES_BUFFER buffer.
+    - The set of routing tables is listed in the "system:config:routing_table" buffer.
     - Each routing table is stored in an individual buffer containing rules [<condition_list>,<output_stream>]
     - Rules fire top-to-bottom; first match wins and stops evaluation.
     - Condition lists are comma-separated; each sub-condition must be true (AND semantics).
@@ -127,7 +127,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
     - The condition name "true" always matches (good for catch-all / fallback rule).
     - Condition names are sandbox-decorated methods with signature (stream: str, text: str, metadata: dict) -> bool.
       Discover available conditions in doc:reflect:sandbox (hardcoded) and doc:reflect:dynamic (runtime); use define_function to add your own.
-    - Control the stream processor by writing to _CONTROL_BUFFER:
+    - Control the stream processor by writing to "system:control:stream_processor":
       new <routing_table> <input_stream>  — create routing table
       drop <routing_table>              — delete routing table
       add <routing_table> <condition_list> <output_stream>  — add rule
@@ -135,8 +135,8 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
       enable_notification <stream>  — enable notification on a stream
       disable_notification <stream>  — disable notification on a stream
       configure_notification <stream> [batch_size=<N>] [interval_secs=<T>] [notify_on_empty=<bool>]  — configure notification
-    - The feedback stream _LOG_BUFFER is always observed (immutable, cannot be disabled).
-    - Read feedback and streaming errors (command results, FALLTHROUGH) from _LOG_BUFFER.
+    - The feedback stream "system:log:stream_processor" is always observed (immutable, cannot be disabled).
+    - Read feedback and streaming errors (command results, FALLTHROUGH) from "system:log:stream_processor".
     """
 
     def __init__(self, **kwargs) -> None:
@@ -193,7 +193,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         )
 
     async def _refresh_routing_tables_buffer(self) -> dict[str, Any]:
-        """Refresh the system:config:routing_tables buffer."""
+        """Refresh the "system:config:routing_table" buffer."""
         from petekit.utils.text_formatters import format_dict_list_for_buffer
         return await self.create_buffer(
             _ROUTING_TABLES_BUFFER,
@@ -561,7 +561,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
             await self.write_buffer(_LOG_BUFFER, f"NOTIFICATION ERROR: {exc}")
 
     async def _refresh_notification_configs_buffer(self) -> dict[str, Any]:
-        """Refresh the system:config:notification_configs buffer."""
+        """Refresh the "system:config:notification_config" buffer."""
         from petekit.utils.text_formatters import format_dict_list_for_buffer
         return await self.create_buffer(
             _NOTIFICATION_CONFIGS_BUFFER,
