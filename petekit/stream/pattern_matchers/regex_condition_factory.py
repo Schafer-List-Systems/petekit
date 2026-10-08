@@ -135,7 +135,11 @@ def _validate_pattern_against_sample(pattern: str, sample_line: str) -> re.Patte
     return compiled
 
 
-async def _pattern_update_hook(factory, buf, old_json: dict, new_json: dict, patch) -> bool | str:
+async def _pattern_update_hook(factory, buf, old_json: dict, new_json: dict | None, patch) -> bool | str:
+    # If new_json is None, then the buffer is being dropped — we initiated the drop, allow it.
+    if new_json is None:
+        return True
+
     # Compute the diff between old and new patterns to find which are added, removed, or changed.
     added, removed, changed = _diff_keys(old_json, new_json)
 
