@@ -14,7 +14,7 @@ from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buf
 from ..utils.text_formatters import _sanitize_title
 
 
-_BASH_PROCESSES_BUFFER = "system:list:bash_processes"
+_BASH_PROCESSES_BUFFER = "system:status:bash"
 
 
 def _make_stream_name(process_id: int, title: str, stream_type: str) -> str:

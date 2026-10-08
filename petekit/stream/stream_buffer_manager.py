@@ -112,9 +112,9 @@ class StreamBufferManager(BufferManager, AgenticObject):
     - You can access stream buffers with float (time-based) start/end arguments. Naturally, writing is append-only.
     - Float start/end values trigger time-based reading on stream buffers. Example: start=-10.0 means to see the last 10 seconds.
     - Timestamps in skip/bucket messages are rounded to 6 decimal places.
-    - The buffers "system:list:stream_buffers" and "system:list:stream_buffer_hooks"
+    - The buffers "system:status:stream_buffers" and "system:status:stream_buffer_hooks"
       are always up to date with all current stream buffers and their hooks including metadata.
-    - Hooks in "system:list:stream_buffer_hooks" are grouped by stream and fire in the order they appear (priority descending, highest first).
+    - Hooks in "system:status:stream_buffer_hooks" are grouped by stream and fire in the order they appear (priority descending, highest first).
     """
 
     # DESIGN: window_size (rolling trim) is deferred — buffers grow indefinitely for now.
@@ -231,12 +231,12 @@ class StreamBufferManager(BufferManager, AgenticObject):
         ]
 
     async def _refresh_stream_buffers_buffer(self) -> dict[str, Any]:
-        """Refresh the system:list:stream_buffers buffer, one JSON dict per line."""
+        """Refresh the system:status:stream_buffers buffer, one JSON dict per line."""
         text = format_dict_list_for_buffer(self.list_stream_buffers())
-        return await self.create_buffer("system:list:stream_buffers", text=text, overwrite=True)
+        return await self.create_buffer("system:status:stream_buffers", text=text, overwrite=True)
 
     async def _refresh_stream_buffer_hooks(self) -> dict[str, Any]:
-        """Refresh the system:list:stream_buffer_hooks buffer with all hook states."""
+        """Refresh the system:status:stream_buffer_hooks buffer with all hook states."""
         records = [
             {
                 "stream": stream_name,
@@ -250,7 +250,7 @@ class StreamBufferManager(BufferManager, AgenticObject):
         ]
         records.sort(key=lambda r: (r["stream"], -r["priority"]))
         text = format_dict_list_for_buffer(records)
-        return await self.create_buffer("system:list:stream_buffer_hooks", text=text, overwrite=True)
+        return await self.create_buffer("system:status:stream_buffer_hooks", text=text, overwrite=True)
 
     @tool
     async def read_buffer(self, name: str, start: int | float = 0, end: int | float | str = "end", show_timestamps: bool = False, show_line_numbers: bool = False, raw: bool = False) -> dict[str, Any] | str:

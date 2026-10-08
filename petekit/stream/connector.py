@@ -26,17 +26,17 @@ class ConnectionHandle:
 class Connector(StreamBufferManager, AgenticObject):
     """You manage long standing TCP/IP sockets. As usual: communication via stream buffers.
     - Use connect and disconnect to open / close a connection.
-    - The buffer "system:list:connections" is always up to date with all current connections."""
+    - The buffer "system:status:network:connections" is always up to date with all current connections."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.connections: dict[str, ConnectionHandle] = {}
-        self._create_buffer("system:list:connections", "[]\n")
+        self._create_buffer("system:status:network:connections", "[]\n")
 
     async def _refresh_connections_buffer(self) -> None:
         records = self.list_connections()
         text = format_dict_list_for_buffer(records)
-        await self.create_buffer("system:list:connections", text=text, overwrite=True)
+        await self.create_buffer("system:status:network:connections", text=text, overwrite=True)
 
     @tool
     async def connect(self, name: str, host: str, port: int, ssl: bool = False) -> dict[str, Any]:

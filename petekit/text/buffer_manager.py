@@ -297,7 +297,7 @@ class Buffer:
 class BufferManager(AgenticObject):
     """You are a buffer manager. You hold multiple named buffers, each a list of lines in memory.
     - You can `create`, insert/append (`write`), search (`grep`), `read` ranges from, and edit (`edit` and `patch`) any named buffer.
-    - Read the "system:list:buffers" buffer to see what exists. Drop unused buffers when it becomes messy!
+    - Read the "system:status:buffers" buffer to see what exists. Drop unused buffers when it becomes messy!
       Read it to get a JSON array of {name, lines} for each buffer.
     - Line indices are 0-based, just like Python array indexing.
       Example: buf[0] is the first line, buf[-1] is the last line, buf[0:5] is the first 5 lines.
@@ -320,7 +320,7 @@ class BufferManager(AgenticObject):
     async def _refresh_buffers_buffer(self) -> dict[str, Any]:
         records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
         text = format_dict_list_for_buffer(records)
-        return await self.create_buffer("system:list:buffers", text=text, overwrite=True)
+        return await self.create_buffer("system:status:buffers", text=text, overwrite=True)
 
     def _create_buffer(self, name: str, text: str | None = None) -> dict[str, Any]:
         """Protected buffer creation for initialization only.
@@ -370,7 +370,7 @@ class BufferManager(AgenticObject):
             create_result = self._create_buffer(name, text)
 
         # Refresh the system buffer listing so the new buffer is visible to the agent.
-        if name != "system:list:buffers":
+        if name != "system:status:buffers":
             refresh_result = await self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already created and registered — rolling back would require
@@ -395,7 +395,7 @@ class BufferManager(AgenticObject):
         now = time.time()
         new_entries = [BufferEntry(data=e.data, modified_at=e.modified_at, object_at=now) for e in src.lines]
         self._buffers[target_name] = Buffer(name=target_name, lines=new_entries, created_at=now, modified_at=now)
-        if target_name != "system:list:buffers":
+        if target_name != "system:status:buffers":
             refresh_result = await self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already created and registered — rolling back would require
@@ -437,7 +437,7 @@ class BufferManager(AgenticObject):
         buf.modified_at = time.time()
 
         # Refresh the buffer registry to keep the system listing current.
-        if name != "system:list:buffers":
+        if name != "system:status:buffers":
             refresh_result = await self._refresh_buffers_buffer()
             if not refresh_result.get("ok"):
                 # TODO(design): buffer already modified — rolling back would require restoring prior
@@ -457,8 +457,8 @@ class BufferManager(AgenticObject):
         buf = self._buffers[name]
 
         # Guard: the system listing buffer may not be dropped.
-        if name == "system:list:buffers":
-            return {"ok": False, "error": "Cannot drop the 'system:list:buffers' buffer."}
+        if name == "system:status:buffers":
+            return {"ok": False, "error": "Cannot drop the 'system:status:buffers' buffer."}
 
         # Fire update hooks with the full buffer content and None for new_text (signals drop).
         # Rejection means the drop is denied and the buffer must not be deleted.
@@ -657,7 +657,7 @@ class BufferManager(AgenticObject):
         """
         # Validate the named buffer exists.
         if name not in self._buffers:
-            return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"system:list:buffers\" to see available buffers."}
+            return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"system:status:buffers\" to see available buffers."}
         if not old_string:
             return {"ok": False, "error": "old_string must not be empty."}
         buf = self._buffers[name]
@@ -813,7 +813,7 @@ class BufferManager(AgenticObject):
         """
         # Validate the named buffer exists.
         if name not in self._buffers:
-            return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"system:list:buffers\" to see available buffers."}
+            return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"system:status:buffers\" to see available buffers."}
 
         # Import paatch; surface a clear error if it is not installed.
         try:

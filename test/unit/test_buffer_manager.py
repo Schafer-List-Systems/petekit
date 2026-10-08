@@ -61,10 +61,10 @@ class TestBufferManagerBasics:
     async def test_list_buffers(self, bm):
         await bm.create_buffer("a", text="x")
         await bm.create_buffer("b", text="y\nz")
-        listing_raw = await bm.read_buffer("system:list:buffers", raw=True)
+        listing_raw = await bm.read_buffer("system:status:buffers", raw=True)
         assert '"name": "a"' in listing_raw
         assert '"name": "b"' in listing_raw
-        assert '"name": "system:list:buffers"' in listing_raw
+        assert '"name": "system:status:buffers"' in listing_raw
 
 
 class TestEditBufferTimestampSemantics:
