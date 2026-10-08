@@ -9,6 +9,7 @@ from peteos import AgenticObject
 from ...function.function_manager import FunctionManager, _FUNCTION_STATUS_NAME_BASE
 from ...text.buffer_manager import _sanitize_buffer_name
 from ...utils.text_codecs import make_json_codec
+from ..stream_processor import RoutingConditionError
 
 
 _CONDITION_LIST_BUFFER = "system:config:regex_condition"
@@ -76,17 +77,23 @@ def _drop_guard(buf, old_text: str | None, start: int, end: int, new_text: str |
     return None
 
 
-def _condition_closure(pattern_buffer: str, read_buffer_fn: callable) -> callable:
+def _condition_closure(pattern_buffer: str, read_buffer_fn: callable, condition_name: str) -> callable:
     # Build a closure that reads the named config buffer and fullmatches text against all patterns.
     def condition(stream: str, text: str, metadata: dict) -> bool:
         import json
         read_result = read_buffer_fn(pattern_buffer)
         if not read_result.get("ok"):
-            return False
+            raise RoutingConditionError(
+                condition=condition_name,
+                reason=f"pattern buffer could not be read: {read_result.get('error')}",
+            )
         try:
             data = json.loads(read_result["content"])
-        except json.JSONDecodeError:
-            return False
+        except json.JSONDecodeError as e:
+            raise RoutingConditionError(
+                condition=condition_name,
+                reason=f"pattern buffer is not valid JSON: {e.msg} — expected a JSON object in '{pattern_buffer}'",
+            )
 
         # Iterate over pattern entries — data is the patterns dict directly.
         for pat in data.values():
@@ -257,7 +264,7 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
                     )
 
                 # Create and register the condition closure so the routing table can evaluate it.
-                condition_fn = _condition_closure(pattern_buffer, factory._read_buffer)
+                condition_fn = _condition_closure(pattern_buffer, factory._read_buffer, name)
                 func_result = await factory.create_function(
                     name=name,
                     callable=condition_fn,

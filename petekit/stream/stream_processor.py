@@ -586,8 +586,8 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
         ]
 
     async def _routing_table_dispatch(self, routing_table: str, text: str, metadata: dict | None = None) -> None:
-        """Private hook: evaluate incoming data against the routing table conditions.
-        First matching condition writes the data to its output stream. No match = reported as FALLTHROUGH.
+        """Hook: evaluate incoming data against the routing table conditions.
+        Dispatches each line individually so different lines can route to different outputs.
         """
         # Guard: reject if the routing table does not exist.
         if routing_table not in self._routing_tables:
@@ -598,12 +598,16 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
 
         # Resolve the table and annotate metadata with the routing table name for condition visibility.
         table = self._routing_tables[routing_table]
-        # TODO(timestamp-missing): ts below is always 0 — metadata has no timestamp.
-        # Real timestamp lives on BufferEntry.modified_at in BufferManager.write_buffer (text/buffer_manager.py:335).
-        # Fix: StreamBufferManager.write_buffer (stream/stream_buffer_manager.py:233) should pass the entry's modified_at into the hook.
-        ts = metadata.get("timestamp", 0) if metadata else 0
         metadata = {**(metadata or {}), "routing_table": routing_table}
 
+        # Dispatch each line individually — each gets its own routing decision.
+        for line in text.splitlines():
+            await self._routing_table_dispatch_line(table, line, metadata)
+
+    async def _routing_table_dispatch_line(self, table: RoutingTable, text: str, metadata: dict) -> None:
+        """Evaluate all condition lists for a single line of text.
+        First list where all sub-conditions match writes the line and stops evaluation.
+        """
         # Evaluate condition lists top-to-bottom; first list where all sub-conditions match wins.
         for condition_list, output_stream in table.conditions:
             all_match = True
@@ -612,7 +616,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
                 try:
                     matched = await self._evaluate_condition(sc, text, metadata)
                 except RoutingConditionError as e:
-                    fb_result = await self.write_buffer(_LOG_BUFFER, f"FALLTHROUGH source={table.input_stream} ts={ts} reason={e}")
+                    fb_result = await self.write_buffer(_LOG_BUFFER, f"FALLTHROUGH source={table.input_stream} reason={e}")
                     if not fb_result.get("ok"):
                         raise RuntimeError(f"failed to write FALLTHROUGH to feedback: {fb_result.get('error')}")
                     return
@@ -636,7 +640,7 @@ class StreamProcessor(FunctionManager, StreamBufferManager, AgenticObject):
                 return
 
         # No condition list matched: report FALLTHROUGH to the feedback stream.
-        fb_result = await self.write_buffer(_LOG_BUFFER, f"FALLTHROUGH source={table.input_stream} ts={ts}")
+        fb_result = await self.write_buffer(_LOG_BUFFER, f"FALLTHROUGH source={table.input_stream} metadata={str(metadata)}")
         if not fb_result.get("ok"):
             raise RuntimeError(f"failed to write FALLTHROUGH to feedback: {fb_result.get('error')}")
 
