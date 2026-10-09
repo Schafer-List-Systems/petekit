@@ -172,7 +172,8 @@ class FunctionManager(BufferManager, AgenticObject):
             long_description = doc.strip() if doc else ""
 
         # Assemble the function entry with all metadata, timestamps, and introspection data.
-        required = [p for p, pv in sig.parameters.items() if pv.default is inspect.Parameter.empty]
+        # self is never caller-provided — it's bound by the sandbox automatically.
+        required = [p for p, pv in sig.parameters.items() if pv.default is inspect.Parameter.empty and p != "self"]
         now = time.time()
         entry = FunctionEntry(
             name=name,

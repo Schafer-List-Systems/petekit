@@ -31,7 +31,7 @@ def _compile_function(compiler: "FunctionCompiler", func_name: str, source: str)
     top_level_nodes = list(ast.iter_child_nodes(tree))
     if len(top_level_nodes) != 1:
         return f"Source must contain exactly one top-level construct, found {len(top_level_nodes)}."
-    if not isinstance(top_level_nodes[0], ast.FunctionDef):
+    if not isinstance(top_level_nodes[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
         node_type = type(top_level_nodes[0]).__name__
         return f"Top-level construct must be a function definition, found '{node_type}'."
     if top_level_nodes[0].name != func_name:
@@ -69,16 +69,16 @@ def _make_stable_wrapper(compiler: "FunctionCompiler", func_name: str) -> Callab
     """
     import inspect
 
-    # Stable wrapper — delegates to the live sandbox function on every call.
+    # Stable wrapper — delegates to the live sandbox proxy on every call.
+    # The proxy from getattr already has sandbox bound via closure capture.
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         sandbox = compiler._oap_sandbox_builder.get_sandbox(freeze_namespaces=False)
-        func = getattr(sandbox, func_name)
-        return func(*args, **kwargs)
+        proxy = getattr(sandbox, func_name)
+        return proxy(*args, **kwargs)
 
-    # Steal signature from the live proxy so introspection sees the real interface.
+    # Mirror signature from the proxy so inspect.signature sees the real interface.
     sandbox = compiler._oap_sandbox_builder.get_sandbox(freeze_namespaces=False)
     proxy = getattr(sandbox, func_name)
-    wrapper.__code__ = proxy.__code__
     wrapper.__signature__ = inspect.signature(proxy)
     wrapper.__name__ = proxy.__name__
     wrapper.__doc__ = getattr(proxy, "__doc__", "")
