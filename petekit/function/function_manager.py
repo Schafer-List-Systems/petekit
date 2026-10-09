@@ -28,6 +28,7 @@ class FunctionEntry:
     long_description: str
     signature: inspect.Signature
     return_annotation: Any
+    required_args: list[str]  # names of params without defaults
     created_at: float
     modified_at: float
 
@@ -171,6 +172,7 @@ class FunctionManager(BufferManager, AgenticObject):
             long_description = doc.strip() if doc else ""
 
         # Assemble the function entry with all metadata, timestamps, and introspection data.
+        required = [p for p, pv in sig.parameters.items() if pv.default is inspect.Parameter.empty]
         now = time.time()
         entry = FunctionEntry(
             name=name,
@@ -179,6 +181,7 @@ class FunctionManager(BufferManager, AgenticObject):
             long_description=long_description,
             signature=sig,
             return_annotation=sig.return_annotation,
+            required_args=required,
             created_at=now,
             modified_at=now,
         )
@@ -256,5 +259,6 @@ class FunctionManager(BufferManager, AgenticObject):
             "name": entry.name,
             "callable": entry.callable,
             "args": list(entry.signature.parameters.keys()),
+            "required_args": entry.required_args,
             "returns": str(entry.return_annotation) if entry.return_annotation is not inspect.Parameter.empty else "None",
         }

@@ -15,7 +15,7 @@ from petekit.image import (
     WebCapture,
 )
 from petekit.reflection import SelfReflector
-from petekit.function import FunctionCompiler, FunctionManager
+from petekit.function import FunctionCaller, FunctionCompiler, FunctionManager
 
 __all__ = [
     "BufferManager",
@@ -33,6 +33,7 @@ __all__ = [
     "DiskImageLoader",
     "WebCapture",
     "SelfReflector",
+    "FunctionCaller",
     "FunctionCompiler",
     "FunctionManager",
 ]
