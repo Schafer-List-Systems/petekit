@@ -309,33 +309,33 @@ class TestUpdateHooks:
         await bm.create_buffer("test")
         buf = bm._buffers["test"]
         count_before = len(buf._update_hooks)
-        result = bm.register_buffer_update_hook("test", "myhook", lambda *_: True)
+        result = bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "myhook", lambda *_: True)
         assert result["ok"]
         assert result["hook"] == "myhook"
         assert len(buf._update_hooks) == count_before + 1
 
     async def test_register_hook_no_overwrite(self, bm):
         await bm.create_buffer("test")
-        bm.register_buffer_update_hook("test", "myhook", lambda *_: True)
-        result = bm.register_buffer_update_hook("test", "myhook", lambda *_: True)
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "myhook", lambda *_: True)
+        result = bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "myhook", lambda *_: True)
         assert not result["ok"]
         assert "already registered" in result["error"]
 
     async def test_register_unknown_buffer(self, bm):
-        result = bm.register_buffer_update_hook("nonexistent", "hook", lambda *_: True)
+        result = bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "nonexistent", "hook", lambda *_: True)
         assert not result["ok"]
         assert "No buffer named" in result["error"]
 
     async def test_unregister_hook_success(self, bm):
         await bm.create_buffer("test")
-        bm.register_buffer_update_hook("test", "myhook", lambda *_: True)
-        result = bm.unregister_buffer_update_hook("test", "myhook")
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "myhook", lambda *_: True)
+        result = bm.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "myhook")
         assert result["ok"]
         assert result["removed"] == "myhook"
 
     async def test_unregister_unknown_silent(self, bm):
         await bm.create_buffer("test")
-        result = bm.unregister_buffer_update_hook("test", "unknown")
+        result = bm.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "unknown")
         assert not result["ok"]
 
     async def test_edit_buffer_hook_receives_correct_args(self, bm):
@@ -344,7 +344,7 @@ class TestUpdateHooks:
         def accepting_hook(buf, old_text, start, end, new_text):
             calls.append((buf, old_text, start, end, new_text))
             return True
-        bm.register_buffer_update_hook("test", "h", accepting_hook)
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", accepting_hook)
         await bm.edit_buffer("test", "B", "X", start=1, end=2)
         assert len(calls) == 1
         buf, old_text, start, end, new_text = calls[0]
@@ -357,7 +357,7 @@ class TestUpdateHooks:
         def accepting_hook(buf, old_text, start, end, new_text):
             calls.append((buf, old_text, start, end, new_text))
             return True
-        bm.register_buffer_update_hook("test", "h", accepting_hook)
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", accepting_hook)
         await bm.drop_buffer("test")
         assert len(calls) == 1
         buf, old_text, start, end, new_text = calls[0]
@@ -367,7 +367,7 @@ class TestUpdateHooks:
 
     async def test_hook_accept_true_allows_write(self, bm):
         await bm.create_buffer("test")
-        bm.register_buffer_update_hook("test", "h", lambda *_: True)
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: True)
         result = await bm.write_buffer("test", "X\nY")
         assert result["ok"]
         content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
@@ -375,13 +375,13 @@ class TestUpdateHooks:
 
     async def test_hook_accept_none_allows_write(self, bm):
         await bm.create_buffer("test", text="A\nB")
-        bm.register_buffer_update_hook("test", "h", lambda *_: None)
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: None)
         result = await bm.write_buffer("test", "X")
         assert result["ok"]
 
     async def test_hook_reject_blocks_write(self, bm):
         await bm.create_buffer("test", text="A\nB")
-        bm.register_buffer_update_hook("test", "h", lambda *_: "rejected by hook")
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: "rejected by hook")
         result = await bm.write_buffer("test", "X")
         assert not result["ok"]
         assert "rejected by hook" in result["error"]
@@ -390,15 +390,15 @@ class TestUpdateHooks:
 
     async def test_hook_reason_string_rejected(self, bm):
         await bm.create_buffer("test", text="A\nB")
-        bm.register_buffer_update_hook("test", "h", lambda *_: "custom rejection reason")
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: "custom rejection reason")
         result = await bm.write_buffer("test", "X")
         assert not result["ok"]
         assert "custom rejection reason" in result["error"]
 
     async def test_multiple_hooks_first_rejection_blocks(self, bm):
         await bm.create_buffer("test", text="A\nB")
-        bm.register_buffer_update_hook("test", "first", lambda *_: True)
-        bm.register_buffer_update_hook("test", "second", lambda *_: "rejected by hook")
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "first", lambda *_: True)
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "second", lambda *_: "rejected by hook")
         result = await bm.write_buffer("test", "X")
         assert not result["ok"]
         assert "rejected by hook" in result["error"]
@@ -409,13 +409,13 @@ class TestUpdateHooks:
             captured.append(buf.modified_at)
             return True
         await bm.create_buffer("test", text="X")
-        bm.register_buffer_update_hook("test", "spy", spy)
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "spy", spy)
         await bm.write_buffer("test", "Y")
         assert captured[0] > 0
 
     async def test_hook_reject_blocks_edit(self, bm):
         await bm.create_buffer("test", text="A\nB\nC")
-        bm.register_buffer_update_hook("test", "h", lambda *_: "rejected by hook")
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: "rejected by hook")
         result = await bm.edit_buffer("test", "B", "X")
         assert not result["ok"]
         content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
@@ -423,7 +423,7 @@ class TestUpdateHooks:
 
     async def test_hook_reject_blocks_drop(self, bm):
         await bm.create_buffer("test", text="A\nB")
-        bm.register_buffer_update_hook("test", "h", lambda *_: "rejected by hook")
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: "rejected by hook")
         result = await bm.drop_buffer("test")
         assert not result["ok"]
         assert "rejected by hook" in result["error"]
@@ -431,7 +431,7 @@ class TestUpdateHooks:
 
     async def test_create_buffer_overwrite_fires_drop_hooks(self, bm):
         await bm.create_buffer("test", text="keep: me")
-        bm.register_buffer_update_hook("test", "nope", lambda *_: "no overwrite")
+        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "nope", lambda *_: "no overwrite")
         result = await bm.create_buffer("test", text="new: thing", overwrite=True)
         assert not result["ok"]
         assert result["error"] == "no overwrite"

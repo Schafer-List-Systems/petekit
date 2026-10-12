@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from petekit import BufferManager
+from petekit import BufferManager, HookPoint
 from petekit.utils.text_codecs import make_json_codec
 
 
@@ -16,8 +16,8 @@ async def bm():
 class TestMakeJsonCodec:
     async def test_reject_blocks_write(self, bm):
         await bm.create_buffer("test", text='{"a": 1}')
-        bm.register_buffer_update_hook(
-            "test", "jc",
+        bm.register_buffer_hook(
+            HookPoint.ON_UPDATE_BUFFER, "test", "jc",
             make_json_codec(lambda *_: "inner rejected"),
         )
         result = await bm.write_buffer("test", "not json", pos="end")

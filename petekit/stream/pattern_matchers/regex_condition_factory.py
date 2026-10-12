@@ -7,7 +7,7 @@ from typing import Any
 
 from peteos import AgenticObject
 from ...function.function_manager import FunctionManager, _FUNCTION_STATUS_NAME_BASE
-from ...text.buffer_manager import _sanitize_buffer_name
+from ...text.buffer_manager import HookPoint, _sanitize_buffer_name
 from ...utils.text_codecs import make_json_codec
 from ..stream_processor import RoutingConditionError
 
@@ -234,7 +234,8 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
             # them already present and skip safely.
             if name not in factory._functions:
                 # Guard the pattern buffer against direct drops — remove via the catalog.
-                guard_result = factory.register_buffer_update_hook(
+                guard_result = factory.register_buffer_hook(
+                    HookPoint.ON_UPDATE_BUFFER,
                     pattern_buffer,
                     "drop_guard",
                     _drop_guard,
@@ -247,7 +248,8 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
                     )
 
                 # Register the pattern management update hook on the new config buffer.
-                hook_result = factory.register_buffer_update_hook(
+                hook_result = factory.register_buffer_hook(
+                    HookPoint.ON_UPDATE_BUFFER,
                     pattern_buffer,
                     "factory",
                     make_json_codec(
@@ -288,7 +290,8 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
                         )
                     return None
 
-                reg_result = factory.register_buffer_update_hook(
+                reg_result = factory.register_buffer_hook(
+                    HookPoint.ON_UPDATE_BUFFER,
                     meta_name,
                     "regex_condition_meta_drop_guard",
                     _meta_drop_guard,
@@ -307,8 +310,8 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
             meta_name = f"{_FUNCTION_STATUS_NAME_BASE}{name}"
 
             # Unregister our drop guard — we are authorized to drop, the sentinel must not block us.
-            factory.unregister_buffer_update_hook(pattern_buffer_name, "drop_guard")
-            factory.unregister_buffer_update_hook(meta_name, "regex_condition_meta_drop_guard")
+            factory.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, pattern_buffer_name, "drop_guard")
+            factory.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, meta_name, "regex_condition_meta_drop_guard")
 
             # Drop the function and its config buffer — the condition is being removed.
             drop_fn_result = await factory.drop_function(name)
@@ -343,7 +346,8 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
                 return "This buffer is protected by the RegexConditionManager."
             return None
 
-        hook_result = self.register_buffer_update_hook(
+        hook_result = self.register_buffer_hook(
+            HookPoint.ON_UPDATE_BUFFER,
             _CONDITION_LIST_BUFFER,
             "drop_guard",
             _conditions_drop_guard,
@@ -352,7 +356,8 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
             raise RuntimeError(f"failed to register drop_guard on conditions list: {hook_result.get('error')}")
 
         # Register the factory's update hook so add/remove operations on conditions are intercepted.
-        hook_result = self.register_buffer_update_hook(
+        hook_result = self.register_buffer_hook(
+            HookPoint.ON_UPDATE_BUFFER,
             _CONDITION_LIST_BUFFER,
             "factory",
             make_json_codec(

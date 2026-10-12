@@ -10,6 +10,7 @@ sys.path.insert(0, "/home/frygge/projects/AIOS/peteos-kit")
 sys.path.insert(0, "/home/frygge/projects/private/petekit/src/peteos/peteos")
 
 from petekit.function import FunctionCompiler, FunctionEntry, FunctionManager
+from petekit.text.buffer_manager import HookPoint
 
 
 @pytest.fixture
@@ -124,7 +125,7 @@ class TestFunctionManagerHookGating:
     async def test_drop_function_blocked_by_hook(self):
         fm = FunctionManager()
         await fm.create_function("to_drop", lambda: None)
-        fm.register_buffer_update_hook("system:status:function:to_drop", "reject", lambda *_: "blocked by hook")
+        fm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "system:status:function:to_drop", "reject", lambda *_: "blocked by hook")
         result = await fm.drop_function("to_drop")
         assert not result["ok"]
         assert "blocked by hook" in result["error"]
@@ -150,7 +151,7 @@ class TestFunctionManagerHookGating:
             return True
 
         await fm.create_function("target", target)
-        fm.register_buffer_update_hook("system:status:function:target", "spy", accepting_hook)
+        fm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "system:status:function:target", "spy", accepting_hook)
         await fm.drop_function("target")
         assert len(calls) == 1
         _, old_text, start, end, new_text = calls[0]

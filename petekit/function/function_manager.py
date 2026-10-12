@@ -13,7 +13,7 @@ from typing import Any, Callable
 from peteos import tool, sandbox
 from peteos.oap.agentic_object import AgenticObject
 
-from petekit.text.buffer_manager import BufferManager, _sanitize_buffer_name
+from petekit.text.buffer_manager import BufferManager, HookPoint, _sanitize_buffer_name
 
 _FUNCTION_STATUS_BUFFER = "system:status:function"
 _FUNCTION_STATUS_NAME_BASE = "system:status:function:"
@@ -133,7 +133,8 @@ class FunctionManager(BufferManager, AgenticObject):
             raise RuntimeError(f"failed to create function list buffer: {init_result.get('error')}")
 
         # Guard the catalog buffer against unsigned writes.
-        hook_result = self.register_buffer_update_hook(
+        hook_result = self.register_buffer_hook(
+            HookPoint.ON_UPDATE_BUFFER,
             _FUNCTION_STATUS_BUFFER,
             "readonly_sentinel",
             _make_readonly_sentinel(self),
@@ -201,7 +202,8 @@ class FunctionManager(BufferManager, AgenticObject):
             }
 
         # Guard the new meta buffer against unsigned writes.
-        hook_result = self.register_buffer_update_hook(
+        hook_result = self.register_buffer_hook(
+            HookPoint.ON_UPDATE_BUFFER,
             _function_status_name(name),
             "readonly_sentinel",
             _make_readonly_sentinel(self),
@@ -235,7 +237,7 @@ class FunctionManager(BufferManager, AgenticObject):
         buf_name = _function_status_name(name)
 
         # Unregister the write guard before dropping — the sentinel would block the drop.
-        self.unregister_buffer_update_hook(buf_name, "readonly_sentinel")
+        self.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, buf_name, "readonly_sentinel")
 
         drop_result = await self.drop_buffer(buf_name)
         if not drop_result.get("ok"):

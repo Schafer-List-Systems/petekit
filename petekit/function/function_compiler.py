@@ -13,6 +13,7 @@ from peteos.oap.agentic_object import AgenticObject, RestoreHook
 from peteos.sandbox import SandboxBuilder
 
 from petekit.function.function_manager import FunctionManager
+from petekit.text.buffer_manager import HookPoint
 
 _CODE_BUFFER_PREFIX = "system:code:"
 _logger = logging.getLogger(__name__)
@@ -280,7 +281,8 @@ class FunctionCompiler(FunctionManager, AgenticObject):
             }
 
         # Register the compilation sentinel so every source write is recompiled.
-        hook_result = self.register_buffer_update_hook(
+        hook_result = self.register_buffer_hook(
+            HookPoint.ON_UPDATE_BUFFER,
             _code_buffer_name(name),
             "compilation_sentinel",
             _make_compilation_sentinel(self, name),
@@ -299,7 +301,7 @@ class FunctionCompiler(FunctionManager, AgenticObject):
     async def drop_function(self, name: str) -> dict[str, Any]:
         # Drop the code buffer first — no sentinel blocks this since we unguard first below.
         buf_name = _code_buffer_name(name)
-        self.unregister_buffer_update_hook(buf_name, "compilation_sentinel")
+        self.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, buf_name, "compilation_sentinel")
         await self.drop_buffer(buf_name)
 
         # Mirror to parent — drops the introspection buffer.
