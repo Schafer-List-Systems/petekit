@@ -600,17 +600,11 @@ class BufferManager(AgenticObject):
         if target_name in self._buffers and not overwrite:
             return {"ok": False, "error": f"Buffer '{target_name}' already exists. Use overwrite=True to replace it."}
         src = self._buffers[source_name]
-        now = time.time()
-        new_entries = [BufferEntry(data=e.data, modified_at=e.modified_at, object_at=now) for e in src.lines]
-        self._buffers[target_name] = Buffer(name=target_name, lines=new_entries, created_at=now, modified_at=now)
-        if target_name != _STATUS_BUFFER:
-            refresh_result = await self._refresh_buffers_buffer()
-            if not refresh_result.get("ok"):
-                # TODO(design): buffer already created and registered — rolling back would require
-                # deleting from self._buffers. Until a rollback strategy is defined, raising the
-                # error leaves BufferManager in an inconsistent state (buffer exists, listing stale).
-                raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
-        return {"ok": True, "target": target_name, "source": source_name, "lines": len(new_entries)}
+        src_text = src.get_text()
+        result = await self.create_buffer(target_name, text=src_text, overwrite=overwrite)
+        if not result.get("ok"):
+            return result
+        return {"ok": True, "target": target_name, "source": source_name, "lines": result.get("lines", 0)}
 
     @tool
     async def write_buffer(self, name: str, text: str, pos: int | str = 'end') -> dict[str, Any]:
