@@ -3,24 +3,124 @@
 from __future__ import annotations
 
 import ast
+import json
+import logging
+from pathlib import Path
 from typing import Any, Callable
 
 from peteos import tool, sandbox
-from peteos.oap.agentic_object import AgenticObject
+from peteos.oap.agentic_object import AgenticObject, RestoreHook
 from peteos.sandbox import SandboxBuilder
 
 from petekit.function.function_manager import FunctionManager
 
 _CODE_BUFFER_PREFIX = "system:code:"
+_logger = logging.getLogger(__name__)
 
+
+# --- Persistence helpers (module-level to keep the class footprint small) ---
+
+def _get_persistence_dir(agent: AgenticObject) -> Path:
+    """Return the FunctionCompiler persistence directory inside the agent's instance dir."""
+    return agent.instance_dir / "function_compiler"
+
+
+def _persist_function(agent: AgenticObject, name: str, source: str, short: str, long: str) -> None:
+    """Write function source and metadata to disk for persistence."""
+    import json
+
+    # Ensure the persistence directory exists.
+    dir = _get_persistence_dir(agent)
+    dir.mkdir(parents=True, exist_ok=True)
+
+    # Raw source file — IDE/debugging friendly, direct Python syntax
+    (dir / f"{name}.py").write_text(source)
+
+    # Metadata JSON
+    meta = {
+        "name": name,
+        "short_description": short,
+        "long_description": long,
+    }
+    (dir / f"{name}.json").write_text(json.dumps(meta, indent=2))
+
+
+def _drop_persisted_function(agent: AgenticObject, name: str) -> None:
+    """Remove persisted source and metadata for the named function."""
+    dir = _get_persistence_dir(agent)
+
+    # Remove source and metadata files; missing_ok=True handles the already-gone case.
+    (dir / f"{name}.py").unlink(missing_ok=True)
+    (dir / f"{name}.json").unlink(missing_ok=True)
+
+
+def _overwrite_persisted_source(agent: AgenticObject, name: str, source: str) -> None:
+    """Overwrite the persisted source file after a successful in-memory recompilation."""
+    dir = _get_persistence_dir(agent)
+    # Write only the source file — descriptions live in .json and are not updated on edit.
+    (dir / f"{name}.py").write_text(source)
+
+
+def _restore_functions(agent: AgenticObject) -> None:
+    """Re-compile all persisted functions from disk on agent restore()."""
+    dir = _get_persistence_dir(agent)
+
+    # Nothing to restore if the directory was never created.
+    if not dir.exists():
+        return
+
+    # Iterate all persisted metadata files and replay create_function for each.
+    for json_file in dir.glob("*.json"):
+
+        # Extract function name and skip if already live.
+        name = json_file.stem
+        if name in agent._functions:
+            continue
+
+        # Replay create_function for this function — loads source, recompiles, re-registers.
+        try:
+            meta = json.loads(json_file.read_text())
+            source = (dir / f"{name}.py").read_text()
+            agent.create_function(
+                name=name,
+                code=source,
+                short_description=meta.get("short_description", ""),
+                long_description=meta.get("long_description", ""),
+            )
+            _logger.info(
+                "[function_compiler] restored function '%s' for %s",
+                name,
+                agent.__class__.__name__,
+            )
+
+        # Log failures so the maintainer knows what failed and why.
+        except Exception as e:
+            _logger.error(
+                "[function_compiler] failed to restore function '%s' for %s: %s",
+                name,
+                agent.__class__.__name__,
+                e,
+            )
+
+
+# --- Internal helpers ---
 
 def _code_buffer_name(name: str) -> str:
     """Return the source-code buffer name for the given function name."""
     return f"{_CODE_BUFFER_PREFIX}{name}"
 
 
-def _compile_function(compiler: "FunctionCompiler", func_name: str, source: str) -> Callable | str:
-    """Validate source in a trial builder, then commit to the OAP sandbox builder."""
+def _compile_function(
+    compiler: "FunctionCompiler",
+    func_name: str,
+    source: str,
+    source_path: "Path | None" = None,
+) -> Callable | str:
+    """Validate source in a trial builder, then commit to the OAP sandbox builder.
+
+    When source_path is given the Path is passed to add_source_code so the source
+    file is imported as a module and debuggers can resolve breakpoints in it.
+    """
     # Parse and require exactly one FunctionDef as the sole top-level construct.
     try:
         tree = ast.parse(source)
@@ -43,7 +143,7 @@ def _compile_function(compiler: "FunctionCompiler", func_name: str, source: str)
 
     # Attempt to add to the trial builder — catches all compilation errors.
     try:
-        entries = trial.add_source_code(source)
+        entries = trial.add_source_code(source_path if source_path is not None else source)
     except Exception as e:
         return f"Compilation failed: {e}"
     if not entries:
@@ -51,7 +151,7 @@ def _compile_function(compiler: "FunctionCompiler", func_name: str, source: str)
 
     # Phase 2: commit to the real instance-level sandbox builder.
     try:
-        compiler._oap_sandbox_builder.add_source_code(source)
+        compiler._oap_sandbox_builder.add_source_code(source_path if source_path is not None else source)
     except Exception as e:
         return f"Failed to register '{func_name}' in sandbox: {e}"
 
@@ -90,14 +190,19 @@ def _make_compilation_sentinel(compiler: "FunctionCompiler", name: str):
     """Factory producing a sentinel hook that recompiles the live callable on every source write.
 
     On failure the write is rejected and the error is surfaced to the caller.
-    On success the sandbox is updated — the stable wrapper in _functions is untouched.
+    On success the sandbox and disk are both updated.
     """
     def compilation_sentinel(buf: str, old_text: str, start: int, end: int, new_text: str) -> str | None:
+        # Write the updated source to disk first — the file on disk is the debugger's view of the code.
+        _overwrite_persisted_source(compiler, name, new_text)
+        source_path = _get_persistence_dir(compiler) / f"{name}.py"
+
         # Delegate to the two-phase compiler — trial, then commit on success.
-        result = _compile_function(compiler, name, new_text)
+        result = _compile_function(compiler, name, new_text, source_path)
         if isinstance(result, str):
             return result  # error — reject the write, surface the message
-        return None  # success — sandbox already updated, wrapper in _functions is untouched
+
+        return None  # success — sandbox and disk both updated
 
     return compilation_sentinel
 
@@ -123,6 +228,12 @@ class FunctionCompiler(FunctionManager, AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
 
+        # Register restore hook so persisted functions are re-compiled after a restart.
+        self._oap_restore_hooks["function_compiler"] = RestoreHook(
+            callable_=_restore_functions,
+            dependencies=[],
+        )
+
     @tool
     async def create_function(
         self,
@@ -132,8 +243,12 @@ class FunctionCompiler(FunctionManager, AgenticObject):
         *,
         code: str,
     ) -> dict[str, Any]:
+        # Persist to disk first — the file on disk is the debugger's view of the code.
+        _persist_function(self, name, code, short_description, long_description)
+        source_path = _get_persistence_dir(self) / f"{name}.py"
+
         # Compile and register in sandbox — build the stable delegating wrapper.
-        compile_result = _compile_function(self, name, code)
+        compile_result = _compile_function(self, name, code, source_path)
         if isinstance(compile_result, str):
             return {"ok": False, "error": compile_result}
 
@@ -188,4 +303,9 @@ class FunctionCompiler(FunctionManager, AgenticObject):
         await self.drop_buffer(buf_name)
 
         # Mirror to parent — drops the introspection buffer.
-        return await super().drop_function(name)
+        result = await super().drop_function(name)
+
+        # Remove persisted source and metadata from disk.
+        _drop_persisted_function(self, name)
+
+        return result

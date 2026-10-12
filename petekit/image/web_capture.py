@@ -9,6 +9,7 @@ import tempfile
 import time as time_mod
 from pathlib import Path
 
+from typing import Any
 from peteos.oap.agentic_object import AgenticObject
 from peteos import tool
 
@@ -22,8 +23,8 @@ class WebCapture(ImageBufferManager, AgenticObject):
     Use web_load_image to load an image from a URL into an image buffer.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
         self._temp_dir: Path | None = None
 
     @property

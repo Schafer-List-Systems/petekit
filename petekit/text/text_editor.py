@@ -36,8 +36,8 @@ class TextEditor(BufferManager, AgenticObject):
       4. store_text(buffer_name, file_path) — write back to disk (refuses if file was modified externally)
     """
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
         self.expected_file_state: dict[str, ExpectedFileData] = {}
 
     @tool(description="Load a file from disk into a buffer named 'file:<abs_path>'.")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos import tool
@@ -48,8 +49,8 @@ class SandboxedBasher(Basher, AgenticObject):
     diff, comm, base64, md5sum, sha256sum, stat, du, file, ls.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
         self._workspace_dir: Path | None = None
 
     @property
