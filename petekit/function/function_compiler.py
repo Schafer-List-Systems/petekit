@@ -62,7 +62,7 @@ def _overwrite_persisted_source(agent: AgenticObject, name: str, source: str) ->
     (dir / f"{name}.py").write_text(source)
 
 
-def _restore_functions(agent: AgenticObject) -> None:
+async def _restore_functions(agent: AgenticObject) -> None:
     """Re-compile all persisted functions from disk on agent restore()."""
     dir = _get_persistence_dir(agent)
 
@@ -82,7 +82,7 @@ def _restore_functions(agent: AgenticObject) -> None:
         try:
             meta = json.loads(json_file.read_text())
             source = (dir / f"{name}.py").read_text()
-            agent.create_function(
+            await agent.create_function(
                 name=name,
                 code=source,
                 short_description=meta.get("short_description", ""),
