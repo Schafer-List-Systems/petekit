@@ -6,7 +6,7 @@ import time
 import pytest
 
 from petekit import BufferManager
-from petekit.text.buffer_manager import Buffer, BufferEntry, _cluster_lines_to_ranges, _NO_BUFFER_
+from petekit.text.buffer_manager import Buffer, BufferEntry, _cluster_lines_to_ranges, _NO_BUFFER_, HookPoint, CreationHook, HookPointRegistry
 
 
 @pytest.fixture
@@ -569,3 +569,127 @@ class TestPatchBuffer:
         assert result["ok"]
         content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
         assert content == "line0\nbar\nline2"
+
+
+class TestBufferHookSystem:
+    async def test_register_buffer_hook_success(self, bm):
+        captured: list = []
+
+        def capture_hook(bm_, scope_, args_):
+            captured.append(args_)
+            return True
+
+        result = bm.register_buffer_hook(
+            HookPoint.ON_CREATE_BUFFER,
+            buffer_path="logs",
+            hook_name="capture",
+            hook=capture_hook,
+        )
+        assert result["ok"]
+        assert result["hook"] == "capture"
+        assert result["buffer_path"] == "logs"
+
+    async def test_register_buffer_hook_name_collision_rejected(self, bm):
+        def noop(bm_, scope_, args_):
+            return True
+
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "h", noop)
+        result = bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "h", noop)
+        assert not result["ok"]
+        assert "already registered" in result["error"]
+
+    async def test_deregister_buffer_hook_success(self, bm):
+        def noop(bm_, scope_, args_):
+            return True
+
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "h", noop)
+        result = bm.deregister_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "h")
+        assert result["ok"]
+        assert result["removed"] == "h"
+
+    async def test_deregister_buffer_hook_unknown_name_rejected(self, bm):
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "h", lambda *a: None)
+        result = bm.deregister_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "nonexistent")
+        assert not result["ok"]
+        assert "no hook" in result["error"]
+
+    async def test_on_create_buffer_fires_before_creation(self, bm):
+        calls: list[dict] = []
+
+        def spy(bm_, scope_, args_):
+            calls.append({"scope": scope_, "args": args_})
+            return True
+
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "spy", spy)
+        await bm.create_buffer("logs/app", text="data")
+
+        assert len(calls) == 1
+        assert calls[0]["scope"] == "logs/app"
+        assert calls[0]["args"]["name"] == "logs/app"
+        assert calls[0]["args"]["text"] == "data"
+        assert calls[0]["args"]["overwrite"] is False
+
+    async def test_on_create_buffer_rejection_blocks_creation(self, bm):
+        def reject(bm_, scope_, args_):
+            return "nope"
+
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "rejector", reject)
+        result = await bm.create_buffer("logs/app", text="data")
+        assert not result["ok"]
+        assert "nope" in result["error"]
+
+    async def test_on_buffer_created_fires_after_creation(self, bm):
+        calls: list[dict] = []
+
+        def spy(bm_, scope_, args_):
+            calls.append({"scope": scope_, "args": args_})
+            return True
+
+        bm.register_buffer_hook(HookPoint.ON_BUFFER_CREATED, "logs", "spy", spy)
+        await bm.create_buffer("logs/app", text="data")
+
+        assert len(calls) == 1
+        assert calls[0]["scope"] == "logs/app"
+        assert calls[0]["args"]["name"] == "logs/app"
+
+    async def test_on_buffer_created_rejection_does_not_block_buffer(self, bm):
+        def reject(bm_, scope_, args_):
+            return "nope"
+
+        bm.register_buffer_hook(HookPoint.ON_BUFFER_CREATED, "logs", "rejector", reject)
+        result = await bm.create_buffer("logs/app", text="data")
+        assert result["ok"]
+        assert "logs/app" in bm._buffers
+
+    async def test_hook_scope_prefix_matching_outer_to_inner(self, bm):
+        call_order: list[str] = []
+
+        def register(name, scope):
+            def hook(bm_, sc_, args_):
+                call_order.append(scope)
+                return True
+            bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, scope, name, hook)
+
+        register("outer", "logs")
+        register("middle", "logs/app")
+        register("inner", "logs/app/server")
+
+        await bm.create_buffer("logs/app/server", text="data")
+
+        assert call_order == ["logs", "logs/app", "logs/app/server"]
+
+    async def test_multiple_hooks_same_scope_both_fire(self, bm):
+        calls: list[str] = []
+
+        def named(n):
+            def hook(bm_, sc_, args_):
+                calls.append(n)
+                return True
+            return hook
+
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs/app", "a", named("a"))
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs/app", "b", named("b"))
+
+        await bm.create_buffer("logs/app", text="data")
+
+        assert set(calls) == {"a", "b"}
