@@ -122,6 +122,7 @@ def _persist_buffer(bm: BufferManager, buffer: Buffer) -> None:
     # Metadata JSON — name, line count, timestamps.
     import json
     meta = {
+        "kind": "buffer",
         "name": buffer.name,
         "line_count": len(buffer.lines),
         "created_at": buffer.created_at,
@@ -156,12 +157,138 @@ def _make_persist_buffer_hook(bm: BufferManager) -> UpdateHook:
     return _persist_buffer_update_hook
 
 
-def _restore_create_buffers(self: BufferManager) -> None:
+async def _create_buffer_implementation(
+    bm: BufferManager,
+    name: str,
+    text: str | None = None,
+    overwrite: bool = False,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a buffer with the given name, text, and timestamps.
+
+    metadata must contain created_at and modified_at. Always called with metadata
+    from the tool wrapper or from the restore hook.
+    """
+    # Reject new creation if the name is already taken and overwrite is not requested.
+    if name in bm._buffers and not overwrite:
+        return {"ok": False, "error": f"Buffer '{name}' already exists. Use overwrite=True to replace it."}
+
+    created_at = metadata.get("created_at", time.time()) if metadata else time.time()
+    modified_at = metadata.get("modified_at", created_at) if metadata else created_at
+    existed = name in bm._buffers
+
+    # Gate the creation or overwrite through pre-creation hooks; a rejection blocks the operation.
+    create_args = {"name": name, "text": text, "overwrite": overwrite}
+    pre_result = await bm._buffer_hooks[HookPoint.ON_CREATE_BUFFER]._fire_hooks(bm, name, create_args)
+    if pre_result is not True and pre_result is not None:
+        return {"ok": False, "error": str(pre_result)}
+
+    # Gate overwrite through the existing buffer's pre-update hooks; a rejection blocks the replacement.
+    if existed:
+        buf = bm._buffers[name]
+        old_text = buf.get_text()
+        hook_result = await buf._fire_hooks(HookPoint.ON_UPDATE_BUFFER, old_text, 0, len(buf.lines), (text + "\n") if text else "\n")
+        if hook_result is not True and hook_result is not None:
+            return {"ok": False, "error": str(hook_result)}
+
+        # Overwrite the buffer's content in place, preserving the buffer object and its
+        # registered update hooks so that they survive across create_buffer overwrites.
+        buf.modified_at = modified_at
+        buf.lines = [BufferEntry(data=line, modified_at=modified_at, object_at=modified_at) for line in (text.splitlines() if text else [])]
+        create_result = {"ok": True, "lines": len(buf.lines)}
+
+        # Fire post-update hooks now that the overwrite is committed.
+        await buf._fire_hooks(HookPoint.ON_BUFFER_UPDATED, old_text, 0, len(buf.lines), (text + "\n") if text else "\n")
+
+    # Create a fresh Buffer with no lines and the given timestamps.
+    # Delegated to protected creation — hooks are not fired here.
+    else:
+        create_result = bm._create_buffer(name, text, metadata)
+        if not create_result.get("ok"):
+            return create_result
+
+    # Fire post-creation hooks; a rejection is logged but does not block the committed buffer.
+    post_result = await bm._buffer_hooks[HookPoint.ON_BUFFER_CREATED]._fire_hooks(bm, name, create_args)
+    if post_result is not True and post_result is not None:
+        post_result = str(post_result)
+
+    # Refresh the system buffer listing so the new buffer is visible to the agent.
+    if name != _STATUS_BUFFER:
+        refresh_result = await bm._refresh_buffers_buffer()
+        if not refresh_result.get("ok"):
+            raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
+
+    # Signal whether this was a fresh creation or an overwrite, and how many lines were written.
+    return {"ok": True, "created": not existed, "overwritten": existed, "lines": create_result.get("lines", 0)}
+
+
+async def _restore_create_buffers(self: BufferManager) -> None:
     """Restore hook: re-creates buffers from persisted state after instance restoration.
 
-    TODO(restore): implement buffer state persistence and re-creation logic.
+    Lists the buffer manager's persistence directory for buffer JSON manifests,
+    validates each, and re-creates the buffer with its original timestamps.
     """
-    pass
+    # Ensure the persistence directory exists — nothing to restore if it was never persisted.
+    dir = _get_persistence_dir(self)
+    if not dir.exists():
+        return
+
+    # Find all hidden JSON manifest files, each representing a single persisted buffer.
+    manifest_files = sorted(dir.glob(".*.json"))
+    valid_manifests: list[tuple[float, Path]] = []
+
+    # Collect only valid buffer manifests and sort by creation time — oldest first.
+    for manifest_path in manifest_files:
+        # Parse the JSON manifest; skip on any read/parse error.
+        import json
+        try:
+            meta = json.loads(manifest_path.read_text())
+        except Exception:
+            continue
+
+        # Guard: skip files that do not carry the buffer kind marker.
+        if not isinstance(meta, dict) or meta.get("kind") != "buffer":
+            continue
+
+        # Extract buffer identity and timestamps from the manifest.
+        name = meta.get("name")
+        created_at = meta.get("created_at")
+        if not name or not created_at:
+            continue
+
+        # Record this manifest as valid for the restore pass.
+        valid_manifests.append((created_at, manifest_path))
+
+    # Restore in creation-time order — oldest buffers first.
+    valid_manifests.sort(key=lambda x: x[0])
+
+    for _, manifest_path in valid_manifests:
+        # Re-parse the manifest and extract all required fields for restoration.
+        import json
+        try:
+            meta = json.loads(manifest_path.read_text())
+        except Exception:
+            continue
+        name = meta.get("name")
+        created_at = meta.get("created_at")
+        modified_at = meta.get("modified_at")
+
+        # Guard: skip if the content file is absent — nothing to restore.
+        content_path = dir / name
+        if not content_path.exists():
+            continue
+
+        # Load the raw buffer content from the corresponding content file.
+        text = content_path.read_text()
+
+        # Re-create the buffer with its original timestamps.
+        metadata = {"created_at": created_at, "modified_at": modified_at or created_at}
+        try:
+            await _create_buffer_implementation(self, name, text, False, metadata)
+        except Exception as e:
+            # Best-effort: non-critical restore — log and continue.
+            import logging
+            logging.warning(f"[_restore_create_buffers] failed to restore buffer '{name}': {e}")
 
 
 def _resolve_line_number(total: int, pos: int  | str | None, arg: str = 'pos') -> dict[str, Any] | int:
@@ -494,11 +621,14 @@ class BufferManager(AgenticObject):
         text = json.dumps(records, indent=2)
         return await self.create_buffer(_STATUS_BUFFER, text=text, overwrite=True)
 
-    def _create_buffer(self, name: str, text: str | None = None) -> dict[str, Any]:
+    def _create_buffer(self, name: str, text: str | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         """Protected buffer creation for initialization only.
         Always overwrites. Does not fire hooks.
         Used by __init__ and constructors — not for agent-facing operations.
         """
+        if metadata is None:
+            metadata = {}
+
         # Validate the buffer name contains no ASCII whitespace; unsanitized names corrupt storage and lookups.
         sanitized = _sanitize_buffer_name(name)
         if sanitized != name:
@@ -511,13 +641,14 @@ class BufferManager(AgenticObject):
                 ),
             }
 
-        ts = time.time()
-        buf = Buffer(name=name, lines=[], created_at=ts, modified_at=ts)
+        created_at = metadata.get("created_at", time.time())
+        modified_at = metadata.get("modified_at", created_at)
+        buf = Buffer(name=name, lines=[], created_at=created_at, modified_at=modified_at)
         self._buffers[name] = buf
         lines = 0
 
         if text:
-            buf.lines = [BufferEntry(data=line, modified_at=ts, object_at=ts) for line in text.splitlines()]
+            buf.lines = [BufferEntry(data=line, modified_at=created_at, object_at=created_at) for line in text.splitlines()]
             lines = len(buf.lines)
 
         # Register the persist hook so every subsequent modification is written to disk.
@@ -535,59 +666,9 @@ class BufferManager(AgenticObject):
         Optionally provide initial text.
         Use overwrite=True to replace an existing buffer.
         """
-        # Reject new creation if the name is already taken and overwrite is not requested.
-        if name in self._buffers and not overwrite:
-            return {"ok": False, "error": f"Buffer '{name}' already exists. Use overwrite=True to replace it."}
-
         ts = time.time()
-        existed = name in self._buffers
-
-        # Gate the creation or overwrite through pre-creation hooks; a rejection blocks the operation.
-        create_args = {"name": name, "text": text, "overwrite": overwrite}
-        pre_result = await self._buffer_hooks[HookPoint.ON_CREATE_BUFFER]._fire_hooks(self, name, create_args)
-        if pre_result is not True and pre_result is not None:
-            return {"ok": False, "error": str(pre_result)}
-
-        # Gate overwrite through the existing buffer's pre-update hooks; a rejection blocks the replacement.
-        if existed:
-            buf = self._buffers[name]
-            old_text = buf.get_text()
-            hook_result = await buf._fire_hooks(HookPoint.ON_UPDATE_BUFFER, old_text, 0, len(buf.lines), (text + "\n") if text else "\n")
-            if hook_result is not True and hook_result is not None:
-                return {"ok": False, "error": str(hook_result)}
-
-            # Overwrite the buffer's content in place, preserving the buffer object and its
-            # registered update hooks so that they survive across create_buffer overwrites.
-            buf.modified_at = ts
-            buf.lines = [BufferEntry(data=line, modified_at=ts, object_at=ts) for line in (text.splitlines() if text else [])]
-            create_result = {"ok": True, "lines": len(buf.lines)}
-
-            # Fire post-update hooks now that the overwrite is committed.
-            await buf._fire_hooks(HookPoint.ON_BUFFER_UPDATED, old_text, 0, len(buf.lines), (text + "\n") if text else "\n")
-
-        # Create a fresh Buffer with no lines and the current timestamp; it starts with zero hooks.
-        # Delegated to protected creation — hooks are not fired here.
-        else:
-            create_result = self._create_buffer(name, text)
-            if not create_result.get("ok"):
-                return create_result
-
-        # Fire post-creation hooks; a rejection is logged but does not block the committed buffer.
-        post_result = await self._buffer_hooks[HookPoint.ON_BUFFER_CREATED]._fire_hooks(self, name, create_args)
-        if post_result is not True and post_result is not None:
-            post_result = str(post_result)
-
-        # Refresh the system buffer listing so the new buffer is visible to the agent.
-        if name != _STATUS_BUFFER:
-            refresh_result = await self._refresh_buffers_buffer()
-            if not refresh_result.get("ok"):
-                # TODO(design): buffer already created and registered — rolling back would require
-                # deleting from self._buffers. Until a rollback strategy is defined, raising the
-                # error leaves BufferManager in an inconsistent state (buffer exists, listing stale).
-                raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
-
-        # Signal whether this was a fresh creation or an overwrite, and how many lines were written.
-        return {"ok": True, "created": not existed, "overwritten": existed, "lines": create_result.get("lines", 0)}
+        metadata = {"created_at": ts, "modified_at": ts}
+        return await _create_buffer_implementation(self, name, text, overwrite, metadata)
 
     @tool
     async def copy_buffer(self, source_name: str, target_name: str, overwrite: bool = False) -> dict[str, Any]:
