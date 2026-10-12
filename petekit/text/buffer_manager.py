@@ -5,12 +5,79 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 from typing import Callable
 from typing import Literal
 
 
 UpdateHook = Callable[["Buffer", str | None, int, int, str | None], bool | str | None]
+
+
+class HookPoint(Enum):
+    """Hook points at which buffer lifecycle events can be intercepted."""
+    ON_CREATE_BUFFER = "on_create_buffer"
+    ON_BUFFER_CREATED = "on_buffer_created"
+    ON_UPDATE_BUFFER = "on_update_buffer"
+    ON_BUFFER_UPDATED = "on_buffer_updated"
+
+
+@dataclass
+class CreationHook:
+    """A single creation hook registered on a buffer path."""
+    name: str
+    buffer_scope: str
+    callable: Callable[..., bool | str | None]
+
+
+@dataclass
+class HookPointRegistry:
+    """Registry of creation hooks for one hook point.
+
+    hooks_by_name maps a unique hook name to its CreationHook.
+    """
+    hooks_by_name: dict[str, CreationHook] = field(default_factory=dict)
+
+    def _sort_hooks_for(self, buffer_scope: str) -> list[CreationHook]:
+        """Return the hooks whose buffer_scope is a prefix of the given path, ordered outer-to-inner.
+
+        Filters to hooks whose registered path is a prefix of buffer_scope, then sorts
+        alphanumerically — this yields outer-to-inner traversal order.
+        """
+        # Filter to only hooks whose buffer_scope is a prefix of the target scope.
+        prefix_hooks = [
+            hook for hook in self.hooks_by_name.values()
+            if buffer_scope.startswith(hook.buffer_scope)
+        ]
+
+        # Sort by buffer_scope alphanumerically — shorter/outermost scopes sort first.
+        prefix_hooks.sort(key=lambda h: h.buffer_scope)
+
+        return prefix_hooks
+
+    async def _fire_hooks(
+        self,
+        bm: "BufferManager",
+        buffer_scope: str,
+        args: dict[str, Any],
+    ) -> bool | str:
+        """Fire all matching creation hooks in outer-to-inner order, returning the first rejection.
+
+        Calls each hook with (bm, buffer_scope, args). If a hook returns a non-None/non-True
+        value, that is treated as a rejection and returned immediately.
+        """
+        # Obtain the hooks for this scope in traversal order.
+        hooks = self._sort_hooks_for(buffer_scope)
+
+        # Fire each hook in order; stop and return the first rejection.
+        for hook in hooks:
+            result = hook.callable(bm, buffer_scope, args)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if result is not None and result is not True:
+                return result
+
+        return True
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos import tool, sandbox
@@ -329,6 +396,12 @@ class BufferManager(AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._buffers: dict[str, Buffer] = {}
+        self._buffer_hooks: dict[HookPoint, HookPointRegistry] = {
+            HookPoint.ON_CREATE_BUFFER: HookPointRegistry(),
+            HookPoint.ON_BUFFER_CREATED: HookPointRegistry(),
+            HookPoint.ON_UPDATE_BUFFER: HookPointRegistry(),
+            HookPoint.ON_BUFFER_UPDATED: HookPointRegistry(),
+        }
         loop = asyncio.get_running_loop()
         loop.create_task(self._refresh_buffers_buffer())
 
@@ -365,6 +438,12 @@ class BufferManager(AgenticObject):
         ts = time.time()
         existed = name in self._buffers
 
+        # Gate the creation or overwrite through pre-creation hooks; a rejection blocks the operation.
+        create_args = {"name": name, "text": text, "overwrite": overwrite}
+        pre_result = await self._buffer_hooks[HookPoint.ON_CREATE_BUFFER]._fire_hooks(self, name, create_args)
+        if pre_result is not True and pre_result is not None:
+            return {"ok": False, "error": str(pre_result)}
+
         # Gate overwrite through the existing buffer's hooks; a rejection blocks the replacement.
         if existed:
             buf = self._buffers[name]
@@ -383,6 +462,11 @@ class BufferManager(AgenticObject):
         # Delegated to protected creation — hooks are not fired here.
         else:
             create_result = self._create_buffer(name, text)
+
+        # Fire post-creation hooks; a rejection is logged but does not block the committed buffer.
+        post_result = await self._buffer_hooks[HookPoint.ON_BUFFER_CREATED]._fire_hooks(self, name, create_args)
+        if post_result is not True and post_result is not None:
+            post_result = str(post_result)
 
         # Refresh the system buffer listing so the new buffer is visible to the agent.
         if name != _STATUS_BUFFER:
@@ -526,6 +610,59 @@ class BufferManager(AgenticObject):
         del buf._update_hooks[hook_name]
 
         return {"ok": True, "buffer": buffer_name, "removed": hook_name}
+
+    def register_buffer_hook(
+        self,
+        hook_point: HookPoint,
+        buffer_path: str,
+        hook_name: str,
+        hook: Callable[..., bool | str | None],
+    ) -> dict[str, Any]:
+        """Register a creation hook on a buffer path under a hook point.
+
+        Rejects if hook_name already exists under this hook point.
+        """
+        # Look up the existing registry for this hook point, creating a fresh one if none exists.
+        if hook_point not in self._buffer_hooks:
+            self._buffer_hooks[hook_point] = HookPointRegistry()
+        registry = self._buffer_hooks[hook_point]
+
+        # Guard: reject name collision — silent registration hides bugs.
+        if hook_name in registry.hooks_by_name:
+            return {"ok": False, "error": f"hook '{hook_name}' already registered under '{hook_point.value}'."}
+
+        # Commit the new hook under its unique name within this hook point.
+        registry.hooks_by_name[hook_name] = CreationHook(
+            name=hook_name,
+            buffer_scope=buffer_path,
+            callable=hook,
+        )
+
+        return {"ok": True, "hook_point": hook_point.value, "buffer_path": buffer_path, "hook": hook_name}
+
+    def deregister_buffer_hook(
+        self,
+        hook_point: HookPoint,
+        buffer_path: str,
+        hook_name: str,
+    ) -> dict[str, Any]:
+        """Remove a named creation hook from a hook point.
+
+        Rejects if the hook point or hook name is not registered.
+        """
+        # Guard: reject unknown hook point — silent miss hides bugs.
+        if hook_point not in self._buffer_hooks:
+            return {"ok": False, "error": f"no hook point '{hook_point.value}' registered."}
+        registry = self._buffer_hooks[hook_point]
+
+        # Guard: reject unknown hook name — silent miss hides bugs.
+        if hook_name not in registry.hooks_by_name:
+            return {"ok": False, "error": f"no hook '{hook_name}' registered under '{hook_point.value}'."}
+
+        # Remove the hook from the registry under this hook point.
+        del registry.hooks_by_name[hook_name]
+
+        return {"ok": True, "hook_point": hook_point.value, "buffer_path": buffer_path, "removed": hook_name}
 
     @sandbox
     def _grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | str = "end") -> dict[str, Any]:
