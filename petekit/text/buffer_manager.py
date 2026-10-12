@@ -1,11 +1,13 @@
 from __future__ import annotations
 import asyncio
 import difflib
+import json
 import os
 import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 from typing import Callable
 from typing import Literal
@@ -57,7 +59,7 @@ class HookPointRegistry:
 
     async def _fire_hooks(
         self,
-        bm: "BufferManager",
+        bm: BufferManager,
         buffer_scope: str,
         args: dict[str, Any],
     ) -> bool | str:
@@ -81,7 +83,6 @@ class HookPointRegistry:
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos import tool, sandbox
-from petekit.utils.text_formatters import format_dict_list_for_buffer
 
 
 # Managed buffer names — system:status: namespace and diff namespace
@@ -97,6 +98,70 @@ def _diff_buffer_name(a: str, b: str) -> str:
 def _sanitize_buffer_name(name: str) -> str:
     """Remove ASCII whitespace from a buffer name segment. Use this for any name derived from agent input."""
     return "".join(c for c in name if c not in " \t\n\r")
+
+
+def _get_persistence_dir(bm: BufferManager) -> Path:
+    """Return the BufferManager persistence directory inside the buffer manager's instance dir."""
+    return bm.instance_dir / "buffer_manager"
+
+
+def _persist_buffer(bm: BufferManager, buffer: Buffer) -> None:
+    """Write buffer content and metadata to disk for persistence.
+
+    Stores the raw line data in a file and structural metadata in a .json file.
+    """
+    # Ensure the persistence directory for this buffer manager exists.
+    dir = _get_persistence_dir(bm)
+    dir.mkdir(parents=True, exist_ok=True)
+
+    # Raw content file — one line per line, preserving exact buffer text.
+    buff_path = dir / f"{buffer.name}"
+    buff_path.parent.mkdir(parents=True, exist_ok=True)
+    buff_path.write_text(buffer.get_text())
+
+    # Metadata JSON — name, line count, timestamps.
+    import json
+    meta = {
+        "name": buffer.name,
+        "line_count": len(buffer.lines),
+        "created_at": buffer.created_at,
+        "modified_at": buffer.modified_at,
+    }
+    (dir / f".{buffer.name}.json").write_text(json.dumps(meta, indent=2))
+
+
+def _drop_persisted_buffer(bm: BufferManager, buffer_name: str) -> None:
+    """Remove persisted content and metadata for the named buffer."""
+    dir = _get_persistence_dir(bm)
+
+    # Remove content and metadata files; missing_ok=True handles the already-gone case.
+    (dir / f"{buffer_name}").unlink(missing_ok=True)
+    (dir / f".{buffer_name}.json").unlink(missing_ok=True)
+
+
+def _make_persist_buffer_hook(bm: BufferManager) -> UpdateHook:
+    """Factory that returns an update hook that persists the buffer on every modification.
+
+    Closes over bm so the hook can call _persist_buffer with the correct BufferManager.
+    """
+    def _persist_buffer_update_hook(
+        buf: Buffer,
+        old_text: str | None,
+        start: int,
+        end: int,
+        new_text: str | None,
+    ) -> bool | str | None:
+        _persist_buffer(bm, buf)
+        return True
+    return _persist_buffer_update_hook
+
+
+def _restore_create_buffers(self: BufferManager) -> None:
+    """Restore hook: re-creates buffers from persisted state after instance restoration.
+
+    TODO(restore): implement buffer state persistence and re-creation logic.
+    """
+    pass
 
 
 def _resolve_line_number(total: int, pos: int  | str | None, arg: str = 'pos') -> dict[str, Any] | int:
@@ -311,6 +376,15 @@ class Buffer:
 
         return True
 
+    def get_text(self) -> str:
+        """Return the full buffer content as a single newline-joined string with a trailing newline.
+
+        Returns an empty string if the buffer has no lines.
+        """
+        if not self.lines:
+            return ""
+        return "\n".join(entry.data for entry in self.lines) + "\n"
+
     def read(
         self,
         start: int = 0,
@@ -402,12 +476,12 @@ class BufferManager(AgenticObject):
             HookPoint.ON_UPDATE_BUFFER: HookPointRegistry(),
             HookPoint.ON_BUFFER_UPDATED: HookPointRegistry(),
         }
-        loop = asyncio.get_running_loop()
-        loop.create_task(self._refresh_buffers_buffer())
+        self._register_restore_hook("create_buffers", _restore_create_buffers)
+        self._create_buffer(_STATUS_BUFFER, text="[]")
 
     async def _refresh_buffers_buffer(self) -> dict[str, Any]:
         records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
-        text = format_dict_list_for_buffer(records)
+        text = json.dumps(records, indent=2)
         return await self.create_buffer(_STATUS_BUFFER, text=text, overwrite=True)
 
     def _create_buffer(self, name: str, text: str | None = None) -> dict[str, Any]:
@@ -415,13 +489,33 @@ class BufferManager(AgenticObject):
         Always overwrites. Does not fire hooks.
         Used by __init__ and constructors — not for agent-facing operations.
         """
+        # Validate the buffer name contains no ASCII whitespace; unsanitized names corrupt storage and lookups.
+        sanitized = _sanitize_buffer_name(name)
+        if sanitized != name:
+            return {
+                "ok": False,
+                "error": (
+                    f"Buffer name '{name}' contains illegal whitespace characters. "
+                    f"Buffer names must be continuous — no spaces, tabs, or newlines. "
+                    f"Example of a valid name: '{sanitized}'"
+                ),
+            }
+
         ts = time.time()
-        self._buffers[name] = Buffer(name=name, lines=[], created_at=ts, modified_at=ts)
+        buf = Buffer(name=name, lines=[], created_at=ts, modified_at=ts)
+        self._buffers[name] = buf
         lines = 0
 
         if text:
-            self._buffers[name].lines = [BufferEntry(data=line, modified_at=ts, object_at=ts) for line in text.splitlines()]
-            lines = len(self._buffers[name].lines)
+            buf.lines = [BufferEntry(data=line, modified_at=ts, object_at=ts) for line in text.splitlines()]
+            lines = len(buf.lines)
+
+        # Register the persist hook so every subsequent modification is written to disk.
+        persist_buffer_hook = _make_persist_buffer_hook(self)
+        self.register_buffer_update_hook(name, "persist_buffer", persist_buffer_hook)
+
+        # Persist the freshly created buffer immediately.
+        persist_buffer_hook(buf, None, 0, 0, None)
 
         return {"ok": True, "lines": lines}
 
@@ -447,7 +541,7 @@ class BufferManager(AgenticObject):
         # Gate overwrite through the existing buffer's hooks; a rejection blocks the replacement.
         if existed:
             buf = self._buffers[name]
-            old_text = "\n".join(e.data for e in buf.lines) + "\n"
+            old_text = buf.get_text()
             hook_result = await buf._fire_update_hooks(old_text, 0, len(buf.lines), (text + "\n") if text else "\n")
             if hook_result is not True and hook_result is not None:
                 return {"ok": False, "error": str(hook_result)}
@@ -462,6 +556,8 @@ class BufferManager(AgenticObject):
         # Delegated to protected creation — hooks are not fired here.
         else:
             create_result = self._create_buffer(name, text)
+            if not create_result.get("ok"):
+                return create_result
 
         # Fire post-creation hooks; a rejection is logged but does not block the committed buffer.
         post_result = await self._buffer_hooks[HookPoint.ON_BUFFER_CREATED]._fire_hooks(self, name, create_args)
@@ -561,7 +657,7 @@ class BufferManager(AgenticObject):
 
         # Fire update hooks with the full buffer content and None for new_text (signals drop).
         # Rejection means the drop is denied and the buffer must not be deleted.
-        old_text = "\n".join(e.data for e in buf.lines) + "\n"
+        old_text = buf.get_text()
         hook_result = await buf._fire_update_hooks(old_text, 0, len(buf.lines), None)
         if hook_result is not True and hook_result is not None:
             return {"ok": False, "error": str(hook_result)}
@@ -574,6 +670,10 @@ class BufferManager(AgenticObject):
             # restoring from a snapshot. Until a rollback strategy is defined, raising the error
             # leaves BufferManager in an inconsistent state (buffer gone, listing stale).
             raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
+
+        # Remove the persisted files for this buffer now that the drop has succeeded.
+        _drop_persisted_buffer(self, name)
+
         return {"ok": True, "dropped": name}
 
     def register_buffer_update_hook(self, buffer_name: str, hook_name: str, hook: UpdateHook) -> dict[str, Any]:
@@ -975,7 +1075,7 @@ class BufferManager(AgenticObject):
 
         # Reconstitute buffer text as a flat string so the unified diff applies over line-oriented content.
         buf = self._buffers[name]
-        buf_text = "\n".join(e.data for e in buf.lines) + "\n"
+        buf_text = buf.get_text()
 
         # Parse the provided diff, returning a parse error if the format is unrecognizable.
         if not isinstance(patch_text, bytes):

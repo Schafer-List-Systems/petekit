@@ -307,10 +307,12 @@ class TestEditBufferScopedRange:
 class TestUpdateHooks:
     async def test_register_hook_success(self, bm):
         await bm.create_buffer("test")
+        buf = bm._buffers["test"]
+        count_before = len(buf._update_hooks)
         result = bm.register_buffer_update_hook("test", "myhook", lambda *_: True)
         assert result["ok"]
         assert result["hook"] == "myhook"
-        assert result["hook_count"] == 1
+        assert len(buf._update_hooks) == count_before + 1
 
     async def test_register_hook_no_overwrite(self, bm):
         await bm.create_buffer("test")
