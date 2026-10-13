@@ -40,7 +40,7 @@ class HookPointRegistry:
     """
     hooks_by_name: dict[str, CreationHook] = field(default_factory=dict)
 
-    def _sort_hooks_for(self, buffer_scope: str) -> list[CreationHook]:
+    def _sort_hooks_for(self, buffer_name: str) -> list[CreationHook]:
         """Return the hooks whose buffer_scope is a prefix of the given path, ordered outer-to-inner.
 
         Filters to hooks whose registered path is a prefix of buffer_scope, then sorts
@@ -49,7 +49,7 @@ class HookPointRegistry:
         # Filter to only hooks whose buffer_scope is a prefix of the target scope.
         prefix_hooks = [
             hook for hook in self.hooks_by_name.values()
-            if buffer_scope.startswith(hook.buffer_scope)
+            if buffer_name.startswith(hook.buffer_scope)
         ]
 
         # Sort by buffer_scope alphanumerically — shorter/outermost scopes sort first.
@@ -60,7 +60,7 @@ class HookPointRegistry:
     async def _fire_hooks(
         self,
         bm: BufferManager,
-        buffer_scope: str,
+        buffer_name: str,
         args: dict[str, Any],
     ) -> bool | str:
         """Fire all matching creation hooks in outer-to-inner order, returning the first rejection.
@@ -69,11 +69,11 @@ class HookPointRegistry:
         value, that is treated as a rejection and returned immediately.
         """
         # Obtain the hooks for this scope in traversal order.
-        hooks = self._sort_hooks_for(buffer_scope)
+        hooks = self._sort_hooks_for(buffer_name)
 
         # Fire each hook in order; stop and return the first rejection.
         for hook in hooks:
-            result = hook.callable(bm, buffer_scope, args)
+            result = hook.callable(bm, buffer_name, args)
             if asyncio.iscoroutine(result):
                 result = await result
             if result is not None and result is not True:
@@ -620,6 +620,14 @@ class BufferManager(AgenticObject):
         records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
         text = json.dumps(records, indent=2)
         return await self.create_buffer(_STATUS_BUFFER, text=text, overwrite=True)
+
+    def _get_buffer(self, name: str) -> Buffer | None:
+        """Protected buffer lookup — returns the Buffer object or None if not found.
+
+        Not agent-facing. Used by subclasses and internal code that needs direct
+        buffer access without the dict-wrapping overhead of a tool response.
+        """
+        return self._buffers.get(name)
 
     def _create_buffer(self, name: str, text: str | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         """Protected buffer creation for initialization only.
