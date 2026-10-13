@@ -3,163 +3,129 @@
 from __future__ import annotations
 
 import ast
-import json
+import inspect
 import logging
 from pathlib import Path
 from typing import Any, Callable
 
-from peteos import tool, sandbox
-from peteos.oap.agentic_object import AgenticObject, RestoreHook
+from peteos.oap.agentic_object import AgenticObject
 from peteos.sandbox import SandboxBuilder
 
 from petekit.function.function_manager import FunctionManager
-from petekit.text.buffer_manager import HookPoint
+from petekit.text.buffer_manager import Buffer, HookPoint, _get_persistence_dir
 
 _CODE_BUFFER_PREFIX = "system:code:"
+_FUNCTION_COMPILER_DOC_BUFFER = "doc:function_compiler"
 _logger = logging.getLogger(__name__)
 
 
-# --- Persistence helpers (module-level to keep the class footprint small) ---
+_FUNCTION_COMPILER_DOC = """\
+## Schema
 
-def _get_persistence_dir(agent: AgenticObject) -> Path:
-    """Return the FunctionCompiler persistence directory inside the agent's instance dir."""
-    return agent.instance_dir / "function_compiler"
+Each compiled function lives in a `system:code:<name>` buffer. The buffer holds the
+Python source. The function is automatically compiled and registered when the buffer
+is created, and re-compiled when the buffer is updated.
 
+## Create a function
 
-def _persist_function(agent: AgenticObject, name: str, source: str, short: str, long: str) -> None:
-    """Write function source and metadata to disk for persistence."""
-    import json
+Create a `system:code:<name>` buffer with your Python source. The function name in the
+source must match the buffer name suffix. Only one top-level `def` is allowed.
 
-    # Ensure the persistence directory exists.
-    dir = _get_persistence_dir(agent)
-    dir.mkdir(parents=True, exist_ok=True)
+Result: `{"ok": true, "name": "...", "args": [...], "returns": "..."}`
 
-    # Raw source file — IDE/debugging friendly, direct Python syntax
-    (dir / f"{name}.py").write_text(source)
+On error: `{"ok": false, "error": "SyntaxError at line 2: ..."}`
 
-    # Metadata JSON
-    meta = {
-        "name": name,
-        "short_description": short,
-        "long_description": long,
-    }
-    (dir / f"{name}.json").write_text(json.dumps(meta, indent=2))
+The first line of the docstring becomes the short description. The full docstring
+is the long description. The function is immediately callable.
 
+## Update a function
 
-def _drop_persisted_function(agent: AgenticObject, name: str) -> None:
-    """Remove persisted source and metadata for the named function."""
-    dir = _get_persistence_dir(agent)
+Overwrite the `system:code:<name>` buffer with new source. The function is re-compiled
+automatically. If the source is invalid the update is rejected with a compile error
+and the previous source remains active.
 
-    # Remove source and metadata files; missing_ok=True handles the already-gone case.
-    (dir / f"{name}.py").unlink(missing_ok=True)
-    (dir / f"{name}.json").unlink(missing_ok=True)
+## Drop a function
 
-
-def _overwrite_persisted_source(agent: AgenticObject, name: str, source: str) -> None:
-    """Overwrite the persisted source file after a successful in-memory recompilation."""
-    dir = _get_persistence_dir(agent)
-    # Write only the source file — descriptions live in .json and are not updated on edit.
-    (dir / f"{name}.py").write_text(source)
-
-
-async def _restore_functions(agent: AgenticObject) -> None:
-    """Re-compile all persisted functions from disk on agent restore()."""
-    dir = _get_persistence_dir(agent)
-
-    # Nothing to restore if the directory was never created.
-    if not dir.exists():
-        return
-
-    # Iterate all persisted metadata files and replay create_function for each.
-    for json_file in dir.glob("*.json"):
-
-        # Extract function name and skip if already live.
-        name = json_file.stem
-        if name in agent._functions:
-            continue
-
-        # Replay create_function for this function — loads source, recompiles, re-registers.
-        try:
-            meta = json.loads(json_file.read_text())
-            source = (dir / f"{name}.py").read_text()
-            await agent.create_function(
-                name=name,
-                code=source,
-                short_description=meta.get("short_description", ""),
-                long_description=meta.get("long_description", ""),
-            )
-            _logger.info(
-                "[function_compiler] restored function '%s' for %s",
-                name,
-                agent.__class__.__name__,
-            )
-
-        # Log failures so the maintainer knows what failed and why.
-        except Exception as e:
-            _logger.error(
-                "[function_compiler] failed to restore function '%s' for %s: %s",
-                name,
-                agent.__class__.__name__,
-                e,
-            )
+Drop the `system:code:<name>` buffer. The function and its introspection buffer are
+removed automatically.
+"""
 
 
 # --- Internal helpers ---
 
-def _code_buffer_name(name: str) -> str:
-    """Return the source-code buffer name for the given function name."""
-    return f"{_CODE_BUFFER_PREFIX}{name}"
-
-
-def _compile_function(
+def _validate_and_trial_compile(
     compiler: "FunctionCompiler",
-    func_name: str,
     source: str,
-    source_path: "Path | None" = None,
-) -> Callable | str:
-    """Validate source in a trial builder, then commit to the OAP sandbox builder.
+) -> str:
+    """Validate source structure and run a trial compilation without committing to the real sandbox.
 
-    When source_path is given the Path is passed to add_source_code so the source
-    file is imported as a module and debuggers can resolve breakpoints in it.
+    Parses the AST, enforces a single FunctionDef, and compiles into a throwaway builder.
+    Returns the function name on success. Raises on any validation or compilation failure.
     """
     # Parse and require exactly one FunctionDef as the sole top-level construct.
     try:
         tree = ast.parse(source)
     except SyntaxError as e:
-        return f"SyntaxError at line {e.lineno}: {e.msg}"
+        raise ValueError(f"SyntaxError at line {e.lineno}: {e.msg}")
 
     # The source must contain exactly one top-level node, and it must be a FunctionDef.
     top_level_nodes = list(ast.iter_child_nodes(tree))
     if len(top_level_nodes) != 1:
-        return f"Source must contain exactly one top-level construct, found {len(top_level_nodes)}."
+        raise ValueError(f"Source must contain exactly one top-level construct, found {len(top_level_nodes)}.")
     if not isinstance(top_level_nodes[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
         node_type = type(top_level_nodes[0]).__name__
-        return f"Top-level construct must be a function definition, found '{node_type}'."
-    if top_level_nodes[0].name != func_name:
-        return f"Function name must be '{func_name}', found '{top_level_nodes[0].name}'."
+        raise ValueError(f"Top-level construct must be a function definition, found '{node_type}'.")
 
-    # Phase 1: trial compilation — mutate a throwaway child builder, not the real one.
+    # Derive the canonical function name from the AST — the single source of truth.
+    func_name = top_level_nodes[0].name
+
+    # Trial compilation — mutate a throwaway child builder, not the real one.
     trial_name = f"{compiler._oap_sandbox_builder._name}_trial"
     trial = SandboxBuilder(trial_name, base=compiler._oap_sandbox_builder)
 
     # Attempt to add to the trial builder — catches all compilation errors.
     try:
-        entries = trial.add_source_code(source_path if source_path is not None else source)
+        entries = trial.add_source_code(source)
     except Exception as e:
-        return f"Compilation failed: {e}"
+        raise ValueError(f"Compilation failed: {e}")
     if not entries:
-        return f"add_source_code returned no entries for '{func_name}'."
+        raise ValueError(f"add_source_code returned no entries for '{func_name}'.")
+
+    return func_name
+
+
+def _compile_function(
+    compiler: "FunctionCompiler",
+    source: str,
+    buffer_name: str | None = None,
+) -> tuple[str, Callable]:
+    """Validate and compile source into a sandbox proxy.
+
+    Parses the source to extract the function name from the AST. Requires exactly one
+    FunctionDef as the sole top-level construct. Commits to the OAP sandbox on success.
+
+    When buffer_name is given, reads the persisted source file from the BufferManager's
+    persistence directory so the file is imported as a module and debuggers can resolve
+    breakpoints in it. This avoids a redundant in-memory string as the compilation input.
+
+    Returns (func_name, proxy) on success. Raises on any validation or compilation failure.
+    """
+    # Validation and trial compilation — raises on failure.
+    func_name = _validate_and_trial_compile(compiler, source)
+
+    # Derive the source path from the persisted buffer file when a buffer name is given.
+    if buffer_name is not None:
+        source_path: Path = _get_persistence_dir(compiler) / buffer_name
+    else:
+        source_path = None
 
     # Phase 2: commit to the real instance-level sandbox builder.
-    try:
-        compiler._oap_sandbox_builder.add_source_code(source_path if source_path is not None else source)
-    except Exception as e:
-        return f"Failed to register '{func_name}' in sandbox: {e}"
+    compiler._oap_sandbox_builder.add_source_code(source_path if source_path is not None else source)
 
-    # Return the proxy from the real sandbox.
+    # Return name and proxy from the real sandbox.
     sandbox = compiler._oap_sandbox_builder.get_sandbox(freeze_namespaces=False)
     proxy = getattr(sandbox, func_name)
-    return proxy
+    return (func_name, proxy)
 
 
 def _make_stable_wrapper(compiler: "FunctionCompiler", func_name: str) -> Callable:
@@ -168,8 +134,6 @@ def _make_stable_wrapper(compiler: "FunctionCompiler", func_name: str) -> Callab
     The wrapper is registered once and never replaced. Every call forwards to the
     current sandbox proxy, so callers holding a reference are never stale.
     """
-    import inspect
-
     # Stable wrapper — delegates to the live sandbox proxy on every call.
     # The proxy from getattr already has sandbox bound via closure capture.
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -187,127 +151,173 @@ def _make_stable_wrapper(compiler: "FunctionCompiler", func_name: str) -> Callab
     return wrapper
 
 
-def _make_compilation_sentinel(compiler: "FunctionCompiler", name: str):
-    """Factory producing a sentinel hook that recompiles the live callable on every source write.
+def _make_on_update_code(compiler: "FunctionCompiler", func_name: str):
+    """Factory producing a pre-update hook that validates source or handles the drop sentinel.
 
-    On failure the write is rejected and the error is surfaced to the caller.
-    On success the sandbox and disk are both updated.
+    When new_text is None the drop sentinel is active — unregisters hooks and delegates
+    to the parent drop_function. Otherwise validates AST structure, enforces a single
+    function def, and runs a trial compilation before allowing the update.
     """
-    def compilation_sentinel(buf: str, old_text: str, start: int, end: int, new_text: str) -> str | None:
-        # Write the updated source to disk first — the file on disk is the debugger's view of the code.
-        _overwrite_persisted_source(compiler, name, new_text)
-        source_path = _get_persistence_dir(compiler) / f"{name}.py"
+    async def on_update_code(buf: Buffer, old_text: str | None, start: int, end: int, new_text: str | None) -> str | None:
+        # Drop sentinel — new_text is None means the buffer is being dropped.
+        if new_text is None:
+            buf_name = buf.name
 
-        # Delegate to the two-phase compiler — trial, then commit on success.
-        result = _compile_function(compiler, name, new_text, source_path)
-        if isinstance(result, str):
-            return result  # error — reject the write, surface the message
+            # Unregister our own hooks before the buffer is removed.
+            compiler.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, buf_name, "on_update_code")
+            compiler.unregister_buffer_hook(HookPoint.ON_BUFFER_UPDATED, buf_name, "on_code_updated")
 
-        return None  # success — sandbox and disk both updated
+            # Delegate to parent — drops the introspection buffer and the callable.
+            await compiler.drop_function(func_name)
+            return None  # allow the drop
 
-    return compilation_sentinel
+        # Validate structure and run trial compilation — raises on any error.
+        try:
+            compiled_name = _validate_and_trial_compile(compiler, new_text)
+        except ValueError as e:
+            return str(e)
+
+        # Name from AST must match the buffer we're registered on.
+        if compiled_name != func_name:
+            return f"Function name must be '{func_name}', found '{compiled_name}'"
+
+        return None  # validation passed — allow the buffer update
+
+    return on_update_code
+
+
+def _make_on_code_updated(compiler: FunctionCompiler, func_name: str, buf_name: str):
+    """Factory producing a post-update hook that commits validated source to the sandbox.
+
+    Called after the buffer update has already succeeded. Reads the new content from the
+    persistence path, registers it in the real sandbox, then refreshes the function list.
+    """
+    async def on_code_updated(buf: Buffer, old_text: str | None, start: int, end: int, new_text: str | None) -> None:
+        # Read the new source from the persisted buffer file — the authoritative content after the update.
+        source_path = _get_persistence_dir(compiler) / buf_name
+        if not source_path.exists():
+            return
+
+        # Commit to the real instance-level sandbox builder.
+        try:
+            compiler._oap_sandbox_builder.add_source_code(source_path)
+        except Exception:
+            return  # best-effort — log and continue
+
+        # Refresh the function catalog so the updated entry is visible.
+        from petekit.function.function_manager import _refresh_list_buffer
+        await _refresh_list_buffer(compiler)
+
+    return on_code_updated
+
+
+# --- Hook handlers ---
+
+async def _on_create_code(
+    compiler: FunctionCompiler,
+    buffer_name: str,
+    args: dict[str, Any],
+) -> str | None:
+    """ON_CREATE_BUFFER hook for the system:code: scope — compiles and registers a function from source text."""
+    # Parse the source from the create args.
+    source: str = args.get("text", "")
+    if not source.strip():
+        return "source buffer is empty"
+
+    # Validate and compile — raises on any error.
+    try:
+        func_name, proxy = _compile_function(compiler, source)
+    except ValueError as e:
+        return str(e)
+
+    # Extract docstring for descriptions.
+    doc = proxy.__doc__ or ""
+    short_description = doc.split("\n")[0].strip() if doc else ""
+    long_description = doc.strip() if doc else ""
+
+    # Build stable wrapper — its identity is fixed, it delegates to the live sandbox proxy.
+    stable_wrapper = _make_stable_wrapper(compiler, func_name)
+
+    # Register in the function namespace via the parent.
+    create_result = await super(FunctionCompiler, compiler).create_function(
+        func_name,
+        stable_wrapper,
+        short_description,
+        long_description,
+    )
+    if not isinstance(create_result, dict) or not create_result.get("ok"):
+        # Roll back: remove the compiled source from the sandbox since manager registration failed.
+        compiler._oap_sandbox_builder.remove_source_code(func_name)
+        return create_result.get("error", f"failed to create function '{func_name}'")
+
+    _logger.info(
+        "[function_compiler] registered function '%s' for %s",
+        func_name,
+        compiler.__class__.__name__,
+    )
+    return None
+
+
+async def _on_code_created(
+    compiler: FunctionCompiler,
+    buffer_name: str,
+    args: dict[str, Any],
+) -> str | None:
+    """ON_BUFFER_CREATED hook for the system:code: scope — registers pre/post update hooks on the new buffer."""
+    # Derive the function name from the buffer name — prefix confirmed by scope registration.
+    func_name = buffer_name[len(_CODE_BUFFER_PREFIX) :]
+
+    # Register the on_update_code guard as a pre-update hook — validates source before mutation.
+    guard_result = compiler.register_buffer_hook(
+        HookPoint.ON_UPDATE_BUFFER,
+        buffer_name,
+        "on_update_code",
+        _make_on_update_code(compiler, func_name),
+    )
+    if not isinstance(guard_result, dict) or not guard_result.get("ok"):
+        return f"failed to register on_update_code on {buffer_name}: {guard_result.get('error')}"
+
+    # Register the on_code_updated post-update hook — commits to sandbox and refreshes the catalog.
+    commit_result = compiler.register_buffer_hook(
+        HookPoint.ON_BUFFER_UPDATED,
+        buffer_name,
+        "on_code_updated",
+        _make_on_code_updated(compiler, func_name, buffer_name),
+    )
+    if not isinstance(commit_result, dict) or not commit_result.get("ok"):
+        return f"failed to register on_code_updated on {buffer_name}: {commit_result.get('error')}"
+
+    return None
 
 
 class FunctionCompiler(FunctionManager, AgenticObject):
-    """FunctionManager that compiles source-code strings into live callables.
+    """I compile Python source-code strings into live callable functions.
 
-    create_function accepts a `code` kwarg holding Python source. That source is stored
-    in a system:code:{name} buffer. Every write to that buffer is intercepted by a
-    compilation sentinel — on failure the write is rejected with the compile error.
-    The live callable is updated in-place on each successful write.
-
-    Usage:
-        await fm.create_function("greet", code=\"\"\"
-            def greet(name: str) -> str:
-                return f"hello {name}"
-        \"\"\")
-
-    The function name used in the source must match the `name` argument.
-    The source must contain exactly one top-level `def`.
+    See doc:function_compiler for the full schema and usage guide.
     """
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
 
-        # Register restore hook so persisted functions are re-compiled after a restart.
-        self._oap_restore_hooks["function_compiler"] = RestoreHook(
-            callable_=_restore_functions,
-            dependencies=[],
+        # Register the ON_CREATE_BUFFER scope hook — compiles and registers functions on buffer creation.
+        on_create_result = self.register_buffer_hook(
+            HookPoint.ON_CREATE_BUFFER,
+            _CODE_BUFFER_PREFIX,
+            "on_create_code",
+            _on_create_code,
         )
+        if not isinstance(on_create_result, dict) or not on_create_result.get("ok"):
+            raise RuntimeError(f"failed to register on_create_code hook: {on_create_result.get('error')}")
 
-    @tool
-    async def create_function(
-        self,
-        name: str,
-        short_description: str = "",
-        long_description: str = "",
-        *,
-        code: str,
-    ) -> dict[str, Any]:
-        # Persist to disk first — the file on disk is the debugger's view of the code.
-        _persist_function(self, name, code, short_description, long_description)
-        source_path = _get_persistence_dir(self) / f"{name}.py"
-
-        # Compile and register in sandbox — build the stable delegating wrapper.
-        compile_result = _compile_function(self, name, code, source_path)
-        if isinstance(compile_result, str):
-            return {"ok": False, "error": compile_result}
-
-        # Build stable wrapper — its identity is fixed, it delegates to the live sandbox proxy.
-        stable_wrapper = _make_stable_wrapper(self, name)
-
-        # Register the stable wrapper in the namespace — parent runs all guards first.
-        create_result = await super().create_function(
-            name,
-            stable_wrapper,
-            short_description,
-            long_description,
+        # Register the ON_BUFFER_CREATED scope hook — registers pre/post update hooks on new code buffers.
+        on_created_result = self.register_buffer_hook(
+            HookPoint.ON_BUFFER_CREATED,
+            _CODE_BUFFER_PREFIX,
+            "on_code_created",
+            _on_code_created,
         )
-        if not isinstance(create_result, dict) or not create_result.get("ok"):
-            return create_result
+        if not isinstance(on_created_result, dict) or not on_created_result.get("ok"):
+            raise RuntimeError(f"failed to register on_code_created hook: {on_created_result.get('error')}")
 
-        # Write the source to the code buffer, replacing any existing content.
-        buf_result = await self.create_buffer(
-            _code_buffer_name(name),
-            text=code,
-            overwrite=True,
-        )
-        if not isinstance(buf_result, dict) or not buf_result.get("ok"):
-            # Roll back: unregister from parent.
-            await super().drop_function(name)
-            return {
-                "ok": False,
-                "error": f"Function '{name}' could not be created: {buf_result.get('error')}",
-            }
-
-        # Register the compilation sentinel so every source write is recompiled.
-        hook_result = self.register_buffer_hook(
-            HookPoint.ON_UPDATE_BUFFER,
-            _code_buffer_name(name),
-            "compilation_sentinel",
-            _make_compilation_sentinel(self, name),
-        )
-        if not isinstance(hook_result, dict) or not hook_result.get("ok"):
-            # Roll back: unregister from parent.
-            await super().drop_function(name)
-            return {
-                "ok": False,
-                "error": f"Function '{name}' created but compilation hook could not be registered: {hook_result.get('error')}",
-            }
-
-        return create_result
-
-    @tool
-    async def drop_function(self, name: str) -> dict[str, Any]:
-        # Drop the code buffer first — no sentinel blocks this since we unguard first below.
-        buf_name = _code_buffer_name(name)
-        self.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, buf_name, "compilation_sentinel")
-        await self.drop_buffer(buf_name)
-
-        # Mirror to parent — drops the introspection buffer.
-        result = await super().drop_function(name)
-
-        # Remove persisted source and metadata from disk.
-        _drop_persisted_function(self, name)
-
-        return result
+        # Seed the function compiler documentation buffer.
+        self._create_buffer(_FUNCTION_COMPILER_DOC_BUFFER, text=_FUNCTION_COMPILER_DOC)
