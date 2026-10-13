@@ -302,7 +302,7 @@ class FunctionCompiler(FunctionManager, AgenticObject):
         # Register the ON_CREATE_BUFFER scope hook — compiles and registers functions on buffer creation.
         on_create_result = self.register_buffer_hook(
             HookPoint.ON_CREATE_BUFFER,
-            _CODE_BUFFER_PREFIX,
+            _CODE_BUFFER_PREFIX + ".*",
             "on_create_code",
             _on_create_code,
         )
@@ -312,7 +312,7 @@ class FunctionCompiler(FunctionManager, AgenticObject):
         # Register the ON_BUFFER_CREATED scope hook — registers pre/post update hooks on new code buffers.
         on_created_result = self.register_buffer_hook(
             HookPoint.ON_BUFFER_CREATED,
-            _CODE_BUFFER_PREFIX,
+            _CODE_BUFFER_PREFIX + ".*",
             "on_code_created",
             _on_code_created,
         )

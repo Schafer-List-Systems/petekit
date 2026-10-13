@@ -583,20 +583,20 @@ class TestBufferHookSystem:
 
         result = bm.register_buffer_hook(
             HookPoint.ON_CREATE_BUFFER,
-            buffer_path="logs",
+            "logs.*",
             hook_name="capture",
             hook=capture_hook,
         )
         assert result["ok"]
         assert result["hook"] == "capture"
-        assert result["buffer_path"] == "logs"
+        assert result["buffer_pattern"] == "logs.*"
 
     async def test_register_buffer_hook_name_collision_rejected(self, bm):
         def noop(bm_, scope_, args_):
             return True
 
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "h", noop)
-        result = bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "h", noop)
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "h", noop)
+        result = bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "h", noop)
         assert not result["ok"]
         assert "already registered" in result["error"]
 
@@ -604,13 +604,13 @@ class TestBufferHookSystem:
         def noop(bm_, scope_, args_):
             return True
 
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "h", noop)
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "h", noop)
         result = bm.deregister_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "h")
         assert result["ok"]
         assert result["removed"] == "h"
 
     async def test_deregister_buffer_hook_unknown_name_rejected(self, bm):
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "h", lambda *a: None)
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "h", lambda *a: None)
         result = bm.deregister_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "nonexistent")
         assert not result["ok"]
         assert "no hook" in result["error"]
@@ -622,7 +622,7 @@ class TestBufferHookSystem:
             calls.append({"scope": scope_, "args": args_})
             return True
 
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "spy", spy)
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "spy", spy)
         await bm.create_buffer("logs/app", text="data")
 
         assert len(calls) == 1
@@ -635,7 +635,7 @@ class TestBufferHookSystem:
         def reject(bm_, scope_, args_):
             return "nope"
 
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "rejector", reject)
+        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "rejector", reject)
         result = await bm.create_buffer("logs/app", text="data")
         assert not result["ok"]
         assert "nope" in result["error"]
@@ -647,7 +647,7 @@ class TestBufferHookSystem:
             calls.append({"scope": scope_, "args": args_})
             return True
 
-        bm.register_buffer_hook(HookPoint.ON_BUFFER_CREATED, "logs", "spy", spy)
+        bm.register_buffer_hook(HookPoint.ON_BUFFER_CREATED, "logs.*", "spy", spy)
         await bm.create_buffer("logs/app", text="data")
 
         assert len(calls) == 1
@@ -658,27 +658,29 @@ class TestBufferHookSystem:
         def reject(bm_, scope_, args_):
             return "nope"
 
-        bm.register_buffer_hook(HookPoint.ON_BUFFER_CREATED, "logs", "rejector", reject)
+        bm.register_buffer_hook(HookPoint.ON_BUFFER_CREATED, "logs.*", "rejector", reject)
         result = await bm.create_buffer("logs/app", text="data")
         assert result["ok"]
         assert "logs/app" in bm._buffers
 
-    async def test_hook_scope_prefix_matching_outer_to_inner(self, bm):
+    async def test_hook_scope_pattern_matching_ordered_alphabetically(self, bm):
+        """Patterns are matched with re.fullmatch; fire order follows alphabetical sort of pattern strings."""
         call_order: list[str] = []
 
-        def register(name, scope):
-            def hook(bm_, sc_, args_):
-                call_order.append(scope)
+        def register(name, pattern):
+            def hook(bm_, buffer_name, args_):
+                call_order.append(pattern)
                 return True
-            bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, scope, name, hook)
+            bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, pattern, name, hook)
 
-        register("outer", "logs")
-        register("middle", "logs/app")
-        register("inner", "logs/app/server")
+        register("a", "logs.*")
+        register("b", "logs/app.*")
+        register("c", "logs/app/server.*")
 
         await bm.create_buffer("logs/app/server", text="data")
 
-        assert call_order == ["logs", "logs/app", "logs/app/server"]
+        # Order follows alphabetical sort of the pattern strings.
+        assert call_order == ["logs.*", "logs/app.*", "logs/app/server.*"]
 
     async def test_multiple_hooks_same_scope_both_fire(self, bm):
         calls: list[str] = []

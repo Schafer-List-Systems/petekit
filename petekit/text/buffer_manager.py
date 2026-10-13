@@ -26,9 +26,13 @@ class HookPoint(Enum):
 
 @dataclass
 class CreationHook:
-    """A single creation hook registered on a buffer path."""
+    """A single creation hook registered on a buffer path.
+
+    buffer_pattern is a regex; a buffer name matches when re.fullmatch(pattern, buffer_name) is true.
+    """
     name: str
-    buffer_scope: str
+    buffer_pattern: str
+    compiled_pattern: re.Pattern
     callable: Callable[..., bool | str | None]
 
 
@@ -41,21 +45,22 @@ class HookPointRegistry:
     hooks_by_name: dict[str, CreationHook] = field(default_factory=dict)
 
     def _sort_hooks_for(self, buffer_name: str) -> list[CreationHook]:
-        """Return the hooks whose buffer_scope is a prefix of the given path, ordered outer-to-inner.
+        """Return the hooks whose buffer_pattern matches the given buffer name.
 
-        Filters to hooks whose registered path is a prefix of buffer_scope, then sorts
-        alphanumerically — this yields outer-to-inner traversal order.
+        Filters to hooks whose pattern fully matches the buffer name, then sorts
+        alphanumerically — ordering is not semantically meaningful; use explicit
+        priority fields when order matters.
         """
-        # Filter to only hooks whose buffer_scope is a prefix of the target scope.
-        prefix_hooks = [
+        # Filter to hooks whose pattern matches the buffer name in its entirety.
+        matching_hooks = [
             hook for hook in self.hooks_by_name.values()
-            if buffer_name.startswith(hook.buffer_scope)
+            if re.fullmatch(hook.compiled_pattern, buffer_name) is not None
         ]
 
-        # Sort by buffer_scope alphanumerically — shorter/outermost scopes sort first.
-        prefix_hooks.sort(key=lambda h: h.buffer_scope)
+        # Sort by buffer_pattern alphanumerically — deterministic tie-break only.
+        matching_hooks.sort(key=lambda h: h.buffer_pattern)
 
-        return prefix_hooks
+        return matching_hooks
 
     async def _fire_hooks(
         self,
@@ -63,10 +68,11 @@ class HookPointRegistry:
         buffer_name: str,
         args: dict[str, Any],
     ) -> bool | str:
-        """Fire all matching creation hooks in outer-to-inner order, returning the first rejection.
+        """Fire all matching creation hooks in pattern order, returning the first rejection.
 
-        Calls each hook with (bm, buffer_scope, args). If a hook returns a non-None/non-True
-        value, that is treated as a rejection and returned immediately.
+        Matches buffer_name against each hook's pattern with re.fullmatch. If a hook
+        returns a non-None/non-True value, that is treated as a rejection and returned
+        immediately.
         """
         # Obtain the hooks for this scope in traversal order.
         hooks = self._sort_hooks_for(buffer_name)
@@ -778,29 +784,33 @@ class BufferManager(AgenticObject):
     def register_buffer_hook(
         self,
         hook_point: HookPoint,
-        buffer_name: str,
+        buffer_pattern: str,
         hook_name: str,
         hook: Callable[..., bool | str | None],
     ) -> dict[str, Any]:
-        """Register a hook on a buffer by name and hook point.
+        """Register a hook on a buffer by pattern and hook point.
 
         Routes to the appropriate internal store based on hook_point:
-        - ON_UPDATE_BUFFER / ON_BUFFER_UPDATED: stores on the Buffer object directly.
-        - ON_CREATE_BUFFER / ON_BUFFER_CREATED: stores on the BufferManager's HookPointRegistry.
+        - ON_UPDATE_BUFFER / ON_BUFFER_UPDATED: stores on the Buffer object directly;
+          buffer_pattern is the exact buffer name to look up.
+        - ON_CREATE_BUFFER / ON_BUFFER_CREATED: stores on the BufferManager's HookPointRegistry;
+          buffer_pattern is a regex; matched with re.fullmatch against each buffer name.
 
+        For creation hooks, the pattern must be a valid regex; re.fullmatch is used so the
+        entire buffer name must match the pattern.
         Rejects if hook_name already exists under this hook point for the given buffer.
         """
         # Route update hooks to the Buffer's _hooks dict.
         if hook_point in (HookPoint.ON_UPDATE_BUFFER, HookPoint.ON_BUFFER_UPDATED):
-            if buffer_name not in self._buffers:
-                return {"ok": False, "error": f"No buffer named '{buffer_name}'."}
-            buf = self._buffers[buffer_name]
+            if buffer_pattern not in self._buffers:
+                return {"ok": False, "error": f"No buffer named '{buffer_pattern}'."}
+            buf = self._buffers[buffer_pattern]
             if hook_name in buf._hooks.get(hook_point, {}):
-                return {"ok": False, "error": f"hook '{hook_name}' already registered on '{buffer_name}' at '{hook_point.value}'. Unregister first."}
+                return {"ok": False, "error": f"hook '{hook_name}' already registered on '{buffer_pattern}' at '{hook_point.value}'. Unregister first."}
             if hook_point not in buf._hooks:
                 buf._hooks[hook_point] = {}
             buf._hooks[hook_point][hook_name] = hook
-            return {"ok": True, "hook_point": hook_point.value, "buffer": buffer_name, "hook": hook_name, "hook_count": len(buf._hooks[hook_point])}
+            return {"ok": True, "hook_point": hook_point.value, "buffer": buffer_pattern, "hook": hook_name, "hook_count": len(buf._hooks[hook_point])}
 
         # Route creation hooks to the BufferManager's HookPointRegistry.
         if hook_point not in self._buffer_hooks:
@@ -808,12 +818,20 @@ class BufferManager(AgenticObject):
         registry = self._buffer_hooks[hook_point]
         if hook_name in registry.hooks_by_name:
             return {"ok": False, "error": f"hook '{hook_name}' already registered under '{hook_point.value}'."}
+
+        # Compile and validate the pattern now — fail fast rather than silently never matching.
+        try:
+            compiled = re.compile(buffer_pattern)
+        except re.error as e:
+            return {"ok": False, "error": f"Invalid buffer_pattern regex '{buffer_pattern}': {e}."}
+
         registry.hooks_by_name[hook_name] = CreationHook(
             name=hook_name,
-            buffer_scope=buffer_name,
+            buffer_pattern=buffer_pattern,
+            compiled_pattern=compiled,
             callable=hook,
         )
-        return {"ok": True, "hook_point": hook_point.value, "buffer_path": buffer_name, "hook": hook_name}
+        return {"ok": True, "hook_point": hook_point.value, "buffer_pattern": buffer_pattern, "hook": hook_name}
 
     def unregister_buffer_hook(
         self,
