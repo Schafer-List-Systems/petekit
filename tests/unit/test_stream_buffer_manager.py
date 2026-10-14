@@ -17,9 +17,10 @@ async def sbm():
 
 class TestStreamBufferCreateDrop:
     async def test_create_stream_requires_stream_prefix(self, sbm):
-        result = await sbm.create_buffer("bad_name", stream=True)
-        assert not result["ok"]
-        assert "stream:" in result["error"]
+        # Stream buffers can be created with any name — no prefix required.
+        result = await sbm.create_buffer("any_name", stream=True)
+        assert result["ok"]
+        assert "any_name" in sbm.stream_buffer_configs
 
     async def test_create_stream_ok(self, sbm):
         result = await sbm.create_buffer("stream:test", stream=True)

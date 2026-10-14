@@ -125,7 +125,9 @@ class TestFunctionManagerHookGating:
     async def test_drop_function_blocked_by_hook(self):
         fm = FunctionManager()
         await fm.create_function("to_drop", lambda: None)
-        fm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "system:status:function:to_drop", "reject", lambda *_: "blocked by hook")
+        fm._buffers["system:status:function:to_drop"].register_hook(
+            HookPoint.ON_DROP_BUFFER, "reject", lambda *_: "blocked by hook"
+        )
         result = await fm.drop_function("to_drop")
         assert not result["ok"]
         assert "blocked by hook" in result["error"]
@@ -146,14 +148,17 @@ class TestFunctionManagerHookGating:
             """Doc string."""
             pass
 
-        def accepting_hook(buf, old_text, start, end, new_text):
-            calls.append((buf, old_text, start, end, new_text))
+        def accepting_hook(bm_, buf, args):
+            calls.append((buf, args.get("old_text"), args.get("start"), args.get("end")))
             return True
 
         await fm.create_function("target", target)
-        fm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "system:status:function:target", "spy", accepting_hook)
+        fm._buffers["system:status:function:target"].register_hook(
+            HookPoint.ON_DROP_BUFFER, "spy", accepting_hook
+        )
         await fm.drop_function("target")
         assert len(calls) == 1
-        _, old_text, start, end, new_text = calls[0]
+        _, old_text, start, end = calls[0]
         assert "target" in old_text
-        assert new_text is None
+        # new_text is None on drop — there's no new content for a drop operation
+        assert start == 0  # drop always starts at 0

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import unittest
 
@@ -35,7 +36,7 @@ class TestMakeJsonCodecUnit(unittest.TestCase):
 
         buf = MockBuffer([MockLine('{"a": 1}')])
         hook = make_json_codec(inner)
-        result = hook(buf, '{"a": 1}', 0, 1, '{"b": 2}')
+        result = asyncio.run(hook(None, buf, buf, {"old_text": '{"a": 1}', "new_text": '{"b": 2}', "start": 0, "end": 1}))
 
         self.assertTrue(result)
         self.assertEqual(len(calls), 1)
@@ -53,7 +54,7 @@ class TestMakeJsonCodecUnit(unittest.TestCase):
 
         buf = MockBuffer([MockLine('{"a": 1}')])
         hook = make_json_codec(inner)
-        result = hook(buf, '{"a": 1}', 0, 1, "not json")
+        result = asyncio.run(hook(None, buf, buf, {"old_text": '{"a": 1}', "new_text": "not json", "start": 0, "end": 1}))
 
         self.assertIsInstance(result, str)
         self.assertIn("not valid JSON", result)
@@ -65,7 +66,7 @@ class TestMakeJsonCodecUnit(unittest.TestCase):
 
         buf = MockBuffer([MockLine("not json")])
         hook = make_json_codec(inner)
-        result = hook(buf, "not json", 0, 1, '{"a": 2}')
+        result = asyncio.run(hook(None, buf, buf, {"old_text": "not json", "new_text": '{"a": 2}', "start": 0, "end": 1}))
 
         self.assertIsInstance(result, str)
         self.assertIn("not valid JSON", result)
@@ -76,7 +77,7 @@ class TestMakeJsonCodecUnit(unittest.TestCase):
 
         buf = MockBuffer([MockLine('{"a": 1}')])
         hook = make_json_codec(inner)
-        result = hook(buf, '{"a": 1}', 0, 1, '{"a": 2}')
+        result = asyncio.run(hook(None, buf, buf, {"old_text": '{"a": 1}', "new_text": '{"a": 2}', "start": 0, "end": 1}))
 
         self.assertEqual(result, "nope")
 
@@ -86,7 +87,7 @@ class TestMakeJsonCodecUnit(unittest.TestCase):
 
         buf = MockBuffer([MockLine('{"a": 1}')])
         hook = make_json_codec(inner)
-        result = hook(buf, '{"a": 1}', 0, 1, '{"a": 2}')
+        result = asyncio.run(hook(None, buf, buf, {"old_text": '{"a": 1}', "new_text": '{"a": 2}', "start": 0, "end": 1}))
 
         self.assertFalse(result)
 
@@ -96,7 +97,7 @@ class TestMakeJsonCodecUnit(unittest.TestCase):
 
         buf = MockBuffer([MockLine('{"a": 1}')])
         hook = make_json_codec(inner)
-        result = hook(buf, '{"a": 1}', 0, 1, '{"a": 1}')
+        result = asyncio.run(hook(None, buf, buf, {"old_text": '{"a": 1}', "new_text": '{"a": 1}', "start": 0, "end": 1}))
 
         self.assertTrue(result)
 
@@ -107,7 +108,7 @@ class TestMakeJsonCodecUnit(unittest.TestCase):
 
         buf = MockBuffer([MockLine('{"a": 1, "b": 2}')])
         hook = make_json_codec(inner)
-        result = hook(buf, '{"a": 1, "b": 2}', 0, 1, '{"a": 1, "c": 3}')
+        result = asyncio.run(hook(None, buf, buf, {"old_text": '{"a": 1, "b": 2}', "new_text": '{"a": 1, "c": 3}', "start": 0, "end": 1}))
 
         self.assertTrue(result)
 
@@ -117,6 +118,6 @@ class TestMakeJsonCodecUnit(unittest.TestCase):
 
         buf = MockBuffer([MockLine('{"prefix": true}'), MockLine('{"keep": 2}')])
         hook = make_json_codec(inner)
-        result = hook(buf, '{"prefix": true}', 0, 1, '{"added": 1}', )
+        result = asyncio.run(hook(None, buf, buf, {"old_text": '{"prefix": true}', "new_text": '{"added": 1}', "start": 0, "end": 1}))
 
         self.assertTrue(result)

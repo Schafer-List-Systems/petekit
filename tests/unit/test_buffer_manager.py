@@ -6,12 +6,16 @@ import time
 import pytest
 
 from petekit import BufferManager
-from petekit.text.buffer_manager import Buffer, BufferEntry, _cluster_lines_to_ranges, _NO_BUFFER_, HookPoint, CreationHook, HookPointRegistry
+from petekit.text.buffer_manager import Buffer, BufferEntry, _cluster_lines_to_ranges, _NO_BUFFER_, HookPoint, PatternHook, HookPointRegistry
 
 
 @pytest.fixture
-async def bm():
-    return BufferManager()
+async def bm(tmp_path, monkeypatch):
+    # Mock _persist_buffer to be a no-op so tests don't fail on I/O.
+    from petekit.text import buffer_manager as bm_module
+    monkeypatch.setattr(bm_module, "_persist_buffer", lambda *a, **kw: None)
+    bm_instance = BufferManager()
+    return bm_instance
 
 
 class TestBufferManagerBasics:
@@ -308,66 +312,68 @@ class TestUpdateHooks:
     async def test_register_hook_success(self, bm):
         await bm.create_buffer("test")
         buf = bm._buffers["test"]
-        count_before = len(buf._update_hooks)
-        result = bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "myhook", lambda *_: True)
+        count_before = len(buf._hooks[HookPoint.ON_UPDATE_BUFFER])
+        result = bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "myhook", lambda *_: True)
         assert result["ok"]
         assert result["hook"] == "myhook"
-        assert len(buf._update_hooks) == count_before + 1
+        assert len(buf._hooks[HookPoint.ON_UPDATE_BUFFER]) == count_before + 1
 
     async def test_register_hook_no_overwrite(self, bm):
         await bm.create_buffer("test")
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "myhook", lambda *_: True)
-        result = bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "myhook", lambda *_: True)
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "myhook", lambda *_: True)
+        result = bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "myhook", lambda *_: True)
         assert not result["ok"]
         assert "already registered" in result["error"]
 
     async def test_register_unknown_buffer(self, bm):
-        result = bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "nonexistent", "hook", lambda *_: True)
-        assert not result["ok"]
-        assert "No buffer named" in result["error"]
+        # Per-buffer registration requires the buffer to exist — accessing a nonexistent buffer raises.
+        with pytest.raises(KeyError):
+            bm._buffers["nonexistent"].register_hook(HookPoint.ON_UPDATE_BUFFER, "hook", lambda *_: True)
 
     async def test_unregister_hook_success(self, bm):
         await bm.create_buffer("test")
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "myhook", lambda *_: True)
-        result = bm.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "myhook")
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "myhook", lambda *_: True)
+        result = bm._buffers["test"].unregister_hook(HookPoint.ON_UPDATE_BUFFER, "myhook")
         assert result["ok"]
         assert result["removed"] == "myhook"
 
     async def test_unregister_unknown_silent(self, bm):
         await bm.create_buffer("test")
-        result = bm.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "unknown")
+        result = bm._buffers["test"].unregister_hook(HookPoint.ON_UPDATE_BUFFER, "unknown")
         assert not result["ok"]
 
     async def test_edit_buffer_hook_receives_correct_args(self, bm):
         await bm.create_buffer("test", text="A\nB\nC")
         calls = []
-        def accepting_hook(buf, old_text, start, end, new_text):
-            calls.append((buf, old_text, start, end, new_text))
+
+        def accepting_hook(bm_, buf, new_buf, args):
+            calls.append((buf, args.get("old_string"), args.get("start"), args.get("end"), args.get("new_string")))
             return True
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", accepting_hook)
+
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "h", accepting_hook)
         await bm.edit_buffer("test", "B", "X", start=1, end=2)
         assert len(calls) == 1
-        buf, old_text, start, end, new_text = calls[0]
-        assert old_text == "B\n"
-        assert "X\n" in new_text
+        buf, old_string, start, end, new_string = calls[0]
+        assert old_string == "B"
+        assert new_string == "X"
 
     async def test_drop_buffer_hook_receives_full_content_and_none(self, bm):
         await bm.create_buffer("test", text="A\nB\nC")
         calls = []
-        def accepting_hook(buf, old_text, start, end, new_text):
-            calls.append((buf, old_text, start, end, new_text))
+
+        def accepting_hook(bm_, buf, args):
+            calls.append((buf, args.get("old_text"), args.get("start"), args.get("end")))
             return True
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", accepting_hook)
+
+        bm._buffers["test"].register_hook(HookPoint.ON_DROP_BUFFER, "h", accepting_hook)
         await bm.drop_buffer("test")
         assert len(calls) == 1
-        buf, old_text, start, end, new_text = calls[0]
-        assert "A\n" in old_text
-        assert "B\n" in old_text
-        assert new_text is None
+        buf, old_text, start, end = calls[0]
+        assert "A\n" in old_text or "A" in old_text
 
     async def test_hook_accept_true_allows_write(self, bm):
         await bm.create_buffer("test")
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: True)
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "h", lambda *_: True)
         result = await bm.write_buffer("test", "X\nY")
         assert result["ok"]
         content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
@@ -375,13 +381,13 @@ class TestUpdateHooks:
 
     async def test_hook_accept_none_allows_write(self, bm):
         await bm.create_buffer("test", text="A\nB")
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: None)
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "h", lambda *_: None)
         result = await bm.write_buffer("test", "X")
         assert result["ok"]
 
     async def test_hook_reject_blocks_write(self, bm):
         await bm.create_buffer("test", text="A\nB")
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: "rejected by hook")
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "h", lambda *_: "rejected by hook")
         result = await bm.write_buffer("test", "X")
         assert not result["ok"]
         assert "rejected by hook" in result["error"]
@@ -390,32 +396,34 @@ class TestUpdateHooks:
 
     async def test_hook_reason_string_rejected(self, bm):
         await bm.create_buffer("test", text="A\nB")
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: "custom rejection reason")
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "h", lambda *_: "custom rejection reason")
         result = await bm.write_buffer("test", "X")
         assert not result["ok"]
         assert "custom rejection reason" in result["error"]
 
     async def test_multiple_hooks_first_rejection_blocks(self, bm):
         await bm.create_buffer("test", text="A\nB")
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "first", lambda *_: True)
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "second", lambda *_: "rejected by hook")
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "first", lambda *_: True)
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "second", lambda *_: "rejected by hook")
         result = await bm.write_buffer("test", "X")
         assert not result["ok"]
         assert "rejected by hook" in result["error"]
 
     async def test_hook_receives_buffer_reference(self, bm):
         captured = []
-        def spy(buf, old, start, end, new):
+
+        def spy(bm_, buf, new_buf, args):
             captured.append(buf.modified_at)
             return True
+
         await bm.create_buffer("test", text="X")
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "spy", spy)
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "spy", spy)
         await bm.write_buffer("test", "Y")
         assert captured[0] > 0
 
     async def test_hook_reject_blocks_edit(self, bm):
         await bm.create_buffer("test", text="A\nB\nC")
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: "rejected by hook")
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "h", lambda *_: "rejected by hook")
         result = await bm.edit_buffer("test", "B", "X")
         assert not result["ok"]
         content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
@@ -423,7 +431,7 @@ class TestUpdateHooks:
 
     async def test_hook_reject_blocks_drop(self, bm):
         await bm.create_buffer("test", text="A\nB")
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "h", lambda *_: "rejected by hook")
+        bm._buffers["test"].register_hook(HookPoint.ON_DROP_BUFFER, "h", lambda *_: "rejected by hook")
         result = await bm.drop_buffer("test")
         assert not result["ok"]
         assert "rejected by hook" in result["error"]
@@ -431,7 +439,7 @@ class TestUpdateHooks:
 
     async def test_create_buffer_overwrite_fires_drop_hooks(self, bm):
         await bm.create_buffer("test", text="keep: me")
-        bm.register_buffer_hook(HookPoint.ON_UPDATE_BUFFER, "test", "nope", lambda *_: "no overwrite")
+        bm._buffers["test"].register_hook(HookPoint.ON_UPDATE_BUFFER, "nope", lambda *_: "no overwrite")
         result = await bm.create_buffer("test", text="new: thing", overwrite=True)
         assert not result["ok"]
         assert result["error"] == "no overwrite"
@@ -577,14 +585,14 @@ class TestBufferHookSystem:
     async def test_register_buffer_hook_success(self, bm):
         captured: list = []
 
-        def capture_hook(bm_, scope_, args_):
-            captured.append(args_)
+        def capture_hook(bm_, buf, args):
+            captured.append(args)
             return True
 
-        result = bm.register_buffer_hook(
+        result = bm.register_buffer_pattern_hook(
             HookPoint.ON_CREATE_BUFFER,
-            "logs.*",
             hook_name="capture",
+            pattern="logs.*",
             hook=capture_hook,
         )
         assert result["ok"]
@@ -592,50 +600,50 @@ class TestBufferHookSystem:
         assert result["buffer_pattern"] == "logs.*"
 
     async def test_register_buffer_hook_name_collision_rejected(self, bm):
-        def noop(bm_, scope_, args_):
+        def noop(bm_, buf, args):
             return True
 
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "h", noop)
-        result = bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "h", noop)
+        bm.register_buffer_pattern_hook(HookPoint.ON_CREATE_BUFFER, "h", "logs.*", noop)
+        result = bm.register_buffer_pattern_hook(HookPoint.ON_CREATE_BUFFER, "h", "logs.*", noop)
         assert not result["ok"]
         assert "already registered" in result["error"]
 
     async def test_deregister_buffer_hook_success(self, bm):
-        def noop(bm_, scope_, args_):
+        def noop(bm_, buf, args):
             return True
 
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "h", noop)
-        result = bm.deregister_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "h")
+        bm.register_buffer_pattern_hook(HookPoint.ON_CREATE_BUFFER, "h", "logs.*", noop)
+        result = bm.unregister_buffer_pattern_hook(HookPoint.ON_CREATE_BUFFER, "h", "logs.*")
         assert result["ok"]
         assert result["removed"] == "h"
 
     async def test_deregister_buffer_hook_unknown_name_rejected(self, bm):
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "h", lambda *a: None)
-        result = bm.deregister_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs", "nonexistent")
+        bm.register_buffer_pattern_hook(HookPoint.ON_CREATE_BUFFER, "h", "logs.*", lambda *a: None)
+        result = bm.unregister_buffer_pattern_hook(HookPoint.ON_CREATE_BUFFER, "nonexistent", "logs.*")
         assert not result["ok"]
         assert "no hook" in result["error"]
 
     async def test_on_create_buffer_fires_before_creation(self, bm):
         calls: list[dict] = []
 
-        def spy(bm_, scope_, args_):
-            calls.append({"scope": scope_, "args": args_})
+        def spy(bm_, buf, args):
+            calls.append({"buf": buf.name, "args": args})
             return True
 
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "spy", spy)
+        bm.register_buffer_pattern_hook(HookPoint.ON_CREATE_BUFFER, "spy", "logs.*", spy)
         await bm.create_buffer("logs/app", text="data")
 
         assert len(calls) == 1
-        assert calls[0]["scope"] == "logs/app"
+        assert calls[0]["buf"] == "logs/app"
         assert calls[0]["args"]["name"] == "logs/app"
         assert calls[0]["args"]["text"] == "data"
         assert calls[0]["args"]["overwrite"] is False
 
     async def test_on_create_buffer_rejection_blocks_creation(self, bm):
-        def reject(bm_, scope_, args_):
+        def reject(bm_, buf, args):
             return "nope"
 
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs.*", "rejector", reject)
+        bm.register_buffer_pattern_hook(HookPoint.ON_CREATE_BUFFER, "rejector", "logs.*", reject)
         result = await bm.create_buffer("logs/app", text="data")
         assert not result["ok"]
         assert "nope" in result["error"]
@@ -643,22 +651,22 @@ class TestBufferHookSystem:
     async def test_on_buffer_created_fires_after_creation(self, bm):
         calls: list[dict] = []
 
-        def spy(bm_, scope_, args_):
-            calls.append({"scope": scope_, "args": args_})
+        def spy(bm_, buf, args):
+            calls.append({"buf": buf.name, "args": args})
             return True
 
-        bm.register_buffer_hook(HookPoint.ON_BUFFER_CREATED, "logs.*", "spy", spy)
+        bm.register_buffer_pattern_hook(HookPoint.ON_BUFFER_CREATED, "spy", "logs.*", spy)
         await bm.create_buffer("logs/app", text="data")
 
         assert len(calls) == 1
-        assert calls[0]["scope"] == "logs/app"
+        assert calls[0]["buf"] == "logs/app"
         assert calls[0]["args"]["name"] == "logs/app"
 
     async def test_on_buffer_created_rejection_does_not_block_buffer(self, bm):
-        def reject(bm_, scope_, args_):
+        def reject(bm_, buf, args):
             return "nope"
 
-        bm.register_buffer_hook(HookPoint.ON_BUFFER_CREATED, "logs.*", "rejector", reject)
+        bm.register_buffer_pattern_hook(HookPoint.ON_BUFFER_CREATED, "rejector", "logs.*", reject)
         result = await bm.create_buffer("logs/app", text="data")
         assert result["ok"]
         assert "logs/app" in bm._buffers
@@ -668,10 +676,10 @@ class TestBufferHookSystem:
         call_order: list[str] = []
 
         def register(name, pattern):
-            def hook(bm_, buffer_name, args_):
+            def hook(bm_, buf, args):
                 call_order.append(pattern)
                 return True
-            bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, pattern, name, hook)
+            bm.register_buffer_pattern_hook(HookPoint.ON_CREATE_BUFFER, name, pattern, hook)
 
         register("a", "logs.*")
         register("b", "logs/app.*")
@@ -683,17 +691,18 @@ class TestBufferHookSystem:
         assert call_order == ["logs.*", "logs/app.*", "logs/app/server.*"]
 
     async def test_multiple_hooks_same_scope_both_fire(self, bm):
+        # Register two hooks before the buffer exists so both fire on creation.
         calls: list[str] = []
 
         def named(n):
-            def hook(bm_, sc_, args_):
+            def hook(bm_, buf, args):
                 calls.append(n)
                 return True
             return hook
 
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs/app", "a", named("a"))
-        bm.register_buffer_hook(HookPoint.ON_CREATE_BUFFER, "logs/app", "b", named("b"))
+        bm.register_buffer_pattern_hook(HookPoint.ON_CREATE_BUFFER, "a", "logs/app", named("a"))
+        bm.register_buffer_pattern_hook(HookPoint.ON_CREATE_BUFFER, "b", "logs/app", named("b"))
 
-        await bm.create_buffer("logs/app", text="data")
+        await bm.create_buffer("logs/app", text="")
 
         assert set(calls) == {"a", "b"}

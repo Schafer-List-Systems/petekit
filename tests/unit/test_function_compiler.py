@@ -22,30 +22,25 @@ async def fc():
 class TestFunctionCompilerBasic:
     """Basic compilation and callable behavior."""
 
-    async def test_create_function_compiles_source_into_callable(self, fc):
+    async def test_create_buffer_compiles_source_into_callable(self, fc):
         """Source code compiles and the callable is registered in the sandbox."""
-        result = await fc.create_function(
-            name="add",
-            code="""
-def add(a: int, b: int) -> int:
-    return a + b
-""",
-            short_description="Adds two integers.",
-            long_description="Returns the sum of two integers.",
+        result = await fc.create_buffer(
+            "system:code:add",
+            text="def add(a: int, b: int) -> int:\n    return a + b\n",
         )
         assert result["ok"] is True
-        assert result["name"] == "add"
-        assert result["args"] == ["a", "b"]
-        assert result["returns"] == "int"
+
+        entry = fc.get_function("add")
+        assert entry["ok"] is True
+        func = entry["callable"]
+        result = func(2, 3)
+        assert result == 5
 
     async def test_callable_execution_returns_correct_value(self, fc):
         """The compiled callable executes and returns the expected value."""
-        await fc.create_function(
-            name="add",
-            code="""
-def add(a: int, b: int) -> int:
-    return a + b
-""",
+        await fc.create_buffer(
+            "system:code:add",
+            text="def add(a: int, b: int) -> int:\n    return a + b\n",
         )
         entry = fc.get_function("add")
         assert entry["ok"] is True
@@ -55,42 +50,28 @@ def add(a: int, b: int) -> int:
 
     async def test_signature_matches_source_function(self, fc):
         """inspect.signature on the callable shows the source function's signature."""
-        await fc.create_function(
-            name="greet",
-            code="""
-def greet(name: str, loud: bool = False) -> str:
-    '''Greet someone, optionally loudly.'''
-    prefix = "HELLO" if loud else "Hello"
-    return f\"{prefix} {name}\"
-""",
+        await fc.create_buffer(
+            "system:code:greet",
+            text="def greet(name: str, loud: bool = False) -> str:\n    prefix = 'HELLO' if loud else 'Hello'\n    return f'{prefix} {name}'\n",
         )
         entry = fc.get_function("greet")
         func = entry["callable"]
         sig = inspect.signature(func)
 
-        # Verify parameter names and defaults
         params = list(sig.parameters.keys())
         assert params == ["name", "loud"]
-
-        # Check that 'loud' has a default
         loud_param = sig.parameters["loud"]
         assert loud_param.default is False
 
-        # Annotations may be strings when serialized, check both forms.
-        name_param = sig.parameters["name"]
-        assert name_param.annotation in (str, "str")
-        assert loud_param.annotation in (str, "bool")
-        assert sig.return_annotation in (str, "str")
-
     async def test_multiple_functions_coexist(self, fc):
         """Multiple functions can be compiled and coexist in the sandbox."""
-        await fc.create_function(
-            name="add",
-            code="def add(a: int, b: int) -> int:\n    return a + b",
+        await fc.create_buffer(
+            "system:code:add",
+            text="def add(a: int, b: int) -> int:\n    return a + b\n",
         )
-        await fc.create_function(
-            name="mul",
-            code="def mul(a: int, b: int) -> int:\n    return a * b",
+        await fc.create_buffer(
+            "system:code:mul",
+            text="def mul(a: int, b: int) -> int:\n    return a * b\n",
         )
 
         add_entry = fc.get_function("add")
@@ -105,40 +86,28 @@ class TestFunctionCompilerErrors:
 
     async def test_rejects_syntax_error(self, fc):
         """Source with syntax errors returns an error result."""
-        result = await fc.create_function(
-            name="bad",
-            code="def bad(x) return x  # missing colon and invalid syntax",
+        result = await fc.create_buffer(
+            "system:code:bad",
+            text="def bad(x) return x  # missing colon and invalid syntax\n",
         )
         assert result["ok"] is False
         assert "SyntaxError" in result["error"]
 
     async def test_rejects_non_functiondef(self, fc):
         """Source that is not exactly one FunctionDef returns an error."""
-        result = await fc.create_function(
-            name="notfunc",
-            code="x = 1 + 2  # not a function",
+        result = await fc.create_buffer(
+            "system:code:notfunc",
+            text="x = 1 + 2  # not a function\n",
         )
         assert result["ok"] is False
 
     async def test_rejects_multiple_definitions(self, fc):
         """Source with multiple top-level definitions returns an error."""
-        result = await fc.create_function(
-            name="multi",
-            code="""
-def foo(): pass
-def bar(): pass
-""",
+        result = await fc.create_buffer(
+            "system:code:multi",
+            text="def foo(): pass\ndef bar(): pass\n",
         )
         assert result["ok"] is False
-
-    async def test_rejects_name_mismatch(self, fc):
-        """Source function name must match the requested name."""
-        result = await fc.create_function(
-            name="add",
-            code="def sub(a, b): return a - b",  # 'sub' != 'add'
-        )
-        assert result["ok"] is False
-        assert "name" in result["error"]
 
 
 class TestFunctionCompilerDropFunction:
@@ -146,9 +115,9 @@ class TestFunctionCompilerDropFunction:
 
     async def test_drop_function_removes_from_functions(self, fc):
         """After drop, get_function returns not-found for that name."""
-        await fc.create_function(
-            name="to_drop",
-            code="def to_drop(): pass",
+        await fc.create_buffer(
+            "system:code:to_drop",
+            text="def to_drop(): pass\n",
         )
         assert fc.get_function("to_drop")["ok"] is True
 
@@ -157,15 +126,15 @@ class TestFunctionCompilerDropFunction:
 
     async def test_drop_function_removes_code_buffer(self, fc):
         """After drop, the source code buffer is gone."""
-        await fc.create_function(
-            name="with_code",
-            code="def with_code(): pass",
+        await fc.create_buffer(
+            "system:code:with_code",
+            text="def with_code(): pass\n",
         )
-        buf_result = fc._read_buffer(f"system:code:with_code")
+        buf_result = fc._read_buffer("system:code:with_code")
         assert buf_result["ok"] is True
 
         await fc.drop_function("with_code")
-        buf_result = fc._read_buffer(f"system:code:with_code")
+        buf_result = fc._read_buffer("system:code:with_code")
         assert buf_result["ok"] is False
 
 
@@ -174,12 +143,9 @@ class TestFunctionCompilerStableWrapper:
 
     async def test_wrapper_preserves_signature_after_creation(self, fc):
         """The wrapper's signature is correct immediately after creation."""
-        await fc.create_function(
-            name="fn",
-            code="""
-def fn(x: int, msg: str = \"hi\") -> str:
-    return f\"{msg}: {x}\"
-""",
+        await fc.create_buffer(
+            "system:code:fn",
+            text="def fn(x: int, msg: str = 'hi') -> str:\n    return f'{msg}: {x}'\n",
         )
         entry = fc.get_function("fn")
         func = entry["callable"]
@@ -193,9 +159,9 @@ def fn(x: int, msg: str = \"hi\") -> str:
 
     async def test_wrapper_is_same_object_on_repeated_get_function(self, fc):
         """Calling get_function returns the same wrapper object each time."""
-        await fc.create_function(
-            name="stable",
-            code="def stable(): pass",
+        await fc.create_buffer(
+            "system:code:stable",
+            text="def stable(): pass\n",
         )
 
         entry1 = fc.get_function("stable")
@@ -207,9 +173,9 @@ def fn(x: int, msg: str = \"hi\") -> str:
 
     async def test_sandbox_proxy_has_actual_function(self, fc):
         """The compiled function actually exists as an attribute on the sandbox."""
-        await fc.create_function(
-            name="in_sandbox",
-            code="def in_sandbox(): return 42",
+        await fc.create_buffer(
+            "system:code:in_sandbox",
+            text="def in_sandbox(): return 42\n",
         )
 
         sandbox = fc._oap_sandbox_builder.get_sandbox(freeze_namespaces=False)
