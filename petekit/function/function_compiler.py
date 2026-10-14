@@ -12,7 +12,7 @@ from peteos.oap.agentic_object import AgenticObject
 from peteos.sandbox import SandboxBuilder
 
 from petekit.function.function_manager import FunctionManager
-from petekit.text.buffer_manager import Buffer, HookPoint, _get_persistence_dir
+from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint, OnBufferDropped, OnBufferUpdated, OnDropBuffer, OnUpdateBuffer, _get_persistence_dir
 
 _CODE_BUFFER_PREFIX = "system:code:"
 _FUNCTION_COMPILER_DOC_BUFFER = "doc:function_compiler"
@@ -151,26 +151,19 @@ def _make_stable_wrapper(compiler: "FunctionCompiler", func_name: str) -> Callab
     return wrapper
 
 
-def _make_on_update_code(compiler: "FunctionCompiler", func_name: str):
-    """Factory producing a pre-update hook that validates source or handles the drop sentinel.
+def _make_on_update_code(compiler: "FunctionCompiler", func_name: str) -> OnUpdateBuffer:
+    """Factory producing a pre-update hook that validates source code on every buffer mutation.
 
-    When new_text is None the drop sentinel is active — unregisters hooks and delegates
-    to the parent drop_function. Otherwise validates AST structure, enforces a single
-    function def, and runs a trial compilation before allowing the update.
+    Validates AST structure, enforces a single function def, and runs a trial compilation
+    before allowing the update. Drop is handled by ON_DROP_BUFFER / ON_BUFFER_DROPPED hooks.
     """
-    async def on_update_code(buf: Buffer, old_text: str | None, start: int, end: int, new_text: str | None) -> str | None:
-        # Drop sentinel — new_text is None means the buffer is being dropped.
-        if new_text is None:
-            buf_name = buf.name
-
-            # Unregister our own hooks before the buffer is removed.
-            compiler.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, buf_name, "on_update_code")
-            compiler.unregister_buffer_hook(HookPoint.ON_BUFFER_UPDATED, buf_name, "on_code_updated")
-
-            # Delegate to parent — drops the introspection buffer and the callable.
-            await compiler.drop_function(func_name)
-            return None  # allow the drop
-
+    async def on_update_code(
+        buffer_manager: BufferManager,
+        buffer: Buffer,
+        new_buffer: Buffer,
+        args: dict[str, Any],
+    ) -> bool | str | None:
+        new_text = args.get("text") or args.get("new_string") or args.get("new_text") or ""
         # Validate structure and run trial compilation — raises on any error.
         try:
             compiled_name = _validate_and_trial_compile(compiler, new_text)
@@ -186,13 +179,61 @@ def _make_on_update_code(compiler: "FunctionCompiler", func_name: str):
     return on_update_code
 
 
-def _make_on_code_updated(compiler: FunctionCompiler, func_name: str, buf_name: str):
+def _make_on_code_drop(compiler: "FunctionCompiler", func_name: str) -> OnDropBuffer:
+    """Factory producing the ON_DROP_BUFFER hook for system:code:.* buffers.
+
+    Cascades the drop to remove the callable from the function namespace. The drop
+    itself is allowed to proceed; this hook only performs the side effect.
+    """
+    async def on_code_drop(
+        buffer_manager: BufferManager,
+        buffer: Buffer,
+        args: dict[str, Any],
+    ) -> str | None:
+        # Delegate to drop_function — removes the introspection buffer and the callable.
+        drop_result = await compiler.drop_function(func_name)
+        # Log if the cascade failed, but still allow the buffer drop.
+        if not drop_result.get("ok"):
+            _logger.warning(f"[on_code_drop] cascade to drop_function('{func_name}') failed: {drop_result.get('error')}")
+        return None  # always allow the drop
+
+    return on_code_drop
+
+
+def _make_on_code_dropped(compiler: "FunctionCompiler", func_name: str) -> OnBufferDropped:
+    """Factory producing the ON_BUFFER_DROPPED safety-net hook for system:code:.* buffers.
+
+    Fires after the buffer is dropped. If the function is still registered, the normal
+    cascade in on_code_drop failed somehow — this logs the anomaly but does not
+    re-attempt the cascade to avoid re-entrancy issues.
+    """
+    def on_code_dropped(
+        buffer_manager: BufferManager,
+        buffer: Buffer,
+        args: dict[str, Any],
+    ) -> None:
+        # Check whether the function is still registered — it should have been removed by on_code_drop.
+        buffer_name = buffer.name
+        if func_name in compiler._functions:
+            _logger.warning(f"[on_code_dropped] buffer '{buffer_name}' dropped but func '{func_name}' still in namespace — normal cascade may have failed")
+        else:
+            _logger.debug(f"[on_code_dropped] buffer '{buffer_name}' dropped, func '{func_name}' already gone (normal)")
+
+    return on_code_dropped
+
+
+def _make_on_code_updated(compiler: FunctionCompiler, func_name: str, buf_name: str) -> OnBufferUpdated:
     """Factory producing a post-update hook that commits validated source to the sandbox.
 
     Called after the buffer update has already succeeded. Reads the new content from the
     persistence path, registers it in the real sandbox, then refreshes the function list.
     """
-    async def on_code_updated(buf: Buffer, old_text: str | None, start: int, end: int, new_text: str | None) -> None:
+    async def on_code_updated(
+        buffer_manager: BufferManager,
+        buffer: Buffer,
+        new_buffer: Buffer,
+        args: dict[str, Any],
+    ) -> None:
         # Read the new source from the persisted buffer file — the authoritative content after the update.
         source_path = _get_persistence_dir(compiler) / buf_name
         if not source_path.exists():
@@ -259,33 +300,50 @@ async def _on_create_code(
 
 
 async def _on_code_created(
-    compiler: FunctionCompiler,
-    buffer_name: str,
+    buffer_manager: BufferManager,
+    new_buffer: Buffer,
     args: dict[str, Any],
 ) -> str | None:
-    """ON_BUFFER_CREATED hook for the system:code: scope — registers pre/post update hooks on the new buffer."""
+    """ON_BUFFER_CREATED hook for the system:code: scope — registers pre/post update and drop hooks on the new buffer."""
     # Derive the function name from the buffer name — prefix confirmed by scope registration.
+    buffer_name = new_buffer.name
     func_name = buffer_name[len(_CODE_BUFFER_PREFIX) :]
 
     # Register the on_update_code guard as a pre-update hook — validates source before mutation.
-    guard_result = compiler.register_buffer_hook(
+    guard_result = new_buffer.register_hook(
         HookPoint.ON_UPDATE_BUFFER,
-        buffer_name,
         "on_update_code",
-        _make_on_update_code(compiler, func_name),
+        _make_on_update_code(bm, func_name),
     )
     if not isinstance(guard_result, dict) or not guard_result.get("ok"):
         return f"failed to register on_update_code on {buffer_name}: {guard_result.get('error')}"
 
     # Register the on_code_updated post-update hook — commits to sandbox and refreshes the catalog.
-    commit_result = compiler.register_buffer_hook(
+    commit_result = new_buffer.register_hook(
         HookPoint.ON_BUFFER_UPDATED,
-        buffer_name,
         "on_code_updated",
-        _make_on_code_updated(compiler, func_name, buffer_name),
+        _make_on_code_updated(bm, func_name, buffer_name),
     )
     if not isinstance(commit_result, dict) or not commit_result.get("ok"):
         return f"failed to register on_code_updated on {buffer_name}: {commit_result.get('error')}"
+
+    # Register the on_code_drop pre-drop hook — cascades buffer drop to the function namespace.
+    drop_result = new_buffer.register_hook(
+        HookPoint.ON_DROP_BUFFER,
+        "on_code_drop",
+        _make_on_code_drop(bm, func_name),
+    )
+    if not isinstance(drop_result, dict) or not drop_result.get("ok"):
+        return f"failed to register on_code_drop on {buffer_name}: {drop_result.get('error')}"
+
+    # Register the on_code_dropped safety-net — logs if the function is still registered after the drop.
+    dropped_result = new_buffer.register_hook(
+        HookPoint.ON_BUFFER_DROPPED,
+        "on_code_dropped",
+        _make_on_code_dropped(bm, func_name),
+    )
+    if not isinstance(dropped_result, dict) or not dropped_result.get("ok"):
+        return f"failed to register on_code_dropped on {buffer_name}: {dropped_result.get('error')}"
 
     return None
 
@@ -300,20 +358,20 @@ class FunctionCompiler(FunctionManager, AgenticObject):
         super().__init__(**kwargs)
 
         # Register the ON_CREATE_BUFFER scope hook — compiles and registers functions on buffer creation.
-        on_create_result = self.register_buffer_hook(
+        on_create_result = self.register_buffer_pattern_hook(
             HookPoint.ON_CREATE_BUFFER,
-            _CODE_BUFFER_PREFIX + ".*",
             "on_create_code",
+            _CODE_BUFFER_PREFIX + ".*",
             _on_create_code,
         )
         if not isinstance(on_create_result, dict) or not on_create_result.get("ok"):
             raise RuntimeError(f"failed to register on_create_code hook: {on_create_result.get('error')}")
 
         # Register the ON_BUFFER_CREATED scope hook — registers pre/post update hooks on new code buffers.
-        on_created_result = self.register_buffer_hook(
+        on_created_result = self.register_buffer_pattern_hook(
             HookPoint.ON_BUFFER_CREATED,
-            _CODE_BUFFER_PREFIX + ".*",
             "on_code_created",
+            _CODE_BUFFER_PREFIX + ".*",
             _on_code_created,
         )
         if not isinstance(on_created_result, dict) or not on_created_result.get("ok"):

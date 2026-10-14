@@ -13,38 +13,68 @@ from typing import Callable
 from typing import Literal
 
 
-UpdateHook = Callable[["Buffer", str | None, int, int, str | None], bool | str | None]
-
-
 class HookPoint(Enum):
     """Hook points at which buffer lifecycle events can be intercepted."""
     ON_CREATE_BUFFER = "on_create_buffer"
     ON_BUFFER_CREATED = "on_buffer_created"
     ON_UPDATE_BUFFER = "on_update_buffer"
     ON_BUFFER_UPDATED = "on_buffer_updated"
+    ON_DROP_BUFFER = "on_drop_buffer"
+    ON_BUFFER_DROPPED = "on_buffer_dropped"
+
+
+# Pre-create: fires before buffer is added to the dict. Rejection blocks creation.
+OnCreateBuffer = Callable[["BufferManager", "Buffer", dict[str, Any]], bool | str | None]
+
+# Post-create: fires after buffer is in the dict. Informative only — returns None.
+OnBufferCreated = Callable[["BufferManager", "Buffer", dict[str, Any]], None]
+
+# Pre-update: fires before mutation is committed. Rejection blocks the update.
+OnUpdateBuffer = Callable[["BufferManager", "Buffer", "Buffer", dict[str, Any]], bool | str | None]
+
+# Post-update: fires after mutation is committed. Informative only — returns None.
+OnBufferUpdated = Callable[["BufferManager", "Buffer", "Buffer", dict[str, Any]], None]
+
+# Pre-drop: fires before buffer is removed from the dict. Rejection blocks the drop.
+OnDropBuffer = Callable[["BufferManager", "Buffer", dict[str, Any]], bool | str | None]
+
+# Post-drop: fires after buffer is removed. Informative only — returns None.
+OnBufferDropped = Callable[["BufferManager", "Buffer", dict[str, Any]], None]
+
+# AnyHook is the union of all six hook type aliases — use this where a parameter
+# accepts any hook regardless of hook point.
+AnyHook = (
+    OnCreateBuffer
+    | OnUpdateBuffer
+    | OnDropBuffer
+    | OnBufferCreated
+    | OnBufferUpdated
+    | OnBufferDropped
+)
 
 
 @dataclass
-class CreationHook:
-    """A single creation hook registered on a buffer path.
+class PatternHook:
+    """A single pattern-based hook registered on the registry.
 
     buffer_pattern is a regex; a buffer name matches when re.fullmatch(pattern, buffer_name) is true.
+    callable is a hook of type AnyHook — callable signature depends on its hook point.
     """
     name: str
     buffer_pattern: str
     compiled_pattern: re.Pattern
-    callable: Callable[..., bool | str | None]
+    callable: AnyHook
 
 
 @dataclass
 class HookPointRegistry:
-    """Registry of creation hooks for one hook point.
+    """Registry of pattern-based hooks for one hook point.
 
-    hooks_by_name maps a unique hook name to its CreationHook.
+    hooks_by_name maps a unique hook name to its PatternHook.
     """
-    hooks_by_name: dict[str, CreationHook] = field(default_factory=dict)
+    hooks_by_name: dict[str, PatternHook] = field(default_factory=dict)
 
-    def _sort_hooks_for(self, buffer_name: str) -> list[CreationHook]:
+    def _sort_hooks_for(self, buffer_name: str) -> list[PatternHook]:
         """Return the hooks whose buffer_pattern matches the given buffer name.
 
         Filters to hooks whose pattern fully matches the buffer name, then sorts
@@ -62,30 +92,6 @@ class HookPointRegistry:
 
         return matching_hooks
 
-    async def _fire_hooks(
-        self,
-        bm: BufferManager,
-        buffer_name: str,
-        args: dict[str, Any],
-    ) -> bool | str:
-        """Fire all matching creation hooks in pattern order, returning the first rejection.
-
-        Matches buffer_name against each hook's pattern with re.fullmatch. If a hook
-        returns a non-None/non-True value, that is treated as a rejection and returned
-        immediately.
-        """
-        # Obtain the hooks for this scope in traversal order.
-        hooks = self._sort_hooks_for(buffer_name)
-
-        # Fire each hook in order; stop and return the first rejection.
-        for hook in hooks:
-            result = hook.callable(bm, buffer_name, args)
-            if asyncio.iscoroutine(result):
-                result = await result
-            if result is not None and result is not True:
-                return result
-
-        return True
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos import tool, sandbox
@@ -146,21 +152,50 @@ def _drop_persisted_buffer(bm: BufferManager, buffer_name: str) -> None:
     (dir / f".{buffer_name}.json").unlink(missing_ok=True)
 
 
-def _make_persist_buffer_hook(bm: BufferManager) -> UpdateHook:
-    """Factory that returns an update hook that persists the buffer on every modification.
+def _make_persist_buffer_hook(bm: BufferManager) -> OnBufferUpdated:
+    """Factory that returns a post-update hook that persists the buffer on every modification.
 
     Closes over bm so the hook can call _persist_buffer with the correct BufferManager.
     """
     def _persist_buffer_update_hook(
-        buf: Buffer,
-        old_text: str | None,
-        start: int,
-        end: int,
-        new_text: str | None,
-    ) -> bool | str | None:
-        _persist_buffer(bm, buf)
-        return True
+        buffer_manager: BufferManager,
+        buffer: Buffer,
+        new_buffer: Buffer,
+        args: dict[str, Any],
+    ) -> None:
+        # Persist the buffer to disk — called after every successful mutation.
+        _persist_buffer(buffer_manager, buffer)
     return _persist_buffer_update_hook
+
+
+def _initialize_buffer_hooks(
+    bm: BufferManager,
+    buffer: Buffer,
+    hook_point: HookPoint,
+) -> None:
+    """Initialize the buffer's _hooks from the registry for the given hook point.
+
+    Queries the HookPointRegistry for all pattern-matching hooks and copies each into
+    buffer._hooks under the same name. Mirroring is additive — existing hooks on the
+    buffer are not overwritten; the registry is not modified.
+
+    This runs after the buffer is in bm._buffers so that the buffer is eligible for
+    update/drop hooks. After mirroring, all hook points on this buffer fire uniformly
+    through buffer._fire_hooks — no more registry lookups for this buffer.
+    """
+    if hook_point not in bm._buffer_hooks:
+        return
+    registry = bm._buffer_hooks[hook_point]
+
+    # Find all pattern-matching hooks for this buffer name.
+    matching = registry._sort_hooks_for(buffer.name)
+    if hook_point not in buffer._hooks:
+        buffer._hooks[hook_point] = {}
+
+    # Copy each matching hook into the buffer — additive, does not overwrite existing.
+    for hook in matching:
+        if hook.name not in buffer._hooks[hook_point]:
+            buffer._hooks[hook_point][hook.name] = hook.callable
 
 
 async def _create_buffer_implementation(
@@ -175,48 +210,87 @@ async def _create_buffer_implementation(
     metadata must contain created_at and modified_at. Always called with metadata
     from the tool wrapper or from the restore hook.
     """
-    # Reject new creation if the name is already taken and overwrite is not requested.
-    if name in bm._buffers and not overwrite:
-        return {"ok": False, "error": f"Buffer '{name}' already exists. Use overwrite=True to replace it."}
-
-    created_at = metadata.get("created_at", time.time()) if metadata else time.time()
-    modified_at = metadata.get("modified_at", created_at) if metadata else created_at
     existed = name in bm._buffers
 
-    # Gate the creation or overwrite through pre-creation hooks; a rejection blocks the operation.
-    create_args = {"name": name, "text": text, "overwrite": overwrite}
-    pre_result = await bm._buffer_hooks[HookPoint.ON_CREATE_BUFFER]._fire_hooks(bm, name, create_args)
-    if pre_result is not True and pre_result is not None:
-        return {"ok": False, "error": str(pre_result)}
+    # Reject new creation if the name is already taken and overwrite is not requested.
+    if existed and not overwrite:
+        return {
+            "ok": False,
+            "error": f"Buffer '{name}' already exists. Use overwrite=True to replace it.",
+        }
 
-    # Gate overwrite through the existing buffer's pre-update hooks; a rejection blocks the replacement.
+    # Compute timestamps from metadata when provided, otherwise use now for both.
+    created_at = metadata.get("created_at", time.time()) if metadata else time.time()
+    modified_at = metadata.get("modified_at", created_at) if metadata else created_at
+
+    # Gate the creation or overwrite through pre-creation hooks; a rejection blocks the operation.
+    create_args = {"_op": "create_buffer", "name": name, "text": text, "overwrite": overwrite}
+
+    # Compute the proposed new lines from the provided text.
+    new_lines = [
+        BufferEntry(data=line, modified_at=modified_at, object_at=modified_at)
+        for line in (text or "").splitlines()
+    ]
+
+    # For existing buffers: behave as an update — gate through pre-update hooks, modify in place.
     if existed:
         buf = bm._buffers[name]
-        old_text = buf.get_text()
-        hook_result = await buf._fire_hooks(HookPoint.ON_UPDATE_BUFFER, old_text, 0, len(buf.lines), (text + "\n") if text else "\n")
-        if hook_result is not True and hook_result is not None:
-            return {"ok": False, "error": str(hook_result)}
 
-        # Overwrite the buffer's content in place, preserving the buffer object and its
-        # registered update hooks so that they survive across create_buffer overwrites.
+        # Build the proposed new state as an alias of the buffer with new content.
+        # The pre-update hook sees what the buffer will become and can accept or reject.
+        buffer_alias = buf.alias()
+        buffer_alias.lines = new_lines
+
+        # Gate the overwrite through pre-update hooks; a rejection blocks the replacement.
+        update_args = {"_op": "create_buffer", "name": name, "text": text, "overwrite": overwrite}
+        pre_result = await buf._fire_hooks(bm, buffer_alias, HookPoint.ON_UPDATE_BUFFER, update_args)
+        if pre_result is not True and pre_result is not None:
+            return {"ok": False, "error": str(pre_result)}
+
+        # Overwrite the buffer's content in place — keep created_at, update modified_at and lines.
         buf.modified_at = modified_at
-        buf.lines = [BufferEntry(data=line, modified_at=modified_at, object_at=modified_at) for line in (text.splitlines() if text else [])]
+        buf.lines, buffer_alias.lines = buffer_alias.lines, buf.lines
         create_result = {"ok": True, "lines": len(buf.lines)}
 
         # Fire post-update hooks now that the overwrite is committed.
-        await buf._fire_hooks(HookPoint.ON_BUFFER_UPDATED, old_text, 0, len(buf.lines), (text + "\n") if text else "\n")
+        await buffer_alias._fire_hooks(bm, buf, HookPoint.ON_BUFFER_UPDATED, update_args)
 
-    # Create a fresh Buffer with no lines and the given timestamps.
-    # Delegated to protected creation — hooks are not fired here.
+    # For new buffers: behave as a creation — gate through pre-create hooks, then create the buffer.
     else:
-        create_result = bm._create_buffer(name, text, metadata)
-        if not create_result.get("ok"):
-            return create_result
+        # Build a working buffer for pre-create hooks to inspect.
+        buf = Buffer(name=name, lines=new_lines, created_at=created_at, modified_at=created_at)
 
-    # Fire post-creation hooks; a rejection is logged but does not block the committed buffer.
-    post_result = await bm._buffer_hooks[HookPoint.ON_BUFFER_CREATED]._fire_hooks(bm, name, create_args)
-    if post_result is not True and post_result is not None:
-        post_result = str(post_result)
+        # Mirror all pattern-based hook points into the buffer before creation hooks fire.
+        _initialize_buffer_hooks(bm, buf, HookPoint.ON_CREATE_BUFFER)
+        _initialize_buffer_hooks(bm, buf, HookPoint.ON_BUFFER_CREATED)
+        _initialize_buffer_hooks(bm, buf, HookPoint.ON_UPDATE_BUFFER)
+        _initialize_buffer_hooks(bm, buf, HookPoint.ON_BUFFER_UPDATED)
+        _initialize_buffer_hooks(bm, buf, HookPoint.ON_DROP_BUFFER)
+        _initialize_buffer_hooks(bm, buf, HookPoint.ON_BUFFER_DROPPED)
+
+        # Fire pre-create hooks — a rejection blocks the creation.
+        pre_result = await buf._fire_hooks(bm, None, HookPoint.ON_CREATE_BUFFER, create_args)
+        if pre_result is not True and pre_result is not None:
+            return {"ok": False, "error": str(pre_result)}
+
+        # Add the buffer to the manager's dict.
+        # Add the buffer to the manager's dict.
+        bm._buffers[name] = buf
+
+        # Create and register the persist hook on the buffer.
+        persist_hook = _make_persist_buffer_hook(bm)
+        buf.register_hook(HookPoint.ON_BUFFER_UPDATED, "persist_buffer", persist_hook)
+
+        # Fire persist immediately for the fresh buffer.
+        persist_hook(bm, buf, buf, create_args)
+
+        # Commit and report success with the line count.
+        create_result = {"ok": True, "lines": len(buf.lines)}
+
+        # Fire post-creation hooks — a rejection is logged but does not block the committed buffer.
+        post_result = await buf._fire_hooks(bm, None, HookPoint.ON_BUFFER_CREATED, create_args)
+        if post_result is not True and post_result is not None:
+            post_result = str(post_result)
 
     # Refresh the system buffer listing so the new buffer is visible to the agent.
     if name != _STATUS_BUFFER:
@@ -492,34 +566,431 @@ class Buffer:
     lines: list[BufferEntry]
     created_at: float
     modified_at: float
-    _hooks: dict[HookPoint, dict[str, UpdateHook]] = field(default_factory=lambda: {
+    _hooks: dict[
+        HookPoint,
+        dict[str, AnyHook],
+    ] = field(default_factory=lambda: {
+        HookPoint.ON_CREATE_BUFFER: {},
+        HookPoint.ON_BUFFER_CREATED: {},
         HookPoint.ON_UPDATE_BUFFER: {},
         HookPoint.ON_BUFFER_UPDATED: {},
+        HookPoint.ON_DROP_BUFFER: {},
+        HookPoint.ON_BUFFER_DROPPED: {},
     })
 
-    async def _fire_hooks(self, hook_point: HookPoint, old_text: str | None, start: int, end: int, new_text: str | None) -> bool | str:
-        # Guard: return early if no hooks are registered for this hook point.
-        if hook_point not in self._hooks or not self._hooks[hook_point]:
-            return True
+    def alias(self) -> Buffer:
+        """Return an alias of this buffer sharing the same lines and hooks.
 
-        # Fire each hook in registration order; stop and return the first rejection for ON_UPDATE_BUFFER.
-        # For ON_BUFFER_UPDATED, fire all hooks and return their results.
-        for hook_name, hook in self._hooks[hook_point].items():
-            # Await the result in case the hook is a coroutine.
-            result = hook(self, old_text, start, end, new_text)
+        No new list or dict is created — the alias points to the identical objects.
+        Modifying the alias's lines list modifies the original's lines, and the
+        same applies to the hooks dict.
+        """
+        return Buffer(
+            name=self.name,
+            lines=self.lines,
+            created_at=self.created_at,
+            modified_at=self.modified_at,
+            _hooks=self._hooks,
+        )
+
+    def copy(self) -> Buffer:
+        """Return a buffer that is fully independent of the original.
+
+        The lines list is deep-copied — no BufferEntry or its data is shared with the original.
+        The hooks dict is also deep-copied — modifying a hook in the copy does not affect the original.
+        """
+        import copy
+
+        return Buffer(
+            name=self.name,
+            lines=copy.deepcopy(self.lines),
+            created_at=self.created_at,
+            modified_at=self.modified_at,
+            _hooks=copy.deepcopy(self._hooks),
+        )
+
+    def edited_buffer(
+        self,
+        old_string: str,
+        new_string: str,
+        start: int = 0,
+        end: int | str = "end",
+        replace_all: bool = False,
+    ) -> dict[str, Any]:
+        """Return a result dict with the edited buffer or an error.
+
+        Returns {"ok": True, "buffer": Buffer, "old_text": str, "new_text": str, "count": int}
+        if successful. Returns {"ok": False, "error": str} on any error.
+        The buffer in the ok case shares this buffer's hooks dict — use copy() if
+        independence is needed.
+        """
+        if not old_string:
+            return {"ok": False, "error": "old_string must not be empty."}
+        total = len(self.lines)
+
+        # Resolve start/end to absolute 0-based indices; return error on out-of-range.
+        resolved = _resolve_line_range(total, start, end)
+        if isinstance(resolved, dict):
+            return resolved
+        lo, hi = resolved
+
+        # Guard: empty range.
+        if lo == hi:
+            return {"ok": False, "error": f"The range you specified is empty (start=end={lo}). Nothing was replaced."}
+
+        # Extract the target segment text and collect its entries.
+        segment_entries = self.lines[lo:hi]
+        segment_text = "\n".join(e.data for e in segment_entries) + "\n"
+
+        # Find every occurrence of old_string within the segment.
+        all_ranges: list[tuple[int, int]] = []
+        pos = 0
+        while True:
+            idx = segment_text.find(old_string, pos)
+            if idx == -1:
+                break
+            all_ranges.append((idx, idx + len(old_string)))
+            pos = idx + 1
+
+        # Guard: no matches found in the segment.
+        if len(all_ranges) == 0:
+            return {"ok": False, "error": f"Search pattern '{old_string}' not found in the range [{lo}:{hi})."}
+
+        # Guard: multiple matches found but replace_all is False; report clusters and decline.
+        if not replace_all and len(all_ranges) > 1:
+            line_numbers = [lo + i for i, e in enumerate(segment_entries) if old_string in e.data]
+            clusters = _cluster_lines_to_ranges(line_numbers, 5, self.lines)
+            cluster_msgs = ", ".join(f"lines {c['start']}–{c['end']} ({c['match_count']} occurrence(s))" for c in clusters)
+            return {
+                "ok": False,
+                "error": (
+                    f"Search pattern '{old_string}' found multiple times ({segment_text.count(old_string)} total) at: {cluster_msgs}. "
+                    "Set replace_all=True to replace all occurrences."
+                ),
+            }
+
+        # Build new_content by applying all replacements in reverse order.
+        new_content = segment_text
+        for r_start, r_end in reversed(all_ranges):
+            new_content = new_content[:r_start] + new_string + new_content[r_end:]
+
+        # Split the replaced text into lines and prepare timestamp bookkeeping.
+        new_lines = new_content.splitlines()
+        now = time.time()
+        result_entries: list[BufferEntry] = []
+        used_old_indices: set[int] = set()
+
+        # Identify which original line indices fall inside any replacement range.
+        sorted_ranges = sorted(all_ranges)
+        replaced_line_indices: set[int] = set()
+        for r_start, r_end in sorted_ranges:
+            first_newline = segment_text[:r_start].count('\n')
+            last_newline = segment_text[:r_end].count('\n') - 1
+            for li in range(first_newline, last_newline + 1):
+                replaced_line_indices.add(lo + li)
+
+        old_entries = self.lines
+        old_timestamps = [e.modified_at for e in old_entries]
+
+        # Walk each new line, tracking its position relative to original content so the
+        # correct modified_at can be assigned: replaced lines get the current now;
+        # untouched lines that match the original content at the same index keep theirs.
+        char_offset = 0
+        for new_i, line_text in enumerate(new_lines):
+            char_pos_new = sum(len(new_lines[j]) + 1 for j in range(new_i)) if new_i > 0 else 0
+
+            in_replaced = False
+            effective_offset = 0
+            matched_range: tuple[int, int] | None = None
+            for r_start, r_end in sorted_ranges:
+                adj_start = r_start + effective_offset
+                adj_end = r_end + effective_offset
+                if char_pos_new < adj_start:
+                    break
+                if adj_start <= char_pos_new < adj_end:
+                    in_replaced = True
+                    matched_range = (r_start, r_end)
+                    effective_offset += len(new_string) - (r_end - r_start)
+                    break
+                effective_offset += len(new_string) - (r_end - r_start)
+
+            # Re-check replaced status after offset adjustment.
+            if in_replaced and matched_range is not None:
+                r_start, r_end = matched_range
+                net_change = len(new_string) - (r_end - r_start)
+                if net_change < 0:
+                    remapped_pos = char_pos_new - net_change
+                else:
+                    remapped_pos = char_pos_new - net_change
+                if not (r_start <= remapped_pos < r_end):
+                    in_replaced = False
+
+            # Assign modified_at: replaced lines get now; untouched preserved lines keep
+            # their original modified_at; novel content also gets now.
+            if in_replaced:
+                result_entries.append(BufferEntry(data=line_text, modified_at=now, object_at=now))
+            else:
+                mapped_pos = char_pos_new - effective_offset
+                if mapped_pos <= 0:
+                    mapped_line_idx = 0
+                else:
+                    mapped_line_idx = segment_text[:mapped_pos].count('\n')
+                abs_mapped = lo + mapped_line_idx
+                if (
+                    abs_mapped < len(old_entries)
+                    and old_entries[abs_mapped].data == line_text
+                    and abs_mapped not in used_old_indices
+                    and abs_mapped not in replaced_line_indices
+                ):
+                    result_entries.append(
+                        BufferEntry(data=line_text, modified_at=old_timestamps[abs_mapped], object_at=now)
+                    )
+                    used_old_indices.add(abs_mapped)
+                else:
+                    result_entries.append(BufferEntry(data=line_text, modified_at=now, object_at=now))
+
+        # Return an alias of this buffer with the edited lines and the current timestamp.
+        # Also return old_text, new_text, and the replacement count for the caller.
+        aliased = self.alias()
+        aliased.lines = self.lines[:lo] + result_entries + self.lines[hi:]
+        aliased.modified_at = now
+
+        return {
+            "ok": True,
+            "buffer": aliased,
+            "count": len(all_ranges),
+        }
+
+    def written_buffer(self, text: str, pos: int) -> dict[str, Any]:
+        """Return a result dict with the buffer after text is inserted at pos, or an error.
+
+        Returns {"ok": True, "buffer": Buffer, "count": int} if the insertion is valid.
+        Returns {"ok": False, "error": str} if the position is out of range.
+        The returned buffer shares this buffer's hooks dict — use copy() if independence is needed.
+        """
+        if pos < 0 or pos > len(self.lines):
+            return {"ok": False, "error": f"Position {pos} is out of range (0–{len(self.lines)})."}
+
+        # Build the new entries from the provided text — a trailing newline is always appended.
+        now = time.time()
+        new_entries = [
+            BufferEntry(data=line, modified_at=now, object_at=now)
+            for line in (text + "\n").splitlines()
+        ]
+
+        # Return an alias of this buffer with the new entries inserted at pos.
+        aliased = self.alias()
+        aliased.lines = self.lines[:pos] + new_entries + self.lines[pos:]
+        aliased.modified_at = now
+
+        return {
+            "ok": True,
+            "buffer": aliased,
+            "count": len(new_entries),
+        }
+
+    def patched_buffer(self, patch_text: str) -> dict[str, Any]:
+        """Return a result dict with the buffer after a unified diff is applied, or an error.
+
+        Returns {"ok": True, "buffer": Buffer, "count": int} on success.
+        Returns {"ok": False, "error": str} if the patch cannot be parsed or applied.
+        The returned buffer shares this buffer's hooks dict — use copy() if independence is needed.
+        """
+        # Import paatch; surface a clear error if it is not installed.
+        try:
+            import paatch
+        except ImportError:
+            return {"ok": False, "error": "paatch library not installed. Install it with: pip install paatch"}
+
+        # Parse the provided diff, returning a parse error if the format is unrecognizable.
+        if not isinstance(patch_text, bytes):
+            patch_bytes = patch_text.encode("utf-8")
+        else:
+            patch_bytes = patch_text
+        ps = paatch.fromstring(patch_bytes)
+        if not ps:
+            return {"ok": False, "error": "Could not parse patch: the unified diff format could not be recognized."}
+
+        # Apply the patch in-memory using patch_stream.
+        buf_text = self.get_text()
+        from io import BytesIO
+        hunks = ps.items[0].hunks
+        try:
+            src = BytesIO(buf_text.encode("utf-8"))
+            patched_bytes = b"".join(ps.patch_stream(src, hunks))
+        except Exception as e:
+            return {"ok": False, "error": f"Could not apply patch: {e}."}
+
+        # Build the new buffer from the patched text.
+        new_text = patched_bytes.decode("utf-8")
+        new_lines = new_text.splitlines()
+        now = time.time()
+        result_entries = [
+            BufferEntry(data=line, modified_at=now, object_at=now) for line in new_lines
+        ]
+
+        # Construct the result alias with the patched lines and the new timestamp.
+        aliased = self.alias()
+        aliased.lines = result_entries
+        aliased.modified_at = now
+
+        return {
+            "ok": True,
+            "buffer": aliased,
+            "count": len(hunks),
+        }
+
+    async def _fire_pre_op_hooks(
+        self,
+        hooks: list[tuple[str, OnCreateBuffer | OnUpdateBuffer | OnDropBuffer]],
+        hook_args: list[Any],
+    ) -> bool | str:
+        """Fire pre-operation hooks in order; return the first rejection.
+
+        Update hooks receive (bm, buffer, new_buffer, args). Create and drop hooks
+        receive (bm, buffer, args). If a hook returns a non-None/non-True value, that
+        is a rejection and is returned immediately — the operation is blocked.
+        If a hook is async and raises, the exception propagates directly to the caller.
+        """
+        # Fire each hook in order; stop and return the first rejection.
+        for hook_name, hook in hooks:
+            # Await the hook if it is a coroutine; otherwise invoke it synchronously.
+            result = hook(*hook_args)
             if asyncio.iscoroutine(result):
                 result = await result
 
-            # Pre-mutation: block on first rejection; post-mutation: fire all and log failures.
-            if hook_point is HookPoint.ON_UPDATE_BUFFER:
-                if result is not None and result is not True:
-                    return result
-            else:
-                if result is not None and result is not True:
-                    # Log and continue — post-hooks never block the operation.
-                    import logging
-                    logging.warning(f"[hook] ON_BUFFER_UPDATED hook '{hook_name}' on '{self.name}' rejected: {result}")
+            # Rejection — a non-None, non-True return means the hook denied the operation.
+            # Return it immediately so the operation is blocked without firing remaining hooks.
+            if result is not None and result is not True:
+                return result
         return True
+
+    async def _fire_post_op_hooks(
+        self,
+        hooks: list[tuple[str, OnBufferCreated | OnBufferUpdated | OnBufferDropped]],
+        hook_args: list[Any],
+    ) -> None:
+        """Fire post-operation hooks in order; catch and log any raises, continue to the next.
+
+        Update hooks receive (bm, buffer, new_buffer, args). Create and drop hooks
+        receive (bm, buffer, args). Return values are ignored — post-op hooks are
+        side-effect only and their return value has no meaning to the caller.
+        """
+        import logging
+
+        # Fire each hook in order; if it raises, log the error and move on.
+        for hook_name, hook in hooks:
+            try:
+                result = hook(*hook_args)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logging.error(f"[hook] post-operation hook '{hook_name}' on '{self.name}' raised: {e}")
+
+    async def _fire_hooks(
+        self,
+        buffer_manager: BufferManager,
+        new_buffer: Buffer | None,
+        hook_point: HookPoint,
+        args: dict[str, Any],
+    ) -> bool | str:
+        """Fire all hooks for the given hook point.
+
+        Pre-operation hooks (ON_CREATE_BUFFER, ON_UPDATE_BUFFER, ON_DROP_BUFFER) block on first
+        rejection. Post-operation hooks (ON_BUFFER_CREATED, ON_BUFFER_UPDATED, ON_BUFFER_DROPPED)
+        fire all hooks and log any rejections.
+        """
+        # Return early if no hooks are registered for this hook point.
+        if hook_point not in self._hooks or not self._hooks[hook_point]:
+            return True
+
+        # Pre-operation hooks block on first rejection; post-operation hooks fire all and log.
+        hook_items = list(self._hooks[hook_point].items())
+        pre_op_point = hook_point in (
+            HookPoint.ON_CREATE_BUFFER,
+            HookPoint.ON_UPDATE_BUFFER,
+            HookPoint.ON_DROP_BUFFER,
+        )
+
+        # Build the positional args list — update hooks get 4 args, create/drop get 3.
+        if new_buffer is not None:
+            hook_args = [buffer_manager, self, new_buffer, args]
+        else:
+            hook_args = [buffer_manager, self, args]
+
+        # Fire pre-op hooks — block on first rejection.
+        if pre_op_point:
+            return await self._fire_pre_op_hooks(hook_items, hook_args)
+
+        # Fire post-op hooks — log all rejections and continue.
+        await self._fire_post_op_hooks(hook_items, hook_args)
+        return True
+
+    def register_hook(
+        self,
+        hook_point: HookPoint,
+        hook_name: str,
+        hook: AnyHook,
+        overwrite_existing: bool = False,
+    ) -> dict[str, Any]:
+        """Register a hook on this buffer for the given hook point.
+
+        Stores the hook directly in buffer._hooks under the hook point.
+        If overwrite_existing is True and the hook already exists, replaces it.
+        If overwrite_existing is False and the hook already exists, rejects.
+        """
+        # Handle the case where the hook already exists under this buffer and hook point.
+        if hook_name in self._hooks[hook_point]:
+            if overwrite_existing:
+                # Overwrite is requested — remove the existing hook and reregister.
+                del self._hooks[hook_point][hook_name]
+            else:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"hook '{hook_name}' already registered on '{self.name}' "
+                        f"at '{hook_point.value}'. Unregister first, or use overwrite_existing."
+                    ),
+                }
+
+        # Store the hook by name on this buffer.
+        self._hooks[hook_point][hook_name] = hook
+
+        return {
+            "ok": True,
+            "hook_point": hook_point.value,
+            "buffer": self.name,
+            "hook": hook_name,
+        }
+
+    def unregister_hook(
+        self,
+        hook_point: HookPoint,
+        hook_name: str,
+    ) -> dict[str, Any]:
+        """Remove a named hook from this buffer and hook point.
+
+        Rejects if the hook point or hook name is not found on this buffer.
+        """
+        if hook_name not in self._hooks[hook_point]:
+            return {
+                "ok": False,
+                "error": (
+                    f"no hook '{hook_name}' on '{self.name}' "
+                    f"at '{hook_point.value}'."
+                ),
+            }
+
+        # Remove the named hook from this buffer and hook point.
+        del self._hooks[hook_point][hook_name]
+
+        # Confirm the removal with the hook name that was removed.
+        return {
+            "ok": True,
+            "hook_point": hook_point.value,
+            "buffer": self.name,
+            "removed": hook_name,
+        }
 
     def get_text(self) -> str:
         """Return the full buffer content as a single newline-joined string with a trailing newline.
@@ -614,20 +1085,32 @@ class BufferManager(AgenticObject):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        # Named buffers — the primary store for all managed buffers.
         self._buffers: dict[str, Buffer] = {}
+
+        # Pattern-based hook registries keyed by hook point.
+        # Each registry holds creation hooks to be mirrored to a buffer on first creation.
         self._buffer_hooks: dict[HookPoint, HookPointRegistry] = {
             HookPoint.ON_CREATE_BUFFER: HookPointRegistry(),
             HookPoint.ON_BUFFER_CREATED: HookPointRegistry(),
+            HookPoint.ON_UPDATE_BUFFER: HookPointRegistry(),
+            HookPoint.ON_BUFFER_UPDATED: HookPointRegistry(),
+            HookPoint.ON_DROP_BUFFER: HookPointRegistry(),
+            HookPoint.ON_BUFFER_DROPPED: HookPointRegistry(),
         }
-        self._register_restore_hook("create_buffers", _restore_create_buffers)
+
+        # Bootstrap the system status buffer — this must exist before any agent runs.
         self._create_buffer(_STATUS_BUFFER, text="[]")
+
+        # Register the restore hook so persisted buffers survive instance restarts.
+        self._register_restore_hook("create_buffers", _restore_create_buffers)
 
     async def _refresh_buffers_buffer(self) -> dict[str, Any]:
         records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
         text = json.dumps(records, indent=2)
         return await self.create_buffer(_STATUS_BUFFER, text=text, overwrite=True)
 
-    def _get_buffer(self, name: str) -> Buffer | None:
+    def get_buffer(self, name: str) -> Buffer | None:
         """Protected buffer lookup — returns the Buffer object or None if not found.
 
         Not agent-facing. Used by subclasses and internal code that needs direct
@@ -667,10 +1150,10 @@ class BufferManager(AgenticObject):
 
         # Register the persist hook so every subsequent modification is written to disk.
         persist_buffer_hook = _make_persist_buffer_hook(self)
-        self.register_buffer_hook(HookPoint.ON_BUFFER_UPDATED, name, "persist_buffer", persist_buffer_hook)
+        buf.register_hook(HookPoint.ON_BUFFER_UPDATED, "persist_buffer", persist_buffer_hook)
 
         # Persist the freshly created buffer immediately.
-        persist_buffer_hook(buf, None, 0, 0, None)
+        persist_buffer_hook(self, buf, buf, {"_op": "create_buffer", "name": name, "text": text})
 
         return {"ok": True, "lines": lines}
 
@@ -721,20 +1204,36 @@ class BufferManager(AgenticObject):
             return resolved
         pos = resolved
 
-        # Capture old buffer content and compute new content, then fire pre-update hooks.
-        # The hook sees the exact slice that will be replaced and the proposed replacement.
-        hook_result = await buf._fire_hooks(HookPoint.ON_UPDATE_BUFFER, "", pos, pos, text + "\n")
+        # Produce the alias with the written content; propagate error dicts directly.
+        write_result = buf.written_buffer(text, pos)
+        if not write_result.get("ok"):
+            return write_result
+        alias = write_result["buffer"]
+        count = write_result["count"]
+
+        # Gate the write through pre-update hooks — rejection blocks the insertion.
+        write_args = {"_op": "write_buffer", "name": name, "text": text, "pos": pos, "start": pos, "end": pos}
+        hook_result = await buf._fire_hooks(
+            self,
+            alias,
+            HookPoint.ON_UPDATE_BUFFER,
+            write_args,
+        )
         if hook_result is not True and hook_result is not None:
             return {"ok": False, "error": str(hook_result)}
 
-        # Commit the mutation to the buffer and stamp the modification time.
-        now = time.time()
-        new_entries = [BufferEntry(data=line, modified_at=now, object_at=now) for line in (text + "\n").splitlines()]
-        buf.lines[pos:pos] = new_entries
-        buf.modified_at = time.time()
+        # Swap the buffer contents in place — preserving the object reference for any callers holding it.
+        buf.lines, alias.lines = alias.lines, buf.lines
+        buf.modified_at, alias.modified_at = alias.modified_at, buf.modified_at
 
-        # Fire post-update hooks now that the mutation is committed.
-        await buf._fire_hooks(HookPoint.ON_BUFFER_UPDATED, "", pos, pos + len(new_entries), text + "\n")
+        # Fire post-update hooks: `alias` is the buffer that was updated,
+        # `buf` now holds the new state and is passed as `new_buffer`.
+        await alias._fire_hooks(
+            self,
+            buf,
+            HookPoint.ON_BUFFER_UPDATED,
+            write_args,
+        )
 
         # Refresh the buffer registry to keep the system listing current.
         if name != _STATUS_BUFFER:
@@ -744,7 +1243,7 @@ class BufferManager(AgenticObject):
                 # content. Until a rollback strategy is defined, raising the error leaves the
                 # BufferManager in an inconsistent state (content changed, listing stale).
                 raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
-        return {"ok": True, "lines_written": len(new_entries), "total_lines": len(buf.lines)}
+        return {"ok": True, "lines_written": count, "total_lines": len(buf.lines)}
 
     @tool
     async def drop_buffer(self, name: str) -> dict[str, Any]:
@@ -760,15 +1259,27 @@ class BufferManager(AgenticObject):
         if name == _STATUS_BUFFER:
             return {"ok": False, "error": f"Cannot drop the '{_STATUS_BUFFER}' buffer."}
 
-        # Fire pre-update hooks with the full buffer content and None for new_text (signals drop).
-        # Rejection means the drop is denied and the buffer must not be deleted.
+        # Capture content before deletion — needed by ON_DROP_BUFFER and ON_BUFFER_DROPPED.
         old_text = buf.get_text()
-        hook_result = await buf._fire_hooks(HookPoint.ON_UPDATE_BUFFER, old_text, 0, len(buf.lines), None)
-        if hook_result is not True and hook_result is not None:
-            return {"ok": False, "error": str(hook_result)}
 
-        # Delete the buffer and refresh the system listing.
+        # Fire pre-drop hooks — a rejection blocks the drop.
+        drop_args = {"_op": "drop_buffer", "name": name, "start": 0, "end": len(buf.lines), "old_text": old_text}
+        drop_guard = await buf._fire_hooks(
+            self,
+            None,
+            HookPoint.ON_DROP_BUFFER,
+            drop_args,
+        )
+        if drop_guard is not True and drop_guard is not None:
+            return {"ok": False, "error": str(drop_guard)}
+
+        # Delete the buffer from the manager — it is now invisible to all code.
         del self._buffers[name]
+
+        # Fire ON_BUFFER_DROPPED post-drop hooks — buffer is gone from the manager.
+        # The buffer object itself is still alive for the duration of this call.
+        await buf._fire_hooks(self, None, HookPoint.ON_BUFFER_DROPPED, drop_args)
+
         refresh_result = await self._refresh_buffers_buffer()
         if not refresh_result.get("ok"):
             # TODO(design): buffer already deleted from self._buffers — rolling back would require
@@ -781,87 +1292,167 @@ class BufferManager(AgenticObject):
 
         return {"ok": True, "dropped": name}
 
-    def register_buffer_hook(
+    def register_buffer_pattern_hook(
         self,
         hook_point: HookPoint,
-        buffer_pattern: str,
         hook_name: str,
-        hook: Callable[..., bool | str | None],
+        pattern: str,
+        hook: (
+            OnCreateBuffer
+            | OnUpdateBuffer
+            | OnDropBuffer
+            | OnBufferCreated
+            | OnBufferUpdated
+            | OnBufferDropped
+        ),
+        overwrite_existing: bool = False,
+        apply_to_existing: bool = False,
     ) -> dict[str, Any]:
-        """Register a hook on a buffer by pattern and hook point.
+        """Register a hook by pattern on the BufferManager's HookPointRegistry.
 
-        Routes to the appropriate internal store based on hook_point:
-        - ON_UPDATE_BUFFER / ON_BUFFER_UPDATED: stores on the Buffer object directly;
-          buffer_pattern is the exact buffer name to look up.
-        - ON_CREATE_BUFFER / ON_BUFFER_CREATED: stores on the BufferManager's HookPointRegistry;
-          buffer_pattern is a regex; matched with re.fullmatch against each buffer name.
+        The pattern is always treated as a regex and matched with re.fullmatch against
+        each buffer name. When a buffer matching the pattern is created, the hook is
+        copied into that buffer's _hooks via _initialize_buffer_hooks. The pattern
+        registry is never consulted at hook-fire time — only at buffer creation.
 
-        For creation hooks, the pattern must be a valid regex; re.fullmatch is used so the
-        entire buffer name must match the pattern.
-        Rejects if hook_name already exists under this hook point for the given buffer.
+        If apply_to_existing is True, the hook is also immediately registered on all
+        buffers that already exist and match the pattern. If overwrite_existing is
+        also True, existing hooks with the same name are replaced rather than rejected.
+
+        Rejects if hook_name already exists under this hook point in the registry.
         """
-        # Route update hooks to the Buffer's _hooks dict.
-        if hook_point in (HookPoint.ON_UPDATE_BUFFER, HookPoint.ON_BUFFER_UPDATED):
-            if buffer_pattern not in self._buffers:
-                return {"ok": False, "error": f"No buffer named '{buffer_pattern}'."}
-            buf = self._buffers[buffer_pattern]
-            if hook_name in buf._hooks.get(hook_point, {}):
-                return {"ok": False, "error": f"hook '{hook_name}' already registered on '{buffer_pattern}' at '{hook_point.value}'. Unregister first."}
-            if hook_point not in buf._hooks:
-                buf._hooks[hook_point] = {}
-            buf._hooks[hook_point][hook_name] = hook
-            return {"ok": True, "hook_point": hook_point.value, "buffer": buffer_pattern, "hook": hook_name, "hook_count": len(buf._hooks[hook_point])}
-
-        # Route creation hooks to the BufferManager's HookPointRegistry.
+        # Reject if the hook point is not a known hook point with a registry.
         if hook_point not in self._buffer_hooks:
-            self._buffer_hooks[hook_point] = HookPointRegistry()
+            return {
+                "ok": False,
+                "error": f"no registry for '{hook_point.value}' — hook point not recognised.",
+            }
         registry = self._buffer_hooks[hook_point]
+
+        # Check for duplicate hook names under this hook point in the registry.
         if hook_name in registry.hooks_by_name:
-            return {"ok": False, "error": f"hook '{hook_name}' already registered under '{hook_point.value}'."}
+            if overwrite_existing:
+                # Overwrite is requested — remove the existing entry and reregister.
+                del registry.hooks_by_name[hook_name]
+            else:
+                return {
+                    "ok": False,
+                    "error": f"hook '{hook_name}' already registered under '{hook_point.value}'. Unregister first, or use overwrite_existing.",
+                }
 
         # Compile and validate the pattern now — fail fast rather than silently never matching.
         try:
-            compiled = re.compile(buffer_pattern)
+            compiled = re.compile(pattern)
         except re.error as e:
-            return {"ok": False, "error": f"Invalid buffer_pattern regex '{buffer_pattern}': {e}."}
+            return {"ok": False, "error": f"Invalid buffer regex '{pattern}': {e}."}
 
-        registry.hooks_by_name[hook_name] = CreationHook(
+        # Store the pattern hook in the registry for future buffer creation events.
+        registry.hooks_by_name[hook_name] = PatternHook(
             name=hook_name,
-            buffer_pattern=buffer_pattern,
+            buffer_pattern=pattern,
             compiled_pattern=compiled,
             callable=hook,
         )
-        return {"ok": True, "hook_point": hook_point.value, "buffer_pattern": buffer_pattern, "hook": hook_name}
 
-    def unregister_buffer_hook(
+        # Build the success return dict, extending it only when apply_to_existing populates extra data.
+        result = {
+            "ok": True,
+            "hook_point": hook_point.value,
+            "buffer_pattern": pattern,
+            "hook": hook_name,
+        }
+
+        # If apply_to_existing is True, register the hook directly on all buffers that already exist and match the pattern.
+        # Track how many matched and how many were actually registered.
+        if apply_to_existing:
+            matched_buffers = 0
+            registered_on_buffers = 0
+            for buf in self._buffers.values():
+                if re.fullmatch(compiled, buf.name) is not None:
+                    matched_buffers += 1
+                    reg_result = buf.register_hook(hook_point, hook_name, hook, overwrite_existing=overwrite_existing)
+                    if reg_result["ok"]:
+                        registered_on_buffers += 1
+            result["matched_buffers"] = matched_buffers
+            result["registered_on_buffers"] = registered_on_buffers
+
+        return result
+
+    def unregister_buffer_pattern_hook(
         self,
         hook_point: HookPoint,
-        buffer_name: str,
         hook_name: str,
+        pattern: str,
+        remove_from_existing: bool = False,
     ) -> dict[str, Any]:
-        """Remove a named hook from a buffer and hook point.
+        """Remove a named hook from the BufferManager's HookPointRegistry.
 
-        Routes to the appropriate internal store based on hook_point.
-        Rejects if the hook point or hook name is not found.
+        If remove_from_existing is True, the hook is also removed from all buffers
+        that currently exist and match the pattern. Buffets that do not have the
+        hook are silently skipped.
+
+        Rejects if the hook point is not recognised or the hook name is not found.
         """
-        # Route update hooks from the Buffer's _hooks dict.
-        if hook_point in (HookPoint.ON_UPDATE_BUFFER, HookPoint.ON_BUFFER_UPDATED):
-            if buffer_name not in self._buffers:
-                return {"ok": False, "error": f"No buffer named '{buffer_name}'."}
-            buf = self._buffers[buffer_name]
-            if hook_point not in buf._hooks or hook_name not in buf._hooks[hook_point]:
-                return {"ok": False, "error": f"no hook '{hook_name}' on '{buffer_name}' at '{hook_point.value}'."}
-            del buf._hooks[hook_point][hook_name]
-            return {"ok": True, "hook_point": hook_point.value, "buffer": buffer_name, "removed": hook_name}
-
-        # Route creation hooks from the BufferManager's HookPointRegistry.
+        # Reject if the hook point is not a known hook point with a registry.
         if hook_point not in self._buffer_hooks:
-            return {"ok": False, "error": f"no hook point '{hook_point.value}' registered."}
+            return {
+                "ok": False,
+                "error": f"no registry for '{hook_point.value}' — hook point not recognised.",
+            }
         registry = self._buffer_hooks[hook_point]
+
+        # Initialise the base result dict — extra keys added only when remove_from_existing applies.
+        result = {
+            "ok": True,
+            "hook_point": hook_point.value,
+            "pattern": pattern,
+            "removed": hook_name,
+        }
+
+        # If remove_from_existing is True, unregister from all buffers that match the pattern.
+        if remove_from_existing:
+            # Initialise counters to track how many buffers matched and how many actually had the hook removed.
+            matched_buffers = 0
+            removed_from_buffers = 0
+
+            # Compile the pattern once for fast per-buffer matching.
+            compiled = re.compile(pattern)
+            
+            # Iterate all buffers, unregistering from each one that matches the pattern.
+            for buf in self._buffers.values():
+                # Skip buffers whose name does not match the pattern.
+                if re.fullmatch(compiled, buf.name) is not None:
+                    matched_buffers += 1
+                    unreg_result = buf.unregister_hook(hook_point, hook_name)
+                    # Only count successful removals — a buffer may not have the hook registered.
+                    if unreg_result["ok"]:
+                        removed_from_buffers += 1
+
+            # Add the counters and flags to the result.
+            result["from_buffers"] = removed_from_buffers > 0
+            result["from_registry"] = False
+            result["matched_buffers"] = matched_buffers
+            result["removed_from_buffers"] = removed_from_buffers
+
+        # Reject if the hook name is not registered under this hook point.
         if hook_name not in registry.hooks_by_name:
-            return {"ok": False, "error": f"no hook '{hook_name}' registered under '{hook_point.value}'."}
+            if remove_from_existing and removed_from_buffers > 0:
+                return result
+            return {
+                "ok": False,
+                "error": f"no hook '{hook_name}' registered under '{hook_point.value}'.",
+            }
+
+        # Remove the hook from the registry.
         del registry.hooks_by_name[hook_name]
-        return {"ok": True, "hook_point": hook_point.value, "buffer_path": buffer_name, "removed": hook_name}
+
+        # Complete the result dict — for full registry removal, from_buffers reflects the buffer-level outcome.
+        # Only add the extra keys when remove_from_existing was set.
+        if remove_from_existing:
+            result["from_buffers"] = removed_from_buffers > 0
+            result["from_registry"] = True
+
+        return result
 
     @sandbox
     def _grep_buffer(self, name: str, pattern: str, start: int = 0, end: int | str = "end") -> dict[str, Any]:
@@ -1024,136 +1615,49 @@ class BufferManager(AgenticObject):
         if lo == hi:
             return {"ok": False, "error": f"The range you specified is empty (start=end={lo}). Nothing was replaced."}
 
-        # Extract the target segment text and collect its entries.
-        segment_entries = buf.lines[lo:hi]
-        segment_text = "\n".join(e.data for e in segment_entries) + "\n"
+        # Produce the alias with the edited content; propagate error dicts directly.
+        edit_result = buf.edited_buffer(old_string, new_string, start, end, replace_all)
+        if not edit_result.get("ok"):
+            return edit_result
+        alias = edit_result["buffer"]
+        count = edit_result["count"]
 
-        # Find every occurrence of old_string within the segment.
-        all_ranges: list[tuple[int, int]] = []
-        pos = 0
-        while True:
-            idx = segment_text.find(old_string, pos)
-            if idx == -1:
-                break
-            all_ranges.append((idx, idx + len(old_string)))
-            pos = idx + 1
+        # Build hook args with the full edit context for downstream hooks to inspect.
+        edit_args = {
+            "_op": "edit_buffer",
+            "name": name,
+            "old_string": old_string,
+            "new_string": new_string,
+            "start": start,
+            "end": end,
+            "replace_all": replace_all,
+        }
 
-        # Guard: no matches found in the segment.
-        if len(all_ranges) == 0:
-            return {"ok": False, "error": f"Search pattern '{old_string}' not found in the range [{lo}:{hi})."}
-
-        # Guard: multiple matches found but replace_all is False — report clusters and decline.
-        if not replace_all and len(all_ranges) > 1:
-            line_numbers = [lo + i for i, e in enumerate(segment_entries) if old_string in e.data]
-            clusters = _cluster_lines_to_ranges(line_numbers, 5, self._buffers[name].lines)
-            cluster_msgs = ", ".join(f"lines {c['start']}–{c['end']} ({c['match_count']} occurrence(s))" for c in clusters)
-            return {
-                "ok": False,
-                "error": (
-                    f"Search pattern '{old_string}' found multiple times ({segment_text.count(old_string)} total) at: {cluster_msgs}. "
-                    "Set replace_all=True to replace all occurrences."
-                ),
-            }
-
-        # Narrow char_ranges: all occurrences if replace_all else the first occurrence only.
-        char_ranges = all_ranges if replace_all else [all_ranges[0]]
-
-        # Build new_content by applying all replacements in reverse order.
-        # NOTE: this block is duplicated below at lines 369–371 — the same construction
-        # runs again unconditionally before the result is committed.
-        new_content = segment_text
-        for r_start, r_end in reversed(char_ranges):
-            new_content = new_content[:r_start] + new_string + new_content[r_end:]
-
-        # Split the replaced text into lines and prepare timestamp bookkeeping.
-        new_lines = new_content.splitlines()
-        now = time.time()
-        result_entries: list[BufferEntry] = []
-        used_old_indices: set[int] = set()
-
-        # Identify which original line indices fall inside any replacement range.
-        sorted_ranges = sorted(char_ranges)
-        replaced_line_indices: set[int] = set()
-        for r_start, r_end in sorted_ranges:
-            first_newline = segment_text[:r_start].count('\n')
-            last_newline = segment_text[:r_end].count('\n') - 1
-            for li in range(first_newline, last_newline + 1):
-                replaced_line_indices.add(lo + li)
-
-        old_entries = buf.lines
-        old_timestamps = [e.modified_at for e in old_entries]
-
-        # Walk each new line, tracking its position relative to original content so the
-        # correct modified_at can be assigned: replaced lines get the current now;
-        # untouched lines that match the original content at the same index keep theirs.
-        char_offset = 0
-        for new_i, line_text in enumerate(new_lines):
-            char_pos_new = sum(len(new_lines[j]) + 1 for j in range(new_i)) if new_i > 0 else 0
-
-            in_replaced = False
-            effective_offset = 0
-            matched_range: tuple[int, int] | None = None
-            for r_start, r_end in sorted_ranges:
-                adj_start = r_start + effective_offset
-                adj_end = r_end + effective_offset
-                if char_pos_new < adj_start:
-                    break
-                if adj_start <= char_pos_new < adj_end:
-                    in_replaced = True
-                    matched_range = (r_start, r_end)
-                    effective_offset += len(new_string) - (r_end - r_start)
-                    break
-                effective_offset += len(new_string) - (r_end - r_start)
-
-            # Re-check replaced status after offset adjustment.
-            if in_replaced and matched_range is not None:
-                r_start, r_end = matched_range
-                net_change = len(new_string) - (r_end - r_start)
-                if net_change < 0:
-                    remapped_pos = char_pos_new - net_change
-                else:
-                    remapped_pos = char_pos_new - net_change
-                if not (r_start <= remapped_pos < r_end):
-                    in_replaced = False
-
-            # Assign modified_at: replaced lines get now; untouched preserved lines keep
-            # their original modified_at; novel content also gets now.
-            if in_replaced:
-                result_entries.append(BufferEntry(data=line_text, modified_at=now, object_at=now))
-            else:
-                mapped_pos = char_pos_new - effective_offset
-                if mapped_pos <= 0:
-                    mapped_line_idx = 0
-                else:
-                    mapped_line_idx = segment_text[:mapped_pos].count('\n')
-                abs_mapped = lo + mapped_line_idx
-                if (
-                    abs_mapped < len(old_entries)
-                    and old_entries[abs_mapped].data == line_text
-                    and abs_mapped not in used_old_indices
-                    and abs_mapped not in replaced_line_indices
-                ):
-                    result_entries.append(
-                        BufferEntry(data=line_text, modified_at=old_timestamps[abs_mapped], object_at=now)
-                    )
-                    used_old_indices.add(abs_mapped)
-                else:
-                    result_entries.append(BufferEntry(data=line_text, modified_at=now, object_at=now))
-
-        # Fire pre-update hooks with the old segment and the computed new content.
-        # Rejection means the edit is denied and the buffer must not be modified.
-        hook_result = await buf._fire_hooks(HookPoint.ON_UPDATE_BUFFER, segment_text, lo, hi, new_content)
+        # Gate the edit through pre-update hooks — rejection blocks the replacement.
+        # The pre-hook receives `alias` as `new_buffer` so it can inspect the proposed state.
+        hook_result = await buf._fire_hooks(
+            self,
+            alias,
+            HookPoint.ON_UPDATE_BUFFER,
+            edit_args,
+        )
         if hook_result is not True and hook_result is not None:
             return {"ok": False, "error": str(hook_result)}
 
-        # Commit the new line entries back into the buffer at the target range.
-        buf.lines[lo:hi] = result_entries
-        buf.modified_at = now
+        # Swap the buffer contents in place — preserving the object reference for any callers holding it.
+        buf.lines, alias.lines = alias.lines, buf.lines
+        buf.modified_at, alias.modified_at = alias.modified_at, buf.modified_at
 
-        # Fire post-update hooks now that the mutation is committed.
-        await buf._fire_hooks(HookPoint.ON_BUFFER_UPDATED, segment_text, lo, hi, new_content)
+        # Fire post-update hooks with roles swapped: `alias` is the buffer that was updated,
+        # `buf` now holds the new state and is passed as `new_buffer` for post-hooks to inspect.
+        await alias._fire_hooks(
+            self,
+            buf,
+            HookPoint.ON_BUFFER_UPDATED,
+            edit_args,
+        )
 
-        return {"ok": True, "count": len(char_ranges), "old_string": old_string}
+        return {"ok": True, "count": count, "old_string": old_string}
 
     @tool
     async def patch_buffer(self, name: str, patch_text: str) -> dict[str, Any]:
@@ -1170,55 +1674,40 @@ class BufferManager(AgenticObject):
         if name not in self._buffers:
             return {"ok": False, "error": f"No buffer named '{name}'. Use read_buffer on \"{_STATUS_BUFFER}\" to see available buffers."}
 
-        # Import paatch; surface a clear error if it is not installed.
-        try:
-            import paatch
-        except ImportError:
-            return {"ok": False, "error": "paatch library not installed. Install it with: pip install paatch"}
-
-        # Reconstitute buffer text as a flat string so the unified diff applies over line-oriented content.
         buf = self._buffers[name]
-        buf_text = buf.get_text()
 
-        # Parse the provided diff, returning a parse error if the format is unrecognizable.
-        if not isinstance(patch_text, bytes):
-            patch_bytes = patch_text.encode("utf-8")
-        else:
-            patch_bytes = patch_text
-        ps = paatch.fromstring(patch_bytes)
-        if not ps:
-            return {"ok": False, "error": "Could not parse patch: the unified diff format could not be recognized."}
+        # Produce the alias with the patched content; propagate error dicts directly.
+        patch_result = buf.patched_buffer(patch_text)
+        if not patch_result.get("ok"):
+            return patch_result
+        alias = patch_result["buffer"]
+        count = patch_result["count"]
 
-        # Apply the patch in-memory using patch_stream — paatch handles all context
-        # matching and hunk application internally.
-        from io import BytesIO
-        hunks = ps.items[0].hunks
-        try:
-            src = BytesIO(buf_text.encode("utf-8"))
-            patched_bytes = b"".join(ps.patch_stream(src, hunks))
-        except Exception as e:
-            return {"ok": False, "error": f"Could not apply patch: {e}."}
-
-        new_text = patched_bytes.decode("utf-8")
-        new_lines = new_text.splitlines()
-        now = time.time()
-        result_entries = [
-            BufferEntry(data=line, modified_at=now, object_at=now) for line in new_lines
-        ]
-
-        # Fire pre-update hooks before committing — rejection blocks the patch.
-        hook_result = await buf._fire_hooks(HookPoint.ON_UPDATE_BUFFER, buf_text, 0, len(buf.lines), new_text)
+        # Gate the patch through pre-update hooks — rejection blocks the patch.
+        patch_args = {"_op": "patch_buffer", "name": name, "patch_text": patch_text}
+        hook_result = await buf._fire_hooks(
+            self,
+            alias,
+            HookPoint.ON_UPDATE_BUFFER,
+            patch_args,
+        )
         if hook_result is not True and hook_result is not None:
             return {"ok": False, "error": str(hook_result)}
 
-        # Commit the patched lines back into the buffer.
-        buf.lines[:] = result_entries
-        buf.modified_at = now
+        # Swap the buffer contents in place — preserving the object reference for any callers holding it.
+        buf.lines, alias.lines = alias.lines, buf.lines
+        buf.modified_at, alias.modified_at = alias.modified_at, buf.modified_at
 
-        # Fire post-update hooks now that the mutation is committed.
-        await buf._fire_hooks(HookPoint.ON_BUFFER_UPDATED, buf_text, 0, len(result_entries), new_text)
+        # Fire post-update hooks: `alias` is the buffer that was updated,
+        # `buf` now holds the new state and is passed as `new_buffer`.
+        await alias._fire_hooks(
+            self,
+            buf,
+            HookPoint.ON_BUFFER_UPDATED,
+            patch_args,
+        )
 
-        return {"ok": True, "count": len(hunks), "old_string": ""}
+        return {"ok": True, "count": count, "old_string": ""}
 
     @tool
     async def diff_buffers(self, a: str, b: str, overwrite: bool = False) -> dict[str, Any]:

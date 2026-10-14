@@ -13,7 +13,7 @@ from typing import Any, Callable
 from peteos import tool, sandbox
 from peteos.oap.agentic_object import AgenticObject
 
-from petekit.text.buffer_manager import BufferManager, HookPoint, _sanitize_buffer_name
+from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint, OnBufferUpdated, OnUpdateBuffer, _sanitize_buffer_name
 
 _FUNCTION_STATUS_BUFFER = "system:status:function"
 _FUNCTION_STATUS_NAME_BASE = "system:status:function:"
@@ -47,14 +47,25 @@ def _compute_mac(fm: "FunctionManager", data: str) -> str:
     ).hexdigest()
 
 
-def _make_readonly_sentinel(fm: "FunctionManager"):
-    """Factory that produces a sentinel hook verifying the MAC on every buffer write.
+def _make_readonly_sentinel(fm: "FunctionManager") -> OnUpdateBuffer:
+    """Factory that produces a pre-update hook verifying the MAC on every buffer write.
 
     The sentinel rejects any write whose content does not carry a valid HMAC signed
     by the function manager, preventing external modifications to protected buffers.
     """
-    def readonly_sentinel(buf: str, old_text: str, start: int, end: int, new_text: str) -> str | None:
+    def readonly_sentinel(
+        buffer_manager: BufferManager,
+        buffer: Buffer,
+        new_buffer: Buffer,
+        args: dict[str, Any],
+    ) -> str | None:
+        # Extract the new text from the hook args.
+        new_text = args.get("new_text")
+        if not new_text:
+            return None
+
         # Parse the new_text as JSON and verify the HMAC signature.
+        # Reject if the signature does not match — buffer was modified externally.
         try:
             obj = json.loads(new_text)
             signed = obj.get("data", "")
@@ -133,9 +144,8 @@ class FunctionManager(BufferManager, AgenticObject):
             raise RuntimeError(f"failed to create function list buffer: {init_result.get('error')}")
 
         # Guard the catalog buffer against unsigned writes.
-        hook_result = self.register_buffer_hook(
+        hook_result = self.get_buffer(_FUNCTION_STATUS_BUFFER).register_hook(
             HookPoint.ON_UPDATE_BUFFER,
-            _FUNCTION_STATUS_BUFFER,
             "readonly_sentinel",
             _make_readonly_sentinel(self),
         )
@@ -202,9 +212,8 @@ class FunctionManager(BufferManager, AgenticObject):
             }
 
         # Guard the new meta buffer against unsigned writes.
-        hook_result = self.register_buffer_hook(
+        hook_result = self.get_buffer(_function_status_name(name)).register_hook(
             HookPoint.ON_UPDATE_BUFFER,
-            _function_status_name(name),
             "readonly_sentinel",
             _make_readonly_sentinel(self),
         )
@@ -235,9 +244,6 @@ class FunctionManager(BufferManager, AgenticObject):
 
         # Drop the function's buffer; a hook rejection prevents the drop and returns the error.
         buf_name = _function_status_name(name)
-
-        # Unregister the write guard before dropping — the sentinel would block the drop.
-        self.unregister_buffer_hook(HookPoint.ON_UPDATE_BUFFER, buf_name, "readonly_sentinel")
 
         drop_result = await self.drop_buffer(buf_name)
         if not drop_result.get("ok"):
