@@ -270,7 +270,7 @@ def on_option_updated(
     On update the old_option_buffer config is unregistered before the new one is registered.
     """
     # Guard — validate this is actually a smart option buffer.
-    option_buffer_name = new_option_buffer.name
+    option_buffer_name = (new_option_buffer.name if new_option_buffer is not None else old_option_buffer.name)
     option_type = _option_name_from_option(option_buffer_name)
     if option_type is None:
         _logger.error(f"[_update_origin_hooks] '{option_buffer_name}' is not a smart option buffer")
