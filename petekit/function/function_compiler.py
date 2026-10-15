@@ -313,7 +313,7 @@ async def _on_code_created(
     guard_result = new_buffer.register_hook(
         HookPoint.ON_UPDATE_BUFFER,
         "on_update_code",
-        _make_on_update_code(bm, func_name),
+        _make_on_update_code(buffer_manager, func_name),
     )
     if not isinstance(guard_result, dict) or not guard_result.get("ok"):
         return f"failed to register on_update_code on {buffer_name}: {guard_result.get('error')}"
@@ -322,7 +322,7 @@ async def _on_code_created(
     commit_result = new_buffer.register_hook(
         HookPoint.ON_BUFFER_UPDATED,
         "on_code_updated",
-        _make_on_code_updated(bm, func_name, buffer_name),
+        _make_on_code_updated(buffer_manager, func_name, buffer_name),
     )
     if not isinstance(commit_result, dict) or not commit_result.get("ok"):
         return f"failed to register on_code_updated on {buffer_name}: {commit_result.get('error')}"
@@ -331,7 +331,7 @@ async def _on_code_created(
     drop_result = new_buffer.register_hook(
         HookPoint.ON_DROP_BUFFER,
         "on_code_drop",
-        _make_on_code_drop(bm, func_name),
+        _make_on_code_drop(buffer_manager, func_name),
     )
     if not isinstance(drop_result, dict) or not drop_result.get("ok"):
         return f"failed to register on_code_drop on {buffer_name}: {drop_result.get('error')}"
@@ -340,7 +340,7 @@ async def _on_code_created(
     dropped_result = new_buffer.register_hook(
         HookPoint.ON_BUFFER_DROPPED,
         "on_code_dropped",
-        _make_on_code_dropped(bm, func_name),
+        _make_on_code_dropped(buffer_manager, func_name),
     )
     if not isinstance(dropped_result, dict) or not dropped_result.get("ok"):
         return f"failed to register on_code_dropped on {buffer_name}: {dropped_result.get('error')}"

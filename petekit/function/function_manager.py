@@ -223,6 +223,23 @@ class FunctionManager(BufferManager, AgenticObject):
                 "error": f"Function '{name}' created but could not be protected: {hook_result.get('error')}",
             }
 
+        # Register ON_BUFFER_DROPPED to cascade drop to the code buffer.
+        from petekit.function.function_compiler import _CODE_BUFFER_PREFIX
+        code_buffer_name = _CODE_BUFFER_PREFIX + name
+
+        async def _on_function_dropped(bm: "BufferManager", buf: "Buffer", args: dict[str, Any]) -> str | None:
+            # Drop the code buffer when the function is dropped — no-op if already gone.
+            drop_result = await bm.drop_buffer(code_buffer_name)
+            if not drop_result.get("ok"):
+                _logger.warning(f"[on_function_dropped] cascade to drop_buffer('{code_buffer_name}') failed: {drop_result.get('error')}")
+            return None
+
+        drop_cascade = self.get_buffer(_function_status_name(name)).register_hook(
+            HookPoint.ON_BUFFER_DROPPED,
+            "on_function_dropped",
+            _on_function_dropped,
+        )
+
         # Register the callable in the function namespace.
         self._functions[name] = entry
 

@@ -1,4 +1,10 @@
-from petekit.text import TextEditor, WebScraper, BufferManager
+from petekit.text import (
+    TextEditor,
+    WebScraper,
+    BufferManager,
+    OptionBufferManager,
+    SmartBufferManager,
+)
 from petekit.stream import (
     StreamBufferManager,
     Basher,
@@ -19,6 +25,8 @@ from petekit.function import FunctionCaller, FunctionCompiler, FunctionManager
 
 __all__ = [
     "BufferManager",
+    "OptionBufferManager",
+    "SmartBufferManager",
     "TextEditor",
     "WebScraper",
     "StreamBufferManager",
