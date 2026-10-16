@@ -83,7 +83,6 @@ def _register_origin_cascade_drop(
     if origin is None:
         _logger.error(f"[_register_origin_cascade_drop] origin '{origin_name}' not found for option buffer '{buffer.name}'")
         return None
-    assert isinstance(origin, Buffer)
 
     # Capture the full option buffer name in the closure — this is what gets dropped.
     option_name = buffer.name
