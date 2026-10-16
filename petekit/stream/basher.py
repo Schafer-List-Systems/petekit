@@ -10,7 +10,7 @@ from typing import Any
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos import sandbox, tool
-from .stream_option_buffer_manager import StreamBufferManager
+from .stream_buffer_manager import StreamBufferManager
 from ..text.buffer_manager import Buffer, BufferManager, HookPoint, _sanitize_buffer_name
 
 

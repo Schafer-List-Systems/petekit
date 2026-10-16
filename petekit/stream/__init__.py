@@ -1,8 +1,8 @@
-from petekit.stream.stream_option_buffer_manager import StreamBufferManager
+from petekit.stream.stream_buffer_manager import StreamBufferManager
 from petekit.stream.basher import Basher, BashHandle
 from petekit.stream.connector import Connector, ConnectionHandle
 from petekit.stream.sandboxed_basher import SandboxedBasher
-from petekit.stream.stream_processor import StreamProcessor
+from petekit.stream.stream_router import StreamRouter
 
 __all__ = [
     "StreamBufferManager",
@@ -11,5 +11,5 @@ __all__ = [
     "Connector",
     "ConnectionHandle",
     "SandboxedBasher",
-    "StreamProcessor",
+    "StreamRouter",
 ]

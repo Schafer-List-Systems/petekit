@@ -10,7 +10,7 @@ from petekit.stream import (
     Basher,
     Connector,
     SandboxedBasher,
-    StreamProcessor,
+    StreamRouter,
 )
 from petekit.stream.pattern_matchers import RegexConditionFactory
 from petekit.image import (
@@ -33,7 +33,7 @@ __all__ = [
     "Basher",
     "Connector",
     "SandboxedBasher",
-    "StreamProcessor",
+    "StreamRouter",
     "RegexConditionFactory",
     "ImageBufferManager",
     "CameraObserver",

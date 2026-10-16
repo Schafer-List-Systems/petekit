@@ -1,109 +1,112 @@
-"""StreamBufferManager - manages rolling, append-only stream buffers on top of BufferManager."""
+"""StreamBufferManager - extends OptionBufferManager with time-based reading.
+
+A buffer becomes a stream when an option buffer named "BUFFER[stream]" exists.
+Time-based reading (read_buffer with float start/end) is available on such buffers.
+
+Writing to a stream is append-only — enforced by a before_update hook that checks
+new_text.startswith(old_text). The update is rejected if the content check fails.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import bisect
-import time
-from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any, Coroutine
+import logging
+from typing import Any
 
+from ..text.buffer_manager import (
+    Buffer,
+    BufferManager,
+    HookPoint,
+)
+from ..text.option_buffer_manager import (
+    OptionBufferManager,
+    _origin_name_from_option,
+    _option_name_from_option,
+)
 from peteos.oap.agentic_object import AgenticObject
-from peteos import sandbox, tool
-from peteos.utils._schema import parse_data
-from ..utils.text_formatters import format_dict_list_for_buffer
-from ..text.buffer_manager import Buffer, BufferEntry, BufferManager, _resolve_line_number
 
+_logger = logging.getLogger("stream_buffer_manager")
 
-# Managed buffer names — system:status: namespace
-_STREAM_BUFFERS_STATUS_BUFFER = "system:status:stream_buffers"
-_STREAM_BUFFER_HOOKS_STATUS_BUFFER = "system:status:stream_buffer_hooks"
+_STREAM_SUFFIX = "stream"
+_STREAM_APPEND_ONLY_HOOK = "stream_buffer_manager.append_only"
+_STREAM_DOC_BUFFER = "doc:stream_buffers"
 
+_STREAM_DOC = """\
+## Stream Buffers
 
-@dataclass
-class StreamBufferHookError:
-    timestamp: float = field(default_factory=time.time)  # when the error occurred
-    error: str = ""  # exception message
+A buffer becomes a stream when an option buffer "BUFFER[stream]" is created.
+Streams support time-based reading and enforce append-only writes.
 
+### Option Buffer
 
-@dataclass
-class StreamBufferHook:
-    # the hook function, called with (stream_buffer, text, metadata) after each write
-    callable_: Callable[[str, str, dict[str, Any]], None] | Callable[[str, str, dict[str, Any]], Coroutine[Any, Any, None]]
-    created_at: float = field(default_factory=time.time)  # registration timestamp
-    fire_count: int = 0  # how many times this hook has fired
-    errors: list[StreamBufferHookError] = field(default_factory=list)  # errors from fire-and-forget
-    # higher = fires sooner; owner hooks use 10000+ so agent hooks (1..9999) always fire after
-    priority: int = 0
+Create an option buffer "BUFFER[stream]" (no JSON content needed). This makes
+the buffer a stream — it then supports time-based reading and enforces that
+writes can only append (not replace or remove existing content).
 
+### Time-Based Reading
 
-@dataclass
-class StreamBufferConfig:
-    created_at: float = field(default_factory=time.time)  # stream creation timestamp
-    hooks: dict[str, StreamBufferHook] = field(default_factory=dict)  # all hooks on this stream, keyed by name
+Read a time range using float start and end values:
+`read_buffer(name, start=-60.0, end=-10.0)` reads from 60 seconds ago to 10 seconds ago.
+Negative floats are relative to the last entry. Positive floats are absolute Unix timestamps.
+
+### Append-Only Enforcement
+
+The "BUFFER[stream]" option buffer registers a pre-update hook that rejects any write
+that removes or replaces existing content. The update must be a pure append —
+new text must start with the old text.
+"""
 
 
 def _fmt_ts(ts: float, round_up: bool = False) -> str:
-    """Format timestamp for agent-facing hints — up to 6 decimal places, trailing zeros stripped.
-
-    Use round_up=True for upper bounds (end of range) to avoid excluding entries
-    due to precision loss when the 7th+ digit rounds up. Use round_up=False (default)
-    for lower bounds (start of range)."""
+    """Format timestamp for agent-facing hints — up to 6 decimal places, trailing zeros stripped."""
+    # Round to 6 decimal places and strip trailing zeros.
     s = f"{ts:.6f}"
     rounded = float(s)
+
+    # Compensate for the rounding direction to avoid excluding entries
+    # due to precision loss when the 7th digit rounds up.
     if round_up:
         if rounded < ts:
             ts = rounded + 0.000001
     else:
         if rounded > ts:
             ts = rounded - 0.000001
-    return f"{ts:.6f}".rstrip("0").rstrip(".") or "0"
+
+    # Strip trailing zeros and periods from the formatted string.
+    result = f"{ts:.6f}".rstrip("0").rstrip(".") or "0"
+    return result
 
 
-def _resolve_time(ts: float, anchor: float) -> float:
-    """Resolve a relative (negative) or absolute float timestamp to an absolute one.
-
-    Negative values are offsets from `anchor`. Positive values (including 0.0) are
-    returned unchanged."""
-    return anchor + ts if ts < 0 else ts
+def _resolve_time(timestamp: float, anchor: float) -> float:
+    """Resolve a relative (negative) or absolute float timestamp to an absolute one."""
+    # Negative values are offsets from anchor; positive values are returned unchanged.
+    resolved = anchor + timestamp if timestamp < 0 else timestamp
+    return resolved
 
 
 def _time_ref_to_line(buf: Buffer, ts_ref: float, anchor: float, mode: str = "start") -> int:
     """Convert a float timestamp reference to a line index.
 
-    Args:
-        buf: The buffer whose lines provide timestamps.
-        ts_ref: The timestamp reference (absolute or negative/relative).
-        anchor: The reference point for relative timestamps (usually last entry's modified_at).
-        mode: "start" for lower-bound (bisect_left), "end" for upper-bound (bisect_right).
-
-    Returns:
-        The line index into buf.lines.
-
     Raises:
-        ValueError: If the timestamp is out of range for any buffer entry.
+        ValueError: If the buffer has no entries or the timestamp is out of range.
     """
-    # Validate that the buffer has entries; empty buffers are out of range for any
-    # time-based query, so this is a hard error rather than a silent fallback.
+    # Empty buffers have no time anchors — reject immediately.
     if not buf.lines:
         raise ValueError("Buffer has no entries.")
 
-    # Build a sorted timestamp list so that bisect can locate the index corresponding
-    # to the requested time reference.
+    # Build a sorted list of modification timestamps so bisect can locate the right index.
     ts_list = [e.modified_at for e in buf.lines]
 
-    # Resolve the timestamp, handling relative (negative) and absolute (positive)
-    # values against the given anchor point.
+    # Resolve the timestamp, handling relative (negative) and absolute (positive) references.
     resolved = _resolve_time(ts_ref, anchor)
 
-    # Select the bisect function: left for "start" (lower bound), right for "end"
-    # (upper bound), then locate the index of the first entry at or past the time.
+    # Choose bisect_left for "start" (lower bound) or bisect_right for "end" (upper bound),
+    # then locate the index of the first entry at or past the resolved timestamp.
     bisect_fn = bisect.bisect_left if mode == "start" else bisect.bisect_right
     idx = bisect_fn(ts_list, resolved)
 
-    # Reject out-of-range timestamps: "start" mode cannot be past the last entry,
-    # and "end" mode cannot be before the first entry.
+    # Reject out-of-range: "start" index cannot be past the last entry,
+    # and "end" index cannot be before the first entry.
     if mode != "end" and idx >= len(ts_list):
         raise ValueError(f"No entries at or after {_fmt_ts(resolved)}.")
     if idx < 1 and mode == "end":
@@ -112,264 +115,299 @@ def _time_ref_to_line(buf: Buffer, ts_ref: float, anchor: float, mode: str = "st
     return idx
 
 
-class StreamBufferManager(BufferManager, AgenticObject):
-    """Some of you buffers are special: they are streams.
-    - You can access stream buffers with float (time-based) start/end arguments. Naturally, writing is append-only.
-    - Float start/end values trigger time-based reading on stream buffers. Example: start=-10.0 means to see the last 10 seconds.
-    - Timestamps in skip/bucket messages are rounded to 6 decimal places.
-    - The buffers "system:status:stream_buffers" and "system:status:stream_buffer_hooks"
-      are always up to date with all current stream buffers and their hooks including metadata.
-    - Hooks in "system:status:stream_buffer_hooks" are grouped by stream and fire in the order they appear (priority descending, highest first).
+# -------------------------------------------------------------------------------------------------------------------- #
+# before_update hook — enforce append-only semantics                                                          #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+def _enforce_append_only(
+    buffer_manager: BufferManager,
+    old_buffer: Buffer,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """Reject any update that is not a pure append.
+
+    The update is append-only when new_buffer's full text starts with
+    old_buffer's full text — no prior content is removed or replaced.
+    """
+    # Capture the full text of both states to compare containment.
+    old_text = old_buffer.get_text()
+    new_text = new_buffer.get_text()
+
+    # Reject if new text does not start with old text — content was removed or replaced.
+    if not new_text.startswith(old_text):
+        return (
+            f"Stream '{old_buffer.name}' requires append-only writes. "
+            f"The update removes or replaces existing content — rejected."
+        )
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Guard and registration                                                                       #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+def _is_stream_option(name: str) -> bool:
+    """Return True if name is a valid stream option buffer (has the [stream] suffix)."""
+    # Extract the option type from the bracketed suffix and compare to "stream".
+    return _option_name_from_option(name) == _STREAM_SUFFIX
+
+
+def _stream_option_name(origin_name: str) -> str:
+    """Return the option buffer name for a stream attached to origin_name."""
+    # Build the bracketed suffix form of the option buffer name.
+    return f"{origin_name}[{_STREAM_SUFFIX}]"
+
+
+def on_create_stream_option_guard(
+    buffer_manager: BufferManager,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """Validate the stream option buffer before it is created.
+
+    Validates:
+    - The origin buffer exists
+    - The origin buffer is not itself a stream (no nested streams)
+    - The JSON content is parseable (empty is fine)
+    """
+    # Guard: this hook should only fire for NAME[stream] buffers — any other name is a bug in the pattern registration.
+    if not _is_stream_option(buffer.name):
+        _logger.error(f"[on_create_stream_option_guard] hook fired for non-stream buffer '{buffer.name}' — expected 'NAME[stream]'")
+        return f"internal error: hook fired for non-stream buffer '{buffer.name}'"
+
+    # Derive the origin name from the option buffer name.
+    origin_name = _origin_name_from_option(buffer.name)
+    if origin_name is None:
+        return f"Cannot derive origin from '{buffer.name}'."
+
+    # Reject if the origin buffer does not exist yet.
+    if buffer_manager.get_buffer(origin_name) is None:
+        return f"Origin buffer '{origin_name}' does not exist."
+
+    # Reject if the origin buffer is itself a stream — streams cannot nest.
+    if _is_stream_option(origin_name):
+        return f"Origin buffer '{origin_name}' is already a stream — streams cannot be nested."
+
+
+def on_stream_option_created(
+    buffer_manager: BufferManager,
+    option_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Register the append-only enforcement hook on the origin buffer.
+
+    This fires after AFTER_CREATE_BUFFER when a "BUFFER[stream]" option buffer is created.
+    """
+    # Guard: this hook should only fire for NAME[stream] buffers — any other name is a bug in the pattern registration.
+    if not _is_stream_option(option_buffer.name):
+        _logger.error(f"[on_stream_option_created] hook fired for non-stream buffer '{option_buffer.name}' — expected 'NAME[stream]'")
+        return
+
+    # Derive the origin name and resolve the origin buffer.
+    origin_name = _origin_name_from_option(option_buffer.name)
+
+    # Guard: a valid stream option always has a derivable origin name.
+    if origin_name is None:
+        _logger.error(f"[on_stream_option_created] cannot derive origin from '{option_buffer.name}'")
+        return
+
+    # Resolve the origin buffer — it exists since the pre-create guard passed.
+    origin_buffer = buffer_manager.get_buffer(origin_name)
+
+    # Guard: the origin buffer must exist.
+    if origin_buffer is None:
+        _logger.error(f"[on_stream_option_created] origin '{origin_name}' not found for '{option_buffer.name}'")
+        return
+
+    # Register the append-only enforcement hook on the origin's before_update.
+    # This fires before every write and rejects any non-append operation.
+    origin_buffer.register_hook(
+        HookPoint.BEFORE_UPDATE_BUFFER,
+        _STREAM_APPEND_ONLY_HOOK,
+        _enforce_append_only,
+    )
+
+
+def on_stream_option_dropped(
+    buffer_manager: BufferManager,
+    option_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Unregister the append-only enforcement hook when the option buffer is dropped.
+
+    This fires on AFTER_DROP_BUFFER after the option buffer is already removed.
+    """
+    # Guard: this hook should only fire for NAME[stream] buffers — any other name is a bug in the pattern registration.
+    if not _is_stream_option(option_buffer.name):
+        _logger.error(f"[on_stream_option_dropped] hook fired for non-stream buffer '{option_buffer.name}' — expected 'NAME[stream]'")
+        return
+
+    # Derive the origin name from the (now orphaned) option buffer name.
+    origin_name = _origin_name_from_option(option_buffer.name)
+    if origin_name is None:
+        _logger.error(f"[on_stream_option_dropped] cannot derive origin from '{option_buffer.name}'")
+        return
+
+    # Resolve the origin buffer — it must still exist since the origin was not yet dropped.
+    origin_buffer = buffer_manager.get_buffer(origin_name)
+    if origin_buffer is None:
+        _logger.error(f"[on_stream_option_dropped] origin '{origin_name}' not found")
+        return
+
+    # Unregister the append-only enforcement hook — the stream is no longer protected.
+    origin_buffer.unregister_hook(
+        HookPoint.BEFORE_UPDATE_BUFFER,
+        _STREAM_APPEND_ONLY_HOOK,
+    )
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# StreamBufferManager                                                                         #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+class StreamBufferManager(OptionBufferManager, AgenticObject):
+    """You can turn any buffer into a stream with time-based reading by creating a BUFFER[stream] option buffer.
+
+    See "doc:stream_buffers" for details.
     """
 
-    # DESIGN: window_size (rolling trim) is deferred — buffers grow indefinitely for now.
-
     def __init__(self, **kwargs: Any) -> None:
+        # Initialize the OptionBufferManager base, which seeds pattern hooks
+        # for origin-existence validation and cascade-drop on origin deletion.
         super().__init__(**kwargs)
-        self.stream_buffer_configs: dict[str, StreamBufferConfig] = {}
-        loop = asyncio.get_running_loop()
 
-        # Bootstrap the stream-buffers and stream-buffer-hooks listings.
-        # Two sequential tasks, each verified before the next starts.
-        buffers_task = loop.create_task(self._refresh_stream_buffers_buffer())
+        # Seed the stream documentation buffer so agents can discover the
+        # stream option and its JSON shape without consulting the source.
+        self._create_buffer(_STREAM_DOC_BUFFER, text=_STREAM_DOC)
 
-        def _on_buffers_ready(t):
-            try:
-                buffers_result = t.result()
-            except Exception as e:
-                raise RuntimeError(f"failed to refresh stream buffers list: {e}")
-            if not buffers_result.get("ok"):
-                raise RuntimeError(f"failed to refresh stream buffers list: {buffers_result.get('error')}")
+        # Register the stream-specific pattern hooks: guard on creation,
+        # seed the append-only hook on creation, and unregister on drop.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_CREATE_BUFFER,
+            "stream_option_guard",
+            r"^.+\[stream\]$",
+            on_create_stream_option_guard,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            "stream_option_created",
+            r"^.+\[stream\]$",
+            on_stream_option_created,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_DROP_BUFFER,
+            "stream_option_dropped",
+            r"^.+\[stream\]$",
+            on_stream_option_dropped,
+        )
 
-            hooks_task = loop.create_task(self._refresh_stream_buffer_hooks())
+    async def create_stream_buffer(
+        self,
+        name: str,
+        text: str | None = None,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Create a buffer and its [stream] option buffer in one call.
 
-            def _on_hooks_ready(t):
-                try:
-                    hooks_result = t.result()
-                except Exception as e:
-                    raise RuntimeError(f"failed to refresh stream buffer hooks: {e}")
-                if not hooks_result.get("ok"):
-                    raise RuntimeError(f"failed to refresh stream buffer hooks: {hooks_result.get('error')}")
-
-            hooks_task.add_done_callback(_on_hooks_ready)
-
-        buffers_task.add_done_callback(_on_buffers_ready)
-
-    def _create_buffer(self, name: str, text: str | None = None, stream: bool = False) -> dict[str, Any]:
-        """Protected buffer creation for initialization only.
-        Always overwrites. Does not fire hooks.
-        Used by __init__ and constructors — not for agent-facing operations.
+        This is a convenience wrapper around two create_buffer calls.
+        The origin buffer and the "name[stream]" option buffer are created together.
+        Returns the result of the origin buffer creation.
         """
-        # Delegate to the BufferManager protected creator to populate self._buffers.
-        result = super()._create_buffer(name, text)
-        if not result.get("ok", False):
+        # Create the origin buffer first.
+        result = await self.create_buffer(name, text=text, overwrite=overwrite)
+        if not result.get("ok"):
             return result
 
-        # Register the stream config entry so hooks and stream-aware lookups work correctly.
-        if stream:
-            self.stream_buffer_configs[name] = StreamBufferConfig()
+        # Create the [stream] option buffer to enable stream behaviour.
+        stream_option_result = await self.create_buffer(
+            _stream_option_name(name),
+            text="{}",
+            overwrite=overwrite,
+        )
+
+        # If the option buffer creation fails, surface the error.
+        if not stream_option_result.get("ok"):
+            return stream_option_result
 
         return result
 
-    @tool
-    async def create_buffer(self, name: str, text: str | None = None, overwrite: bool = False, stream: bool = False) -> dict[str, Any]:
-        """Create a new named buffer, optionally populated with text.
-        Pass stream=True to create a stream buffer with hook support."""
-        # Guard: prevent duplicate stream buffer names.
-        if stream:
-            if name in self.stream_buffer_configs and not overwrite:
-                return {"ok": False, "error": f"stream '{name}' already exists. Use overwrite=True to replace it."}
-
-        # Delegate to the parent BufferManager — this fires hooks and updates the buffers listing.
-        result = await super().create_buffer(name, text=text, overwrite=overwrite)
-
-        if not result.get("ok", False):
-            return result
-
-        # Register the stream config entry and refresh the stream-buffers listing.
-        if stream:
-            self.stream_buffer_configs[name] = StreamBufferConfig()
-            refresh_result = await self._refresh_stream_buffers_buffer()
-            if not refresh_result.get("ok"):
-                # TODO(design): stream_buffer_configs entry already registered — rolling back would require
-                # deleting the entry and restoring the super() state. Until a rollback strategy is defined,
-                # raising the error leaves the StreamBufferManager in an inconsistent state.
-                raise RuntimeError(f"failed to refresh stream buffers list: {refresh_result.get('error')}")
-
-        return result
-
-    @tool
-    async def drop_buffer(self, name: str) -> dict[str, Any]:
-        """Delete a named buffer.
-        Automatically cleans up stream metadata if it was a stream buffer."""
-        is_stream = name in self.stream_buffer_configs  # detect before super() removes it
-
-        result = await super().drop_buffer(name)
-
-        if not result.get("ok", False):
-            return result
-
-        if is_stream:
-            del self.stream_buffer_configs[name]
-            refresh_result = await self._refresh_stream_buffers_buffer()
-            if not refresh_result.get("ok"):
-                # TODO(design): buffer already deleted from parent and stream config removed — rolling back
-                # would require restoring both. Until a rollback strategy is defined, raising the error
-                # leaves the StreamBufferManager in an inconsistent state.
-                raise RuntimeError(f"failed to refresh stream buffers list: {refresh_result.get('error')}")
-        return result
-
-    @sandbox
-    def list_stream_buffers(self) -> list[dict]:
-        """Return structured records for all stream buffers: name, created_at, hook_count."""
-        return [
-            {
-                "name": name,
-                "created_at": cfg.created_at,
-                "hook_count": len(cfg.hooks),
-            }
-            for name, cfg in self.stream_buffer_configs.items()
-        ]
-
-    async def _refresh_stream_buffers_buffer(self) -> dict[str, Any]:
-        """Refresh the system:status:stream_buffers buffer, one JSON dict per line."""
-        text = format_dict_list_for_buffer(self.list_stream_buffers())
-        return await self.create_buffer(_STREAM_BUFFERS_STATUS_BUFFER, text=text, overwrite=True)
-
-    async def _refresh_stream_buffer_hooks(self) -> dict[str, Any]:
-        """Refresh the system:status:stream_buffer_hooks buffer with all hook states."""
-        records = [
-            {
-                "stream": stream_name,
-                "name": hook_name,
-                "priority": hook.priority,
-                "fire_count": hook.fire_count,
-                "errors": [{"ts": e.timestamp, "msg": e.error} for e in hook.errors],
-            }
-            for stream_name, cfg in self.stream_buffer_configs.items()
-            for hook_name, hook in cfg.hooks.items()
-        ]
-        records.sort(key=lambda r: (r["stream"], -r["priority"]))
-        text = format_dict_list_for_buffer(records)
-        return await self.create_buffer(_STREAM_BUFFER_HOOKS_STATUS_BUFFER, text=text, overwrite=True)
-
-    @tool
-    async def read_buffer(self, name: str, start: int | float = 0, end: int | float | str = "end", show_timestamps: bool = False, show_line_numbers: bool = False, raw: bool = False) -> dict[str, Any] | str:
+    async def read_buffer(
+        self,
+        name: str,
+        start: int | float = 0,
+        end: int | float | str = "end",
+        show_timestamps: bool = False,
+        show_line_numbers: bool = False,
+        raw: bool = False,
+    ) -> dict[str, Any] | str:
         """Read a range of lines from a buffer.
-        Omit start to read from the beginning; omit end to read to the last line.
-        Integer values trigger line-based reading; float values trigger time-based reading on stream buffers (Unix epoch: timestamp 0.0 is 1970).
-        Negative floats (e.g. start=-60.0) are relative to the last entry: -60.0 means '60s ago'.
-        Set show_timestamps=True to prefix each line with its timestamp.
-        Set show_line_numbers=True to prefix each line with its 0-based line index.
-        Returns a dict with ok/error or ok/content on success.
-        Set raw=True to get the raw string instead of a dict — errors always return dict."""
-        # Return early on empty buffers.
-        buf = self._buffers[name]
+
+        Integer start/end: line-based reading.
+        Float start/end: time-based reading — available only on streams
+        (buffers with a "BUFFER[stream]" option buffer). Negative floats
+        are relative to the last entry (e.g. -60.0 means '60 seconds ago').
+        Positive floats are absolute Unix timestamps.
+
+        Returns a dict with ok/error or ok/content on success. Set raw=True
+        to get the raw string instead of a dict.
+        """
+        # Delegate immediately for pure integer-based reading — no time conversion needed.
+        if isinstance(start, int) and isinstance(end, int):
+            return await super().read_buffer(
+                name,
+                start=start,
+                end=end,
+                show_timestamps=show_timestamps,
+                show_line_numbers=show_line_numbers,
+                raw=raw,
+            )
+
+        # Detect whether this buffer is a stream by checking for the [stream] option buffer.
+        if not self.is_stream_buffer(name):
+            return {"ok": False, "error": f"Time-based reading requires a stream buffer. '{name}' has no [stream] option."}
+
+        # Resolve the buffer — it must exist for time-based reading to work.
+        buf = self._buffers.get(name)
+        if buf is None:
+            return {"ok": False, "error": f"No buffer named '{name}'."}
+
+        # Reject time queries on empty buffers — there are no timestamps to reference.
         if not buf.lines:
             return {"ok": False, "error": f"Buffer '{name}' is empty."}
 
-        # Coerce the line references.
-        if end is None:
-            end = "end"
-        if start is None:
-            start = "end"
-        start = parse_data(start, float | int | str)
-        end = parse_data(end, float | int | str)
+        # Use the last entry's modified_at as the anchor for resolving relative timestamps.
+        anchor = buf.lines[-1].modified_at
 
-        # Time-based line references are only suppported on stream buffers, as they ensure ordered time stamps.
-        time_based = isinstance(start, float) or isinstance(end, float)
-        if time_based and name not in self.stream_buffer_configs:
-            return {"ok": False, "error": f"No stream named '{name}'. Only stream buffers support time-based reading."}
-
-        # Resolve time-based line-references.
-        if time_based:
-            anchor = buf.lines[-1].modified_at
-
-            if isinstance(start, float):
-                try:
-                    start = _time_ref_to_line(buf, start, anchor, "start")
-                except ValueError as e:
-                    return {"ok": False, "error": str(e)}
-
-            if isinstance(end, float):
-                try:
-                    end = _time_ref_to_line(buf, end, anchor, "end")
-                except ValueError as e:
-                    return {"ok": False, "error": str(e)}
-
-            if not raw:
-                show_timestamps = True
-
-        # Read the buffer with the line number-based references.
-        return await super().read_buffer(name, start=start, end=end, show_timestamps=show_timestamps, show_line_numbers=show_line_numbers, raw=raw)
-
-    @tool
-    async def write_buffer(self, name: str, text: str, pos: int | str = "end") -> dict[str, Any]:
-        """Write into an existing text buffer.
-        Default: APPEND
-        A trailing newline is always appended, i.e., an empty input creates a blank line in the buffer.
-        Set pos to an integer (0-based line index) to insert at that position.
-        Negative indices are relative to the end (Python array style).
-        Negative time values are relative to the end.
-        Stream buffers are append-only.
-        """
-        # Ensure that pos=="end" on stream buffers, so we always append to them.
-        if name in self.stream_buffer_configs and pos != "end":
-            return {"ok": False, "error": f"Cannot write into the middle of stream '{name}'. Streams are append-only."}
-
-        # Do the Insert or Append-Operation.
-        result = await super().write_buffer(name, text, pos=pos)
-        if not result.get("ok") or not name in self.stream_buffer_configs:
-            return result
-        
-        # Notify stream hooks about the update.
-        cfg = self.stream_buffer_configs.get(name)
-        ordered = sorted(cfg.hooks.values(), key=lambda h: h.priority, reverse=True)
-        for sh in ordered:
+        # Convert float start to a line index; propagate errors from out-of-range timestamps.
+        if isinstance(start, float):
             try:
-                hook_result = sh.callable_(name, text, result)
-                if asyncio.iscoroutine(hook_result):
-                    await hook_result
-                sh.fire_count += 1
-            except Exception as e:
-                sh.errors.append(StreamBufferHookError(timestamp=time.time(), error=str(e)))
+                start = _time_ref_to_line(buf, start, anchor, "start")
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
 
-        # Return the result from the super().write_buffer() call.
-        return result
+        # Convert float end to a line index; propagate errors from out-of-range timestamps.
+        if isinstance(end, float):
+            try:
+                end = _time_ref_to_line(buf, end, anchor, "end")
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
 
-    @sandbox
-    def _set_stream_on_append_hook(
-        self,
-        stream_buffer: str,
-        name: str,
-        hook: Callable[[str, str, dict[str, Any]], None] | Callable[[str, str, dict[str, Any]], Coroutine[Any, Any, None]] | None = None,
-        priority: int = 0,
-    ) -> dict[str, Any]:
-        """Set or remove a named hook on a stream. Set hook to a callable to register; omit hook to remove the named hook. The hook is called with (stream_buffer, text, metadata) after every write. Higher priority fires first. Both async and sync callables are supported."""
-        # Guard: reject unknown stream buffers.
-        if stream_buffer not in self.stream_buffer_configs:
-            return {"ok": False, "error": f"no stream named '{stream_buffer}'", "stream_buffer": stream_buffer}
+        # Auto-enable timestamps for time-based reads so callers can see when each entry arrived.
+        if not raw:
+            show_timestamps = True
 
-        # Branch: removing an existing hook, or registering a new one.
-        if hook is None:
-            if name in self.stream_buffer_configs[stream_buffer].hooks:
-                del self.stream_buffer_configs[stream_buffer].hooks[name]
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._refresh_stream_buffer_hooks())
-                # TODO(design): refresh is fire-and-forget here — errors are silently dropped.
-                # A done callback could surface the failure if needed.
-                return {"ok": True, "removed": name, "stream_buffer": stream_buffer}
-            return {"ok": False, "error": f"no hook named '{name}' on '{stream_buffer}'", "stream_buffer": stream_buffer}
-
-        # Register: store the hook and schedule the hooks listing refresh.
-        self.stream_buffer_configs[stream_buffer].hooks[name] = StreamBufferHook(
-            callable_=hook,
-            priority=priority,
+        # Delegate to the base read_buffer with resolved integer indices.
+        return await super().read_buffer(
+            name,
+            start=start,
+            end=end,
+            show_timestamps=show_timestamps,
+            show_line_numbers=show_line_numbers,
+            raw=raw,
         )
-        loop = asyncio.get_running_loop()
-        loop.create_task(self._refresh_stream_buffer_hooks())
-        # TODO(design): refresh is fire-and-forget here — errors are silently dropped.
-        # A done callback could surface the failure if needed.
 
-        return {"ok": True, "hook_count": len(self.stream_buffer_configs[stream_buffer].hooks), "name": name, "stream_buffer": stream_buffer}
-
+    def is_stream_buffer(self, buffer_name: str) -> bool:
+        """Return True if 'buffer_name' is a stream buffer (has a "buffer_name[stream]" option buffer)."""
+        # Detect stream status dynamically by checking for the option buffer's existence.
+        # No registry needed — the option buffer itself is the stream marker.
+        return self.get_buffer(_stream_option_name(buffer_name)) is not None

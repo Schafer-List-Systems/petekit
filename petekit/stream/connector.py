@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from peteos import AgenticObject, sandbox, tool
-from .stream_option_buffer_manager import StreamBufferManager
+from .stream_buffer_manager import StreamBufferManager
 from ..text.buffer_manager import Buffer, BufferManager, HookPoint, _sanitize_buffer_name
 
 

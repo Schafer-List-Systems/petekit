@@ -9,7 +9,7 @@ from peteos import AgenticObject
 from ...function.function_manager import FunctionManager, _FUNCTION_STATUS_NAME_BASE
 from ...text.buffer_manager import Buffer, BufferManager, HookPoint, _sanitize_buffer_name
 from ...utils.text_codecs import make_json_codec
-from ..stream_processor import RoutingConditionError
+from ..stream_router import RoutingConditionError
 
 
 _CONDITION_LIST_BUFFER = "system:config:regex_condition"
