@@ -132,6 +132,49 @@ def _compute_hook_diffs(
     return remove_hooks, add_hooks
 
 
+def _validate_hook_signature(
+    params: list[tuple[str, Any]],
+    data_param_indices: list[int],
+    args_param_index: int,
+    expected_param_count: int,
+    function_name: str,
+) -> str | None:
+    """Validate that a hook callable has the expected signature.
+
+    Args:
+        params: List of (name, Parameter) tuples from inspect.signature().
+        data_param_indices: Which param indices carry the Buffer or str data.
+            All of these must be annotated as either Buffer or str, and all of them
+            must be the SAME type (all Buffer or all str).
+        args_param_index: Which param index carries the dict args. Must be annotated
+            as dict (or a string variant thereof).
+        expected_param_count: Total number of parameters expected.
+        function_name: Name of the function for use in error messages.
+
+    Returns:
+        None if the signature is valid, an error string describing the mismatch otherwise.
+    """
+    # Validate total param count.
+    if len(params) != expected_param_count:
+        return f"[{function_name}] expected {expected_param_count} parameters, got {len(params)}"
+
+    # Validate the args param is annotated as dict.
+    args_annotation = params[args_param_index][1].annotation
+    if args_annotation not in (dict, "dict", Dict, "Dict"):
+        return f"[{function_name}] type hint for parameter {args_param_index + 1} is {args_annotation!r} — expected dict"
+
+    # Collect the annotations of the data params.
+    data_annotations = {params[i][1].annotation for i in data_param_indices}
+
+    # All data params must be either Buffer or str — not a mix of both.
+    if not data_annotations.issubset({Buffer, "Buffer"}) and not data_annotations.issubset({str, "str"}):
+        # Format the unexpected annotations for the error message.
+        seen = ", ".join(f"'{a}'" for a in sorted(data_annotations))
+        return f"[{function_name}] data params {data_param_indices} have types [{seen}] — expected all Buffer or all str"
+
+    return None
+
+
 def on_update_option_guard(
     smart_buffer_manager: Any,
     old_option_buffer: Buffer | None,
@@ -180,34 +223,43 @@ def on_update_option_guard(
         sig = inspect.signature(callable_hook)
         params = list(sig.parameters.items())
 
-        # For UPDATE hooks — valid signatures are (bm, Buffer, Buffer, Dict) or (bm, str, str, Dict).
+        # Validate the signature against the hook point's expectations.
         if hook_point in (HookPoint.ON_UPDATE_BUFFER, HookPoint.ON_BUFFER_UPDATED):
-            # Need exactly 4 parameters: (bm, old_buffer, new_buffer, args).
-            if len(params) != 4:
-                return f"[{function_name}] expected 4 parameters, got {len(params)}"
+            # UPDATE hooks: params are (bm, old_buffer, new_buffer, args) — data params are [1, 2].
+            error = _validate_hook_signature(
+            params=params,
+            data_param_indices=[1, 2],
+            args_param_index=3,
+            expected_param_count=4,
+            function_name=function_name,
+        )
+            if error:
+                return error
 
-            # Fourth param must be a dict.
-            if params[3][1].annotation not in (dict, "dict", Dict, "Dict"):
-                return f"[{function_name}] type hint for parameter 4 is {params[3][1].annotation} — expected dict"
-
-            # Parameters 2 and 3 must both be Buffer, or both be str.
-            if not ((params[1][1].annotation in (Buffer, "Buffer") and params[2][1].annotation in (Buffer, "Buffer")) or
-                    (params[1][1].annotation in (str, "str") and params[2][1].annotation in (str, "str"))):
-                return f"[{function_name}] type hints: param2={params[1][1].annotation}, param3={params[2][1].annotation} — expected both Buffer or both str"
-
-        # For DROP hooks — valid signatures are (bm, Buffer, Dict) or (bm, str, Dict).
         elif hook_point in (HookPoint.ON_DROP_BUFFER, HookPoint.ON_BUFFER_DROPPED):
-            # Need exactly 3 parameters.
-            if len(params) != 3:
-                return f"[{function_name}] expected 3 parameters, got {len(params)}"
+            # DROP hooks: params are (bm, buffer, args) — data param is [1].
+            error = _validate_hook_signature(
+                params=params,
+                data_param_indices=[1],
+                args_param_index=2,
+                expected_param_count=3,
+                function_name=function_name,
+            )
+            if error:
+                return error
 
-            # Third param must be a dict.
-            if params[2][1].annotation not in (dict, "dict", Dict, "Dict"):
-                return f"[{function_name}] type hint for parameter 3 is {params[2][1].annotation} — expected dict"
 
-            # Parameter 2 must be Buffer or str.
-            if not (params[1][1].annotation in (Buffer, "Buffer") or params[1][1].annotation in (str, "str")):
-                return f"[{function_name}] type hint for parameter 2 is {params[1][1].annotation} — expected Buffer or str"
+def _get_data_param_mode(
+    params: list[tuple[str, Any]],
+    data_param_indices: list[int],
+) -> str:
+    """Return 'buffer' if data params are Buffer-annotated, 'str' if str-annotated.
+
+    Call this only after _validate_hook_signature has confirmed all data params share one type.
+    """
+    # Inspect the first data param to determine the shared mode.
+    first_annotation = params[data_param_indices[0]][1].annotation
+    return "buffer" if first_annotation in (Buffer, "Buffer") else "str"
 
 
 def _register_buffer_hook(
@@ -216,46 +268,63 @@ def _register_buffer_hook(
     function_name: str,
     callable_hook: Callable,
 ) -> str | None:
-    # Inspect the user-facing parameter annotation to decide whether the callable
-    # accepts a Buffer directly or needs a text adapter.
+    # Inspect the callable's signature to decide direct registration or text-wrapping.
     sig = inspect.signature(callable_hook)
     params = list(sig.parameters.items())
 
-    # Distinguish between UPDATE hooks and DROP hooks
+    # Validate the signature — fail fast if unexpected.
+    # Delegate to the generic validator with the right param layout for each hook family.
     if hook_point in (HookPoint.ON_UPDATE_BUFFER, HookPoint.ON_BUFFER_UPDATED):
-        # If the signature is (BufferManager, Buffer, Buffer, Dict), then we register the hook directly
-        if len(params) == 4 and params[1][1].annotation in (Buffer, "Buffer") and params[2][1].annotation in (Buffer, "Buffer"):
+        # UPDATE: data params are [1, 2] (old and new buffer), args is [3].
+        error = _validate_hook_signature(
+            params=params,
+            data_param_indices=[1, 2],
+            args_param_index=3,
+            expected_param_count=4,
+            function_name=function_name,
+        )
+        if error:
+            raise RuntimeError(f"[{function_name}] signature mismatch at registration — this should have been caught by the guard")
+
+        # Determine the data param mode to decide direct vs. wrapped registration.
+        data_mode = _get_data_param_mode(params, [1, 2])
+
+        # Buffer-annotated: register directly — no conversion needed.
+        if data_mode == "buffer":
             origin_buffer.register_hook(hook_point, f"{_SMART_BUFFER_PREFIX}{function_name}", callable_hook)
 
-        # Otherwise, the signature must be (BufferManager, str, str, Dict),
-        # in which case we wrap the hook to pass the text of the buffers.
-        elif len(params) == 4 and params[1][1].annotation in (str, "str") and params[2][1].annotation in (str, "str"):
+        # str-annotated: wrap to extract buffer text before forwarding.
+        else:
+            # Wrap the str-annotated callable so it receives text instead of buffer objects.
             def wrapped_update_hook(bm: Any, old_buffer: Buffer, new_buffer: Buffer, args: dict[str, Any]) -> Any:
-                # Use empty string for drop hooks since the buffer is already gone.
                 return callable_hook(bm, old_buffer.get_text(), new_buffer.get_text(), args)
-
-            # Register the update hook wrapper.
             origin_buffer.register_hook(hook_point, f"{_SMART_BUFFER_PREFIX}{function_name}", wrapped_update_hook)
 
-        else:
+    elif hook_point in (HookPoint.ON_DROP_BUFFER, HookPoint.ON_BUFFER_DROPPED):
+        # DROP: data param is [1] (the buffer being dropped), args is [2].
+        error = _validate_hook_signature(
+            params=params,
+            data_param_indices=[1],
+            args_param_index=2,
+            expected_param_count=3,
+            function_name=function_name,
+        )
+        if error:
             raise RuntimeError(f"[{function_name}] signature mismatch at registration — this should have been caught by the guard")
 
-    elif hook_point in (HookPoint.ON_DROP_BUFFER, HookPoint.ON_BUFFER_DROPPED):
-        # If the signature is (BufferManager, Buffer, Dict), register direct.
-        if len(params) == 3 and params[1][1].annotation in (Buffer, "Buffer"):
+        # Determine the data param mode to decide direct vs. wrapped registration.
+        data_mode = _get_data_param_mode(params, [1])
+
+        # Buffer-annotated: register directly — buffer is still valid at fire time.
+        if data_mode == "buffer":
             origin_buffer.register_hook(hook_point, f"{_SMART_BUFFER_PREFIX}{function_name}", callable_hook)
 
-        # Otherwise, the signature must be (BufferManager, str, Dict),
-        # in which case we wrap the hook to pass empty string (buffer is already dropped).
-        elif len(params) == 3 and params[1][1].annotation in (str, "str"):
+        # str-annotated: the buffer is already gone — pass empty string as the data value.
+        else:
+            # Wrap the str-annotated callable — buffer is gone at fire time, so forward empty string.
             def wrapped_drop_hook(bm: Any, buffer: Buffer, args: dict[str, Any]) -> Any:
                 return callable_hook(bm, "", args)
-
-            # Register the drop hook wrapper.
             origin_buffer.register_hook(hook_point, f"{_SMART_BUFFER_PREFIX}{function_name}", wrapped_drop_hook)
-
-        else:
-            raise RuntimeError(f"[{function_name}] signature mismatch at registration — this should have been caught by the guard")
 
 
 def on_option_updated(
@@ -321,6 +390,8 @@ def on_origin_buffer_dropped(
         # Get the option buffer.
         option_name = f"{origin_buffer.name}{suffix}"
         option_buffer = buffer_manager.get_buffer(option_name)
+
+        # Guard: skip this suffix if no option buffer exists for it.
         if option_buffer is None:
             continue
 
