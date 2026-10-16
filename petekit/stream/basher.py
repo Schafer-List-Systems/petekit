@@ -130,7 +130,7 @@ class Basher(StreamBufferManager, AgenticObject):
             # Forward the newly appended text to the process's stdin.
             return self._bash_send_hook(process_id, appended_text)
 
-        stdin_buf.register_hook(HookPoint.ON_BUFFER_UPDATED, "bash_send", _bash_forward)
+        stdin_buf.register_hook(HookPoint.AFTER_UPDATE_BUFFER, "bash_send", _bash_forward)
 
         # Launch: fork the subprocess with connected stdin/stdout/stderr pipes.
         try:

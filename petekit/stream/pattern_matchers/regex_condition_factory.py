@@ -249,7 +249,7 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
                 # Guard the pattern buffer against direct drops — remove via the catalog.
                 pattern_buf = factory.get_buffer(pattern_buffer)
                 guard_result = pattern_buf.register_hook(
-                    HookPoint.ON_DROP_BUFFER,
+                    HookPoint.BEFORE_DROP_BUFFER,
                     "drop_guard",
                     _drop_guard,
                 )
@@ -262,7 +262,7 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
 
                 # Register the pattern management update hook on the new config buffer.
                 hook_result = pattern_buf.register_hook(
-                    HookPoint.ON_BUFFER_UPDATED,
+                    HookPoint.AFTER_UPDATE_BUFFER,
                     "factory",
                     make_json_codec(
                         lambda buf, old_json, new_json, patch: _pattern_update_hook(
@@ -303,7 +303,7 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
 
                 meta_buf = factory.get_buffer(meta_name)
                 reg_result = meta_buf.register_hook(
-                    HookPoint.ON_DROP_BUFFER,
+                    HookPoint.BEFORE_DROP_BUFFER,
                     "regex_condition_meta_drop_guard",
                     _meta_drop_guard,
                 )
@@ -321,8 +321,8 @@ async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: di
             meta_name = f"{_FUNCTION_STATUS_NAME_BASE}{name}"
 
             # Unregister our drop guards — we are authorized to drop, the sentinel must not block us.
-            factory.get_buffer(pattern_buffer_name).unregister_hook(HookPoint.ON_DROP_BUFFER, "drop_guard")
-            factory.get_buffer(meta_name).unregister_hook(HookPoint.ON_DROP_BUFFER, "regex_condition_meta_drop_guard")
+            factory.get_buffer(pattern_buffer_name).unregister_hook(HookPoint.BEFORE_DROP_BUFFER, "drop_guard")
+            factory.get_buffer(meta_name).unregister_hook(HookPoint.BEFORE_DROP_BUFFER, "regex_condition_meta_drop_guard")
 
             # Drop the function and its config buffer — the condition is being removed.
             drop_fn_result = await factory.drop_function(name)
@@ -360,7 +360,7 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
 
         conditions_buf = self.get_buffer(_CONDITION_LIST_BUFFER)
         hook_result = conditions_buf.register_hook(
-            HookPoint.ON_DROP_BUFFER,
+            HookPoint.BEFORE_DROP_BUFFER,
             "drop_guard",
             _conditions_drop_guard,
         )
@@ -369,7 +369,7 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
 
         # Register the factory's update hook so add/remove operations on conditions are intercepted.
         hook_result = conditions_buf.register_hook(
-            HookPoint.ON_UPDATE_BUFFER,
+            HookPoint.BEFORE_UPDATE_BUFFER,
             "factory",
             make_json_codec(
                 lambda buf, old_json, new_json, patch: _condition_list_update_hook(

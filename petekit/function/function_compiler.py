@@ -12,7 +12,7 @@ from peteos.oap.agentic_object import AgenticObject
 from peteos.sandbox import SandboxBuilder
 
 from petekit.function.function_manager import FunctionManager
-from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint, OnBufferDropped, OnBufferUpdated, OnDropBuffer, OnUpdateBuffer, _get_persistence_dir
+from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint, AfterBufferDropped, AfterUpdateBuffer, BeforeDropBuffer, BeforeUpdateBuffer, _get_persistence_dir
 
 _CODE_BUFFER_PREFIX = "system:code:"
 _FUNCTION_COMPILER_DOC_BUFFER = "doc:function_compiler"
@@ -151,11 +151,11 @@ def _make_stable_wrapper(compiler: "FunctionCompiler", func_name: str) -> Callab
     return wrapper
 
 
-def _make_on_update_code(compiler: "FunctionCompiler", func_name: str) -> OnUpdateBuffer:
+def _make_on_update_code(compiler: "FunctionCompiler", func_name: str) -> BeforeUpdateBuffer:
     """Factory producing a pre-update hook that validates source code on every buffer mutation.
 
     Validates AST structure, enforces a single function def, and runs a trial compilation
-    before allowing the update. Drop is handled by ON_DROP_BUFFER / ON_BUFFER_DROPPED hooks.
+    before allowing the update. Drop is handled by BEFORE_DROP_BUFFER / AFTER_DROP_BUFFER hooks.
     """
     async def on_update_code(
         buffer_manager: BufferManager,
@@ -179,8 +179,8 @@ def _make_on_update_code(compiler: "FunctionCompiler", func_name: str) -> OnUpda
     return on_update_code
 
 
-def _make_on_code_drop(compiler: "FunctionCompiler", func_name: str) -> OnDropBuffer:
-    """Factory producing the ON_DROP_BUFFER hook for system:code:.* buffers.
+def _make_on_code_drop(compiler: "FunctionCompiler", func_name: str) -> BeforeDropBuffer:
+    """Factory producing the BEFORE_DROP_BUFFER hook for system:code:.* buffers.
 
     Cascades the drop to remove the callable from the function namespace. The drop
     itself is allowed to proceed; this hook only performs the side effect.
@@ -200,8 +200,8 @@ def _make_on_code_drop(compiler: "FunctionCompiler", func_name: str) -> OnDropBu
     return on_code_drop
 
 
-def _make_on_code_dropped(compiler: "FunctionCompiler", func_name: str) -> OnBufferDropped:
-    """Factory producing the ON_BUFFER_DROPPED safety-net hook for system:code:.* buffers.
+def _make_on_code_dropped(compiler: "FunctionCompiler", func_name: str) -> AfterBufferDropped:
+    """Factory producing the AFTER_DROP_BUFFER safety-net hook for system:code:.* buffers.
 
     Fires after the buffer is dropped. If the function is still registered, the normal
     cascade in on_code_drop failed somehow — this logs the anomaly but does not
@@ -222,7 +222,7 @@ def _make_on_code_dropped(compiler: "FunctionCompiler", func_name: str) -> OnBuf
     return on_code_dropped
 
 
-def _make_on_code_updated(compiler: FunctionCompiler, func_name: str, buf_name: str) -> OnBufferUpdated:
+def _make_on_code_updated(compiler: FunctionCompiler, func_name: str, buf_name: str) -> AfterUpdateBuffer:
     """Factory producing a post-update hook that commits validated source to the sandbox.
 
     Called after the buffer update has already succeeded. Reads the new content from the
@@ -259,7 +259,7 @@ async def _on_create_code(
     buffer_name: str,
     args: dict[str, Any],
 ) -> str | None:
-    """ON_CREATE_BUFFER hook for the system:code: scope — compiles and registers a function from source text."""
+    """BEFORE_CREATE_BUFFER hook for the system:code: scope — compiles and registers a function from source text."""
     # Parse the source from the create args.
     source: str = args.get("text", "")
     if not source.strip():
@@ -304,14 +304,14 @@ async def _on_code_created(
     new_buffer: Buffer,
     args: dict[str, Any],
 ) -> str | None:
-    """ON_BUFFER_CREATED hook for the system:code: scope — registers pre/post update and drop hooks on the new buffer."""
+    """AFTER_CREATE_BUFFER hook for the system:code: scope — registers pre/post update and drop hooks on the new buffer."""
     # Derive the function name from the buffer name — prefix confirmed by scope registration.
     buffer_name = new_buffer.name
     func_name = buffer_name[len(_CODE_BUFFER_PREFIX) :]
 
     # Register the on_update_code guard as a pre-update hook — validates source before mutation.
     guard_result = new_buffer.register_hook(
-        HookPoint.ON_UPDATE_BUFFER,
+        HookPoint.BEFORE_UPDATE_BUFFER,
         "on_update_code",
         _make_on_update_code(buffer_manager, func_name),
     )
@@ -320,7 +320,7 @@ async def _on_code_created(
 
     # Register the on_code_updated post-update hook — commits to sandbox and refreshes the catalog.
     commit_result = new_buffer.register_hook(
-        HookPoint.ON_BUFFER_UPDATED,
+        HookPoint.AFTER_UPDATE_BUFFER,
         "on_code_updated",
         _make_on_code_updated(buffer_manager, func_name, buffer_name),
     )
@@ -329,7 +329,7 @@ async def _on_code_created(
 
     # Register the on_code_drop pre-drop hook — cascades buffer drop to the function namespace.
     drop_result = new_buffer.register_hook(
-        HookPoint.ON_DROP_BUFFER,
+        HookPoint.BEFORE_DROP_BUFFER,
         "on_code_drop",
         _make_on_code_drop(buffer_manager, func_name),
     )
@@ -338,7 +338,7 @@ async def _on_code_created(
 
     # Register the on_code_dropped safety-net — logs if the function is still registered after the drop.
     dropped_result = new_buffer.register_hook(
-        HookPoint.ON_BUFFER_DROPPED,
+        HookPoint.AFTER_DROP_BUFFER,
         "on_code_dropped",
         _make_on_code_dropped(buffer_manager, func_name),
     )
@@ -357,9 +357,9 @@ class FunctionCompiler(FunctionManager, AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
 
-        # Register the ON_CREATE_BUFFER scope hook — compiles and registers functions on buffer creation.
+        # Register the BEFORE_CREATE_BUFFER scope hook — compiles and registers functions on buffer creation.
         on_create_result = self.register_buffer_pattern_hook(
-            HookPoint.ON_CREATE_BUFFER,
+            HookPoint.BEFORE_CREATE_BUFFER,
             "on_create_code",
             _CODE_BUFFER_PREFIX + ".*",
             _on_create_code,
@@ -367,9 +367,9 @@ class FunctionCompiler(FunctionManager, AgenticObject):
         if not isinstance(on_create_result, dict) or not on_create_result.get("ok"):
             raise RuntimeError(f"failed to register on_create_code hook: {on_create_result.get('error')}")
 
-        # Register the ON_BUFFER_CREATED scope hook — registers pre/post update hooks on new code buffers.
+        # Register the AFTER_CREATE_BUFFER scope hook — registers pre/post update hooks on new code buffers.
         on_created_result = self.register_buffer_pattern_hook(
-            HookPoint.ON_BUFFER_CREATED,
+            HookPoint.AFTER_CREATE_BUFFER,
             "on_code_created",
             _CODE_BUFFER_PREFIX + ".*",
             _on_code_created,

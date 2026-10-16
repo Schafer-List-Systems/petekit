@@ -15,41 +15,41 @@ from typing import Literal
 
 class HookPoint(Enum):
     """Hook points at which buffer lifecycle events can be intercepted."""
-    ON_CREATE_BUFFER = "on_create_buffer"
-    ON_BUFFER_CREATED = "on_buffer_created"
-    ON_UPDATE_BUFFER = "on_update_buffer"
-    ON_BUFFER_UPDATED = "on_buffer_updated"
-    ON_DROP_BUFFER = "on_drop_buffer"
-    ON_BUFFER_DROPPED = "on_buffer_dropped"
+    BEFORE_CREATE_BUFFER = "before_create_buffer"
+    AFTER_CREATE_BUFFER = "after_create_buffer"
+    BEFORE_UPDATE_BUFFER = "before_update_buffer"
+    AFTER_UPDATE_BUFFER = "after_update_buffer"
+    BEFORE_DROP_BUFFER = "before_drop_buffer"
+    AFTER_DROP_BUFFER = "after_drop_buffer"
 
 
 # Pre-create: fires before buffer is added to the dict. Rejection blocks creation.
-OnCreateBuffer = Callable[["BufferManager", "Buffer", dict[str, Any]], bool | str | None]
+BeforeCreateBuffer = Callable[["BufferManager", "Buffer", dict[str, Any]], bool | str | None]
 
 # Post-create: fires after buffer is in the dict. Informative only — returns None.
-OnBufferCreated = Callable[["BufferManager", "Buffer", dict[str, Any]], None]
+AfterCreateBuffer = Callable[["BufferManager", "Buffer", dict[str, Any]], None]
 
 # Pre-update: fires before mutation is committed. Rejection blocks the update.
-OnUpdateBuffer = Callable[["BufferManager", "Buffer", "Buffer", dict[str, Any]], bool | str | None]
+BeforeUpdateBuffer = Callable[["BufferManager", "Buffer", "Buffer", dict[str, Any]], bool | str | None]
 
 # Post-update: fires after mutation is committed. Informative only — returns None.
-OnBufferUpdated = Callable[["BufferManager", "Buffer", "Buffer", dict[str, Any]], None]
+AfterUpdateBuffer = Callable[["BufferManager", "Buffer", "Buffer", dict[str, Any]], None]
 
 # Pre-drop: fires before buffer is removed from the dict. Rejection blocks the drop.
-OnDropBuffer = Callable[["BufferManager", "Buffer", dict[str, Any]], bool | str | None]
+BeforeDropBuffer = Callable[["BufferManager", "Buffer", dict[str, Any]], bool | str | None]
 
 # Post-drop: fires after buffer is removed. Informative only — returns None.
-OnBufferDropped = Callable[["BufferManager", "Buffer", dict[str, Any]], None]
+AfterBufferDropped = Callable[["BufferManager", "Buffer", dict[str, Any]], None]
 
 # AnyHook is the union of all six hook type aliases — use this where a parameter
 # accepts any hook regardless of hook point.
 AnyHook = (
-    OnCreateBuffer
-    | OnUpdateBuffer
-    | OnDropBuffer
-    | OnBufferCreated
-    | OnBufferUpdated
-    | OnBufferDropped
+    BeforeCreateBuffer
+    | BeforeUpdateBuffer
+    | BeforeDropBuffer
+    | AfterCreateBuffer
+    | AfterUpdateBuffer
+    | AfterBufferDropped
 )
 
 
@@ -152,7 +152,7 @@ def _drop_persisted_buffer(bm: BufferManager, buffer_name: str) -> None:
     (dir / f".{buffer_name}.json").unlink(missing_ok=True)
 
 
-def _make_persist_buffer_hook(bm: BufferManager) -> OnBufferUpdated:
+def _make_persist_buffer_hook(bm: BufferManager) -> AfterUpdateBuffer:
     """Factory that returns a post-update hook that persists the buffer on every modification.
 
     Closes over bm so the hook can call _persist_buffer with the correct BufferManager.
@@ -243,7 +243,7 @@ async def _create_buffer_implementation(
 
         # Gate the overwrite through pre-update hooks; a rejection blocks the replacement.
         update_args = {"_op": "create_buffer", "name": name, "text": text, "overwrite": overwrite}
-        pre_result = await buf._fire_hooks(bm, buffer_alias, HookPoint.ON_UPDATE_BUFFER, update_args)
+        pre_result = await buf._fire_hooks(bm, buffer_alias, HookPoint.BEFORE_UPDATE_BUFFER, update_args)
         if pre_result is not True and pre_result is not None:
             return {"ok": False, "error": str(pre_result)}
 
@@ -253,7 +253,7 @@ async def _create_buffer_implementation(
         create_result = {"ok": True, "lines": len(buf.lines)}
 
         # Fire post-update hooks now that the overwrite is committed.
-        await buffer_alias._fire_hooks(bm, buf, HookPoint.ON_BUFFER_UPDATED, update_args)
+        await buffer_alias._fire_hooks(bm, buf, HookPoint.AFTER_UPDATE_BUFFER, update_args)
 
     # For new buffers: behave as a creation — gate through pre-create hooks, then create the buffer.
     else:
@@ -261,15 +261,15 @@ async def _create_buffer_implementation(
         buf = Buffer(name=name, lines=new_lines, created_at=created_at, modified_at=created_at)
 
         # Mirror all pattern-based hook points into the buffer before creation hooks fire.
-        _initialize_buffer_hooks(bm, buf, HookPoint.ON_CREATE_BUFFER)
-        _initialize_buffer_hooks(bm, buf, HookPoint.ON_BUFFER_CREATED)
-        _initialize_buffer_hooks(bm, buf, HookPoint.ON_UPDATE_BUFFER)
-        _initialize_buffer_hooks(bm, buf, HookPoint.ON_BUFFER_UPDATED)
-        _initialize_buffer_hooks(bm, buf, HookPoint.ON_DROP_BUFFER)
-        _initialize_buffer_hooks(bm, buf, HookPoint.ON_BUFFER_DROPPED)
+        _initialize_buffer_hooks(bm, buf, HookPoint.BEFORE_CREATE_BUFFER)
+        _initialize_buffer_hooks(bm, buf, HookPoint.AFTER_CREATE_BUFFER)
+        _initialize_buffer_hooks(bm, buf, HookPoint.BEFORE_UPDATE_BUFFER)
+        _initialize_buffer_hooks(bm, buf, HookPoint.AFTER_UPDATE_BUFFER)
+        _initialize_buffer_hooks(bm, buf, HookPoint.BEFORE_DROP_BUFFER)
+        _initialize_buffer_hooks(bm, buf, HookPoint.AFTER_DROP_BUFFER)
 
         # Fire pre-create hooks — a rejection blocks the creation.
-        pre_result = await buf._fire_hooks(bm, None, HookPoint.ON_CREATE_BUFFER, create_args)
+        pre_result = await buf._fire_hooks(bm, None, HookPoint.BEFORE_CREATE_BUFFER, create_args)
         if pre_result is not True and pre_result is not None:
             return {"ok": False, "error": str(pre_result)}
 
@@ -279,7 +279,7 @@ async def _create_buffer_implementation(
 
         # Create and register the persist hook on the buffer.
         persist_hook = _make_persist_buffer_hook(bm)
-        buf.register_hook(HookPoint.ON_BUFFER_UPDATED, "persist_buffer", persist_hook)
+        buf.register_hook(HookPoint.AFTER_UPDATE_BUFFER, "persist_buffer", persist_hook)
 
         # Fire persist immediately for the fresh buffer.
         persist_hook(bm, buf, buf, create_args)
@@ -288,7 +288,7 @@ async def _create_buffer_implementation(
         create_result = {"ok": True, "lines": len(buf.lines)}
 
         # Fire post-creation hooks — a rejection is logged but does not block the committed buffer.
-        post_result = await buf._fire_hooks(bm, None, HookPoint.ON_BUFFER_CREATED, create_args)
+        post_result = await buf._fire_hooks(bm, None, HookPoint.AFTER_CREATE_BUFFER, create_args)
         if post_result is not True and post_result is not None:
             post_result = str(post_result)
 
@@ -570,12 +570,12 @@ class Buffer:
         HookPoint,
         dict[str, AnyHook],
     ] = field(default_factory=lambda: {
-        HookPoint.ON_CREATE_BUFFER: {},
-        HookPoint.ON_BUFFER_CREATED: {},
-        HookPoint.ON_UPDATE_BUFFER: {},
-        HookPoint.ON_BUFFER_UPDATED: {},
-        HookPoint.ON_DROP_BUFFER: {},
-        HookPoint.ON_BUFFER_DROPPED: {},
+        HookPoint.BEFORE_CREATE_BUFFER: {},
+        HookPoint.AFTER_CREATE_BUFFER: {},
+        HookPoint.BEFORE_UPDATE_BUFFER: {},
+        HookPoint.AFTER_UPDATE_BUFFER: {},
+        HookPoint.BEFORE_DROP_BUFFER: {},
+        HookPoint.AFTER_DROP_BUFFER: {},
     })
 
     def alias(self) -> Buffer:
@@ -842,7 +842,7 @@ class Buffer:
 
     async def _fire_pre_op_hooks(
         self,
-        hooks: list[tuple[str, OnCreateBuffer | OnUpdateBuffer | OnDropBuffer]],
+        hooks: list[tuple[str, BeforeCreateBuffer | BeforeUpdateBuffer | BeforeDropBuffer]],
         hook_args: list[Any],
     ) -> bool | str:
         """Fire pre-operation hooks in order; return the first rejection.
@@ -867,7 +867,7 @@ class Buffer:
 
     async def _fire_post_op_hooks(
         self,
-        hooks: list[tuple[str, OnBufferCreated | OnBufferUpdated | OnBufferDropped]],
+        hooks: list[tuple[str, AfterCreateBuffer | AfterUpdateBuffer | AfterBufferDropped]],
         hook_args: list[Any],
     ) -> None:
         """Fire post-operation hooks in order; catch and log any raises, continue to the next.
@@ -896,8 +896,8 @@ class Buffer:
     ) -> bool | str:
         """Fire all hooks for the given hook point.
 
-        Pre-operation hooks (ON_CREATE_BUFFER, ON_UPDATE_BUFFER, ON_DROP_BUFFER) block on first
-        rejection. Post-operation hooks (ON_BUFFER_CREATED, ON_BUFFER_UPDATED, ON_BUFFER_DROPPED)
+        Pre-operation hooks (BEFORE_CREATE_BUFFER, BEFORE_UPDATE_BUFFER, BEFORE_DROP_BUFFER) block on first
+        rejection. Post-operation hooks (AFTER_CREATE_BUFFER, AFTER_UPDATE_BUFFER, AFTER_DROP_BUFFER)
         fire all hooks and log any rejections.
         """
         # Return early if no hooks are registered for this hook point.
@@ -907,9 +907,9 @@ class Buffer:
         # Pre-operation hooks block on first rejection; post-operation hooks fire all and log.
         hook_items = list(self._hooks[hook_point].items())
         pre_op_point = hook_point in (
-            HookPoint.ON_CREATE_BUFFER,
-            HookPoint.ON_UPDATE_BUFFER,
-            HookPoint.ON_DROP_BUFFER,
+            HookPoint.BEFORE_CREATE_BUFFER,
+            HookPoint.BEFORE_UPDATE_BUFFER,
+            HookPoint.BEFORE_DROP_BUFFER,
         )
 
         # Build the positional args list — update hooks get 4 args, create/drop get 3.
@@ -1108,12 +1108,12 @@ class BufferManager(AgenticObject):
         # Pattern-based hook registries keyed by hook point.
         # Each registry holds creation hooks to be mirrored to a buffer on first creation.
         self._buffer_hooks: dict[HookPoint, HookPointRegistry] = {
-            HookPoint.ON_CREATE_BUFFER: HookPointRegistry(),
-            HookPoint.ON_BUFFER_CREATED: HookPointRegistry(),
-            HookPoint.ON_UPDATE_BUFFER: HookPointRegistry(),
-            HookPoint.ON_BUFFER_UPDATED: HookPointRegistry(),
-            HookPoint.ON_DROP_BUFFER: HookPointRegistry(),
-            HookPoint.ON_BUFFER_DROPPED: HookPointRegistry(),
+            HookPoint.BEFORE_CREATE_BUFFER: HookPointRegistry(),
+            HookPoint.AFTER_CREATE_BUFFER: HookPointRegistry(),
+            HookPoint.BEFORE_UPDATE_BUFFER: HookPointRegistry(),
+            HookPoint.AFTER_UPDATE_BUFFER: HookPointRegistry(),
+            HookPoint.BEFORE_DROP_BUFFER: HookPointRegistry(),
+            HookPoint.AFTER_DROP_BUFFER: HookPointRegistry(),
         }
 
         # Bootstrap the system status buffer — this must exist before any agent runs.
@@ -1167,7 +1167,7 @@ class BufferManager(AgenticObject):
 
         # Register the persist hook so every subsequent modification is written to disk.
         persist_buffer_hook = _make_persist_buffer_hook(self)
-        buf.register_hook(HookPoint.ON_BUFFER_UPDATED, "persist_buffer", persist_buffer_hook)
+        buf.register_hook(HookPoint.AFTER_UPDATE_BUFFER, "persist_buffer", persist_buffer_hook)
 
         # Persist the freshly created buffer immediately.
         persist_buffer_hook(self, buf, buf, {"_op": "create_buffer", "name": name, "text": text})
@@ -1233,7 +1233,7 @@ class BufferManager(AgenticObject):
         hook_result = await buf._fire_hooks(
             self,
             alias,
-            HookPoint.ON_UPDATE_BUFFER,
+            HookPoint.BEFORE_UPDATE_BUFFER,
             write_args,
         )
         if hook_result is not True and hook_result is not None:
@@ -1248,7 +1248,7 @@ class BufferManager(AgenticObject):
         await alias._fire_hooks(
             self,
             buf,
-            HookPoint.ON_BUFFER_UPDATED,
+            HookPoint.AFTER_UPDATE_BUFFER,
             write_args,
         )
 
@@ -1276,7 +1276,7 @@ class BufferManager(AgenticObject):
         if name == _STATUS_BUFFER:
             return {"ok": False, "error": f"Cannot drop the '{_STATUS_BUFFER}' buffer."}
 
-        # Capture content before deletion — needed by ON_DROP_BUFFER and ON_BUFFER_DROPPED.
+        # Capture content before deletion — needed by BEFORE_DROP_BUFFER and AFTER_DROP_BUFFER.
         old_text = buf.get_text()
 
         # Fire pre-drop hooks — a rejection blocks the drop.
@@ -1284,7 +1284,7 @@ class BufferManager(AgenticObject):
         drop_guard = await buf._fire_hooks(
             self,
             None,
-            HookPoint.ON_DROP_BUFFER,
+            HookPoint.BEFORE_DROP_BUFFER,
             drop_args,
         )
         if drop_guard is not True and drop_guard is not None:
@@ -1293,9 +1293,9 @@ class BufferManager(AgenticObject):
         # Delete the buffer from the manager — it is now invisible to all code.
         del self._buffers[name]
 
-        # Fire ON_BUFFER_DROPPED post-drop hooks — buffer is gone from the manager.
+        # Fire AFTER_DROP_BUFFER post-drop hooks — buffer is gone from the manager.
         # The buffer object itself is still alive for the duration of this call.
-        await buf._fire_hooks(self, None, HookPoint.ON_BUFFER_DROPPED, drop_args)
+        await buf._fire_hooks(self, None, HookPoint.AFTER_DROP_BUFFER, drop_args)
 
         refresh_result = await self._refresh_buffers_buffer()
         if not refresh_result.get("ok"):
@@ -1315,12 +1315,12 @@ class BufferManager(AgenticObject):
         hook_name: str,
         pattern: str,
         hook: (
-            OnCreateBuffer
-            | OnUpdateBuffer
-            | OnDropBuffer
-            | OnBufferCreated
-            | OnBufferUpdated
-            | OnBufferDropped
+            BeforeCreateBuffer
+            | BeforeUpdateBuffer
+            | BeforeDropBuffer
+            | AfterCreateBuffer
+            | AfterUpdateBuffer
+            | AfterBufferDropped
         ),
         overwrite_existing: bool = False,
         apply_to_existing: bool = False,
@@ -1655,7 +1655,7 @@ class BufferManager(AgenticObject):
         hook_result = await buf._fire_hooks(
             self,
             alias,
-            HookPoint.ON_UPDATE_BUFFER,
+            HookPoint.BEFORE_UPDATE_BUFFER,
             edit_args,
         )
         if hook_result is not True and hook_result is not None:
@@ -1670,7 +1670,7 @@ class BufferManager(AgenticObject):
         await alias._fire_hooks(
             self,
             buf,
-            HookPoint.ON_BUFFER_UPDATED,
+            HookPoint.AFTER_UPDATE_BUFFER,
             edit_args,
         )
 
@@ -1705,7 +1705,7 @@ class BufferManager(AgenticObject):
         hook_result = await buf._fire_hooks(
             self,
             alias,
-            HookPoint.ON_UPDATE_BUFFER,
+            HookPoint.BEFORE_UPDATE_BUFFER,
             patch_args,
         )
         if hook_result is not True and hook_result is not None:
@@ -1720,7 +1720,7 @@ class BufferManager(AgenticObject):
         await alias._fire_hooks(
             self,
             buf,
-            HookPoint.ON_BUFFER_UPDATED,
+            HookPoint.AFTER_UPDATE_BUFFER,
             patch_args,
         )
 

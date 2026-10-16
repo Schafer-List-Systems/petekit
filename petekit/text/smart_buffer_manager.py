@@ -35,10 +35,10 @@ _SMART_BUFFER_PREFIX = "smart_buffer_manager."
 _SMART_BUFFER_MANAGER_HOOK_NAME = "smart_buffer_manager"
 
 _OPTION_TYPE_TO_HOOK_POINT: dict[str, HookPoint] = {
-    _BEFORE_UPDATE_SUFFIX: HookPoint.ON_UPDATE_BUFFER,
-    _AFTER_UPDATE_SUFFIX: HookPoint.ON_BUFFER_UPDATED,
-    _BEFORE_DROP_SUFFIX: HookPoint.ON_DROP_BUFFER,
-    _AFTER_DROP_SUFFIX: HookPoint.ON_BUFFER_DROPPED,
+    _BEFORE_UPDATE_SUFFIX: HookPoint.BEFORE_UPDATE_BUFFER,
+    _AFTER_UPDATE_SUFFIX: HookPoint.AFTER_UPDATE_BUFFER,
+    _BEFORE_DROP_SUFFIX: HookPoint.BEFORE_DROP_BUFFER,
+    _AFTER_DROP_SUFFIX: HookPoint.AFTER_DROP_BUFFER,
 }
 
 
@@ -224,7 +224,7 @@ def on_update_option_guard(
         params = list(sig.parameters.items())
 
         # Validate the signature against the hook point's expectations.
-        if hook_point in (HookPoint.ON_UPDATE_BUFFER, HookPoint.ON_BUFFER_UPDATED):
+        if hook_point in (HookPoint.BEFORE_UPDATE_BUFFER, HookPoint.AFTER_UPDATE_BUFFER):
             # UPDATE hooks: params are (bm, old_buffer, new_buffer, args) — data params are [1, 2].
             error = _validate_hook_signature(
             params=params,
@@ -236,7 +236,7 @@ def on_update_option_guard(
             if error:
                 return error
 
-        elif hook_point in (HookPoint.ON_DROP_BUFFER, HookPoint.ON_BUFFER_DROPPED):
+        elif hook_point in (HookPoint.BEFORE_DROP_BUFFER, HookPoint.AFTER_DROP_BUFFER):
             # DROP hooks: params are (bm, buffer, args) — data param is [1].
             error = _validate_hook_signature(
                 params=params,
@@ -274,7 +274,7 @@ def _register_buffer_hook(
 
     # Validate the signature — fail fast if unexpected.
     # Delegate to the generic validator with the right param layout for each hook family.
-    if hook_point in (HookPoint.ON_UPDATE_BUFFER, HookPoint.ON_BUFFER_UPDATED):
+    if hook_point in (HookPoint.BEFORE_UPDATE_BUFFER, HookPoint.AFTER_UPDATE_BUFFER):
         # UPDATE: data params are [1, 2] (old and new buffer), args is [3].
         error = _validate_hook_signature(
             params=params,
@@ -300,7 +300,7 @@ def _register_buffer_hook(
                 return callable_hook(bm, old_buffer.get_text(), new_buffer.get_text(), args)
             origin_buffer.register_hook(hook_point, f"{_SMART_BUFFER_PREFIX}{function_name}", wrapped_update_hook)
 
-    elif hook_point in (HookPoint.ON_DROP_BUFFER, HookPoint.ON_BUFFER_DROPPED):
+    elif hook_point in (HookPoint.BEFORE_DROP_BUFFER, HookPoint.AFTER_DROP_BUFFER):
         # DROP: data param is [1] (the buffer being dropped), args is [2].
         error = _validate_hook_signature(
             params=params,
@@ -396,7 +396,7 @@ def on_origin_buffer_dropped(
             continue
 
         # Unregister the dropped hook from the option buffer.
-        option_buffer.unregister_hook(HookPoint.ON_BUFFER_DROPPED, _SMART_BUFFER_MANAGER_HOOK_NAME)
+        option_buffer.unregister_hook(HookPoint.AFTER_DROP_BUFFER, _SMART_BUFFER_MANAGER_HOOK_NAME)
 
         # Drop the option buffer.
         buffer_manager.drop_buffer(option_name)
@@ -435,28 +435,28 @@ def on_hook_option_created(
 
     # Register dropped sentinel on origin buffer, which drops the option buffer too.
     origin_buffer.register_hook(
-        HookPoint.ON_BUFFER_DROPPED,
+        HookPoint.AFTER_DROP_BUFFER,
         _SMART_BUFFER_MANAGER_HOOK_NAME,
         on_origin_buffer_dropped,
     )
 
     # Register update guard on the option buffer, which checks for valid option buffer schema and existing functions.
     option_buffer.register_hook(
-        HookPoint.ON_UPDATE_BUFFER,
+        HookPoint.BEFORE_UPDATE_BUFFER,
         _SMART_BUFFER_MANAGER_HOOK_NAME,
         on_update_option_guard,
     )
 
     # Register update hook on the option buffer, which updates the hooks on the origin buffer.
     option_buffer.register_hook(
-        HookPoint.ON_BUFFER_UPDATED,
+        HookPoint.AFTER_UPDATE_BUFFER,
         _SMART_BUFFER_MANAGER_HOOK_NAME,
         on_option_updated,
     )
 
     # Register dropped sentinel on the option buffer, which unregisters the hooks from the origin.
     option_buffer.register_hook(
-        HookPoint.ON_BUFFER_DROPPED,
+        HookPoint.AFTER_DROP_BUFFER,
         _SMART_BUFFER_MANAGER_HOOK_NAME,
         on_option_buffer_dropped,
     )
@@ -478,7 +478,7 @@ class SmartBufferManager(FunctionManager, OptionBufferManager, AgenticObject):
 
         # Register guard on create to validate before the buffer is created.
         self.register_buffer_pattern_hook(
-            HookPoint.ON_CREATE_BUFFER,
+            HookPoint.BEFORE_CREATE_BUFFER,
             _SMART_BUFFER_MANAGER_HOOK_NAME,
             r"^.+\[(before_update|after_update|before_drop|after_drop)\]$",
             on_create_hook_option_guard,
@@ -486,7 +486,7 @@ class SmartBufferManager(FunctionManager, OptionBufferManager, AgenticObject):
 
         # Register handler to seed and update hooks when the option buffer is created or changed.
         self.register_buffer_pattern_hook(
-            HookPoint.ON_BUFFER_CREATED,
+            HookPoint.AFTER_CREATE_BUFFER,
             _SMART_BUFFER_MANAGER_HOOK_NAME,
             r"^.+\[(before_update|after_update|before_drop|after_drop)\]$",
             on_hook_option_created,

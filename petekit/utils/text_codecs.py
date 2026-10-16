@@ -8,7 +8,7 @@ import json
 
 import jsonpatch
 
-from petekit.text.buffer_manager import Buffer, BufferManager, OnUpdateBuffer, OnBufferUpdated, _resolve_line_range
+from petekit.text.buffer_manager import Buffer, BufferManager, BeforeUpdateBuffer, AfterUpdateBuffer, _resolve_line_range
 
 
 def _describe_write_scenario(buffer: Buffer, start: int, end: int | None) -> str:
@@ -27,7 +27,7 @@ def _describe_write_scenario(buffer: Buffer, start: int, end: int | None) -> str
     return f"You inserted text at line {resolved_start}."
 
 
-def make_json_codec(inner: Callable[..., bool | str]) -> OnUpdateBuffer:
+def make_json_codec(inner: Callable[..., bool | str]) -> BeforeUpdateBuffer:
     """Build an UpdateHook that validates and diffs JSON-formatted buffer content.
     The inner callable receives (buf, old_json, new_json, patch) and returns bool|str.
     Supports both sync and async inner callables.

@@ -196,7 +196,7 @@ def on_stream_option_created(
 ) -> None:
     """Register the append-only enforcement hook on the origin buffer.
 
-    This fires after ON_BUFFER_CREATED when a "BUFFER[stream]" option buffer is created.
+    This fires after AFTER_CREATE_BUFFER when a "BUFFER[stream]" option buffer is created.
     """
     # Guard: this hook should only fire for NAME[stream] buffers — any other name is a bug in the pattern registration.
     if not _is_stream_option(option_buffer.name):
@@ -222,7 +222,7 @@ def on_stream_option_created(
     # Register the append-only enforcement hook on the origin's before_update.
     # This fires before every write and rejects any non-append operation.
     origin_buffer.register_hook(
-        HookPoint.ON_UPDATE_BUFFER,
+        HookPoint.BEFORE_UPDATE_BUFFER,
         _STREAM_APPEND_ONLY_HOOK,
         _enforce_append_only,
     )
@@ -235,7 +235,7 @@ def on_stream_option_dropped(
 ) -> None:
     """Unregister the append-only enforcement hook when the option buffer is dropped.
 
-    This fires on ON_BUFFER_DROPPED after the option buffer is already removed.
+    This fires on AFTER_DROP_BUFFER after the option buffer is already removed.
     """
     # Guard: this hook should only fire for NAME[stream] buffers — any other name is a bug in the pattern registration.
     if not _is_stream_option(option_buffer.name):
@@ -256,7 +256,7 @@ def on_stream_option_dropped(
 
     # Unregister the append-only enforcement hook — the stream is no longer protected.
     origin_buffer.unregister_hook(
-        HookPoint.ON_UPDATE_BUFFER,
+        HookPoint.BEFORE_UPDATE_BUFFER,
         _STREAM_APPEND_ONLY_HOOK,
     )
 
@@ -295,19 +295,19 @@ class StreamBufferManager(OptionBufferManager, AgenticObject):
         # Register the stream-specific pattern hooks: guard on creation,
         # seed the append-only hook on creation, and unregister on drop.
         self.register_buffer_pattern_hook(
-            HookPoint.ON_CREATE_BUFFER,
+            HookPoint.BEFORE_CREATE_BUFFER,
             "stream_option_guard",
             r"^.+\[stream\]$",
             on_create_stream_option_guard,
         )
         self.register_buffer_pattern_hook(
-            HookPoint.ON_BUFFER_CREATED,
+            HookPoint.AFTER_CREATE_BUFFER,
             "stream_option_created",
             r"^.+\[stream\]$",
             on_stream_option_created,
         )
         self.register_buffer_pattern_hook(
-            HookPoint.ON_BUFFER_DROPPED,
+            HookPoint.AFTER_DROP_BUFFER,
             "stream_option_dropped",
             r"^.+\[stream\]$",
             on_stream_option_dropped,

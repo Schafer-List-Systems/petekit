@@ -97,9 +97,9 @@ def _register_origin_cascade_drop(
         if hook_buffer_manager.get_buffer(option_name) is not None:
             hook_buffer_manager.drop_buffer(option_name)
 
-    # Register the cascade-drop hook on the origin buffer's ON_BUFFER_DROPPED hook point.
+    # Register the cascade-drop hook on the origin buffer's AFTER_DROP_BUFFER hook point.
     origin.register_hook(
-        HookPoint.ON_BUFFER_DROPPED,
+        HookPoint.AFTER_DROP_BUFFER,
         f"option_cascade_{option_name}",
         _cascade_drop_option,
     )
@@ -117,13 +117,13 @@ class OptionBufferManager(BufferManager):
 
         # Register the pattern hooks that enforce the option-buffer/origin invariant.
         self.register_buffer_pattern_hook(
-            HookPoint.ON_CREATE_BUFFER,
+            HookPoint.BEFORE_CREATE_BUFFER,
             "option_buffer_requires_origin",
             r"^.+\[.+\]$",
             _reject_creation_if_origin_missing,
         )
         self.register_buffer_pattern_hook(
-            HookPoint.ON_BUFFER_CREATED,
+            HookPoint.AFTER_CREATE_BUFFER,
             "option_buffer_cascade_drop",
             r"^.+\[.+\]$",
             _register_origin_cascade_drop,

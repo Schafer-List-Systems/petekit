@@ -13,7 +13,7 @@ from typing import Any, Callable
 from peteos import tool, sandbox
 from peteos.oap.agentic_object import AgenticObject
 
-from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint, OnBufferUpdated, OnUpdateBuffer, _sanitize_buffer_name
+from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint, AfterUpdateBuffer, BeforeUpdateBuffer, _sanitize_buffer_name
 
 _FUNCTION_STATUS_BUFFER = "system:status:function"
 _FUNCTION_STATUS_NAME_BASE = "system:status:function:"
@@ -47,7 +47,7 @@ def _compute_mac(fm: "FunctionManager", data: str) -> str:
     ).hexdigest()
 
 
-def _make_readonly_sentinel(fm: "FunctionManager") -> OnUpdateBuffer:
+def _make_readonly_sentinel(fm: "FunctionManager") -> BeforeUpdateBuffer:
     """Factory that produces a pre-update hook verifying the MAC on every buffer write.
 
     The sentinel rejects any write whose content does not carry a valid HMAC signed
@@ -145,7 +145,7 @@ class FunctionManager(BufferManager, AgenticObject):
 
         # Guard the catalog buffer against unsigned writes.
         hook_result = self.get_buffer(_FUNCTION_STATUS_BUFFER).register_hook(
-            HookPoint.ON_UPDATE_BUFFER,
+            HookPoint.BEFORE_UPDATE_BUFFER,
             "readonly_sentinel",
             _make_readonly_sentinel(self),
         )
@@ -213,7 +213,7 @@ class FunctionManager(BufferManager, AgenticObject):
 
         # Guard the new meta buffer against unsigned writes.
         hook_result = self.get_buffer(_function_status_name(name)).register_hook(
-            HookPoint.ON_UPDATE_BUFFER,
+            HookPoint.BEFORE_UPDATE_BUFFER,
             "readonly_sentinel",
             _make_readonly_sentinel(self),
         )
@@ -223,7 +223,7 @@ class FunctionManager(BufferManager, AgenticObject):
                 "error": f"Function '{name}' created but could not be protected: {hook_result.get('error')}",
             }
 
-        # Register ON_BUFFER_DROPPED to cascade drop to the code buffer.
+        # Register AFTER_DROP_BUFFER to cascade drop to the code buffer.
         from petekit.function.function_compiler import _CODE_BUFFER_PREFIX
         code_buffer_name = _CODE_BUFFER_PREFIX + name
 
@@ -235,7 +235,7 @@ class FunctionManager(BufferManager, AgenticObject):
             return None
 
         drop_cascade = self.get_buffer(_function_status_name(name)).register_hook(
-            HookPoint.ON_BUFFER_DROPPED,
+            HookPoint.AFTER_DROP_BUFFER,
             "on_function_dropped",
             _on_function_dropped,
         )

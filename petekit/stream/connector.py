@@ -98,7 +98,7 @@ class Connector(StreamBufferManager, AgenticObject):
             # Forward the newly appended text to the connection.
             return self._connection_send_hook(name, appended_text)
 
-        out_buf.register_hook(HookPoint.ON_BUFFER_UPDATED, "connection_send", _connection_forward)
+        out_buf.register_hook(HookPoint.AFTER_UPDATE_BUFFER, "connection_send", _connection_forward)
 
         # Connect: open the TCP socket.
         try:
