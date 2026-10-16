@@ -992,14 +992,31 @@ class Buffer:
             "removed": hook_name,
         }
 
-    def get_text(self) -> str:
-        """Return the full buffer content as a single newline-joined string with a trailing newline.
+    def get_text(self, start: int = 0, end: int | None = None) -> str:
+        """Return the buffer content between start and end.
 
-        Returns an empty string if the buffer has no lines.
+        Returns the selected slice as a single string with entries joined by newlines
+        and a trailing newline at the end.
+
+        Args:
+            start: 0-based start index (inclusive). Negative values are relative to the end.
+            end: 0-based end index (exclusive), or None (default) to go to the last line.
+            Negative values are relative to the end.
+
+        Returns:
+            The selected slice as a single string with a trailing newline.
+            Returns an empty string with no newline if the slice is empty.
         """
+        # Empty buffer — nothing to return.
         if not self.lines:
             return ""
-        return "\n".join(entry.data for entry in self.lines) + "\n"
+
+        # Slice the lines and join them, preserving the trailing newline.
+        return "\n".join(entry.data for entry in self.lines[start:end]) + "\n"
+
+    def __len__(self) -> int:
+        """Return the number of lines in the buffer."""
+        return len(self.lines)
 
     def read(
         self,

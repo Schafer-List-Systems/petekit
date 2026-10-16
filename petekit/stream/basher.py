@@ -10,8 +10,8 @@ from typing import Any
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos import sandbox, tool
-from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buffer
-from ..text.buffer_manager import _sanitize_buffer_name
+from .stream_option_buffer_manager import StreamBufferManager
+from ..text.buffer_manager import Buffer, BufferManager, HookPoint, _sanitize_buffer_name
 
 
 _BASH_PROCESSES_BUFFER = "system:status:bash"
@@ -65,7 +65,8 @@ class Basher(StreamBufferManager, AgenticObject):
 
     async def _refresh_bash_processes_buffer(self) -> None:
         records = self.list_processes()
-        text = format_dict_list_for_buffer(records)
+        import json
+        text = json.dumps(records, indent=2)
         await self.create_buffer(_BASH_PROCESSES_BUFFER, text=text, overwrite=True)
 
     @sandbox
@@ -105,21 +106,31 @@ class Basher(StreamBufferManager, AgenticObject):
         stdin_buffer = _make_stream_name(process_id, title, "stdin")
         stdout_buffer = _make_stream_name(process_id, title, "stdout")
         stderr_buffer = _make_stream_name(process_id, title, "stderr")
-        await self.create_buffer(stdin_buffer, stream=True)
-        await self.create_buffer(stdout_buffer, stream=True)
-        await self.create_buffer(stderr_buffer, stream=True)
+        await self.create_stream_buffer(stdin_buffer)
+        await self.create_stream_buffer(stdout_buffer)
+        await self.create_stream_buffer(stderr_buffer)
 
         # Register: attach a hook on stdin so writes to that buffer forward text to the process.
-        hook_result = self._set_stream_on_append_hook(
-            stdin_buffer,
-            name="bash_send",
-            hook=lambda stream, text, metadata: self._bash_send_hook(process_id, text),
-        )
-        if not hook_result.get("ok"):
+        stdin_buf = self.get_buffer(stdin_buffer)
+        if stdin_buf is None:
             await self.drop_buffer(stdin_buffer)
             await self.drop_buffer(stdout_buffer)
             await self.drop_buffer(stderr_buffer)
-            return {"ok": False, "error": f"failed to register bash_send hook: {hook_result.get('error')}"}
+            return {"ok": False, "error": f"stdin buffer '{stdin_buffer}' not found after creation"}
+
+        def _bash_forward(
+            buffer_manager: BufferManager,
+            old_buffer: Buffer,
+            new_buffer: Buffer,
+            args: dict[str, Any],
+        ) -> str | None:
+            # Extract only the newly appended text: use the old line count as the start index.
+            appended_text = new_buffer.get_text(start=len(old_buffer))
+
+            # Forward the newly appended text to the process's stdin.
+            return self._bash_send_hook(process_id, appended_text)
+
+        stdin_buf.register_hook(HookPoint.ON_BUFFER_UPDATED, "bash_send", _bash_forward)
 
         # Launch: fork the subprocess with connected stdin/stdout/stderr pipes.
         try:

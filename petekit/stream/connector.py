@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from peteos import AgenticObject, sandbox, tool
-from .stream_buffer_manager import StreamBufferManager, format_dict_list_for_buffer
-from ..text.buffer_manager import _sanitize_buffer_name
+from .stream_option_buffer_manager import StreamBufferManager
+from ..text.buffer_manager import Buffer, BufferManager, HookPoint, _sanitize_buffer_name
 
 
 # Managed buffer names — system:status: and stream: namespaces
@@ -51,7 +51,8 @@ class Connector(StreamBufferManager, AgenticObject):
 
     async def _refresh_connections_buffer(self) -> None:
         records = self.list_connections()
-        text = format_dict_list_for_buffer(records)
+        import json
+        text = json.dumps(records, indent=2)
         await self.create_buffer(_CONNECTIONS_STATUS_BUFFER, text=text, overwrite=True)
 
     @tool
@@ -72,23 +73,32 @@ class Connector(StreamBufferManager, AgenticObject):
                 pass
 
         # Provision: create the two stream buffers; on failure roll back the first.
-        await self.create_buffer(in_buffer, stream=True)
+        await self.create_stream_buffer(in_buffer)
         try:
-            await self.create_buffer(out_buffer, stream=True)
+            await self.create_stream_buffer(out_buffer)
         except KeyError:
             await self.drop_buffer(in_buffer)
             raise
 
         # Register: attach a hook on the out buffer so writes to it forward text to the socket.
-        hook_result = self._set_stream_on_append_hook(
-            out_buffer,
-            name="connection_send",
-            hook=lambda s, t, m: self._connection_send_hook(name, t),
-        )
-        if not hook_result.get("ok"):
+        out_buf = self.get_buffer(out_buffer)
+        if out_buf is None:
             await self.drop_buffer(in_buffer)
             await self.drop_buffer(out_buffer)
-            raise ConnectionError(f"failed to register connection_send hook: {hook_result.get('error')}")
+            raise ConnectionError(f"out buffer '{out_buffer}' not found after creation")
+
+        def _connection_forward(
+            buffer_manager: BufferManager,
+            old_buffer: Buffer,
+            new_buffer: Buffer,
+            args: dict[str, Any],
+        ) -> str | None:
+            # Extract only the newly appended text: use the old line count as the start index.
+            appended_text = new_buffer.get_text(start=len(old_buffer))
+            # Forward the newly appended text to the connection.
+            return self._connection_send_hook(name, appended_text)
+
+        out_buf.register_hook(HookPoint.ON_BUFFER_UPDATED, "connection_send", _connection_forward)
 
         # Connect: open the TCP socket.
         try:
