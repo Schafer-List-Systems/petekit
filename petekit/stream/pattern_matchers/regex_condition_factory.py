@@ -2,38 +2,80 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
-from typing import Any
+from typing import Any, Callable
+
+_logger = logging.getLogger("regex_condition_factory")
 
 from peteos import AgenticObject
 from ...function.function_manager import FunctionManager, _FUNCTION_STATUS_NAME_BASE
 from ...text.buffer_manager import Buffer, BufferManager, HookPoint, _sanitize_buffer_name
-from ...utils.text_codecs import make_json_codec
-from ..stream_router import RoutingConditionError
+from ..stream_router import RoutingConditionError, CONDITION_FN
 
 
 _CONDITION_LIST_BUFFER = "system:config:regex_condition"
 _REGEX_DOC_BUFFER = "doc:regex_conditions"
 _REGEX_PATTERN_BUFFER = "system:config:regex_condition"
+_CONDITION_BUFFER_PATTERN = r"^system:config:regex_condition:[^[]+$"
+_READ_BUFFER_FN = Callable[[str], dict[str, Any]]
 
 
 def _pattern_buffer_name(condition_name: str) -> str:
-    # Derive the canonical buffer name for a single pattern buffer.
+    """Derive the canonical buffer name for a single pattern buffer."""
+    # Derive the canonical buffer name by combining the base pattern buffer prefix
+    # with a sanitized version of the condition name.
     return f"{_REGEX_PATTERN_BUFFER}:{_sanitize_buffer_name(condition_name)}"
 
 
 
-def _diff_keys(old: dict, new: dict) -> tuple[set[str], set[str], set[str]]:
-    # Compute which keys were added, removed, or changed between two dictionaries.
-    removed = set(old.keys()) - set(new.keys())
-    added = set(new.keys()) - set(old.keys())
-    changed = {k for k in set(old.keys()) & set(new.keys()) if old[k] != new[k]}
-    return (added, removed, changed)
-
 _REGEX_DOC = f"""\
-## Schema
+## Regex Conditions
 
-`{_CONDITION_LIST_BUFFER}`  — catalog of all condition descriptors (JSON)
+A regex condition matches incoming text against one or more regular expression
+patterns. The text must fullmatch at least one pattern (^...$) for the
+condition to return True.
+
+### Create a condition
+
+Create a pattern buffer with the name `system:config:regex_condition:<condition_name>`
+and provide at least one pattern entry:
+
+```json
+{{
+    "<pattern_name>": {{
+        "regex": "<regular expression>",
+        "sample_line": "<example text that the regex must match>"
+    }}
+}}
+```
+
+The `regex` and `sample_line` are required. The regex is validated against
+`sample_line` immediately — if it does not fullmatch, the creation is rejected.
+
+To add more patterns, write additional entries to the same buffer.
+
+### Remove a condition
+
+Drop the pattern buffer `system:config:regex_condition:<condition_name>`. The
+condition is deregistered and its entry is removed from the conditions catalog.
+
+### Requirements per pattern
+
+- `regex` — a valid regular expression
+- `sample_line` — a line of text that the regex must fullmatch exactly
+
+The `sample_line` is used for validation only. It is not stored after creation.
+
+### What happens automatically
+
+- The condition is registered as a callable in the function manager
+- The `pattern_count` in the conditions catalog is updated
+
+### Conditions catalog
+
+`system:config:regex_condition` — a catalog of all conditions:
 
 ```json
 {{
@@ -46,80 +88,72 @@ _REGEX_DOC = f"""\
 }}
 ```
 
-`{_REGEX_PATTERN_BUFFER}:<condition_name>`  — per-condition pattern dictionary (JSON)
-
-```json
-{{
-    "<pattern_name>": {{
-        "regex": "<regex>",
-        "sample_line": "..."
-    }}
-}}
-```
-
-## Usage
-
-A condition evaluates to `True` when the incoming text matches ANY of its patterns
-using fullmatch semantics — the entire line must match (`^...$`).
-
-To add a condition, add an entry to the conditions catalog in `{_CONDITION_LIST_BUFFER}`:
-- The pattern buffer `{_REGEX_PATTERN_BUFFER}:<condition_name>` is created automatically.
-
-To remove a condition, remove its entry from `{_CONDITION_LIST_BUFFER}`.
-
-To add or update a pattern in the pattern buffer `{_REGEX_PATTERN_BUFFER}:<condition_name>`, write an entry:
-
-```json
-"<pattern_name>": {{"regex": "<regex>", "sample_line": "<example>"}}
-```
-
-The regex is validated against `sample_line` immediately — a mismatch is rejected.
-To remove a pattern, remove its entry from the pattern buffer.
-
-Prefer beautified JSON format!
+Read this buffer to discover available conditions and their pattern counts.
 """
 
 
-def _drop_guard(
+def _before_drop_conditions_list(
     buffer_manager: BufferManager,
     buffer: Buffer,
     args: dict[str, Any],
 ) -> str | None:
-    """Block direct buffer drops. Remove entries via "system:config:regex_condition" instead."""
-    # Reject drop operations — conditions must be removed through the conditions list, not by dropping the buffer directly.
-    return f"This buffer cannot be dropped. Remove entries via {_CONDITION_LIST_BUFFER} instead."
+    """Block direct drops of the conditions list buffer."""
+    return "This buffer is protected by the RegexConditionManager."
 
 
-def _condition_closure(pattern_buffer: str, read_buffer_fn: callable, condition_name: str) -> callable:
-    # Build a closure that reads the named config buffer and fullmatches text against all patterns.
-    def condition(stream: str, text: str, metadata: dict) -> bool:
-        import json
+def _before_drop_function_meta(
+    buffer_manager: BufferManager,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """Block direct drops of function meta buffers."""
+    return (
+        f"Buffer '{buffer.name}' is managed by RegexConditionManager. "
+        f"Remove entries via {_CONDITION_LIST_BUFFER} instead."
+    )
+
+
+def _make_condition(
+    pattern_buffer: str,
+    read_buffer_fn: _READ_BUFFER_FN,
+    condition_name: str,
+) -> CONDITION_FN:
+    """Return a condition function that fullmatches text against all patterns in the pattern buffer."""
+    # Return a closure that reads the pattern buffer and fullmatches the incoming text
+    # against every registered pattern. The routing table calls this with (stream, text, metadata).
+    def condition(function_manager: FunctionManager, stream_buffer_name: str, appended_text: str, metadata: dict) -> bool:
+
+        # Read the pattern buffer content — the caller provides the read function.
         read_result = read_buffer_fn(pattern_buffer)
         if not read_result.get("ok"):
             raise RoutingConditionError(
                 condition=condition_name,
                 reason=f"pattern buffer could not be read: {read_result.get('error')}",
             )
+
+        # Parse the pattern buffer JSON — it must be a valid JSON object.
         try:
-            data = json.loads(read_result["content"])
+            pattern_data = json.loads(read_result["content"])
         except json.JSONDecodeError as e:
             raise RoutingConditionError(
                 condition=condition_name,
                 reason=f"pattern buffer is not valid JSON: {e.msg} — expected a JSON object in '{pattern_buffer}'",
             )
 
-        # Iterate over pattern entries — data is the patterns dict directly.
-        for pat in data.values():
+        # Evaluate each pattern: compile and test against the text with fullmatch.
+        for pat in pattern_data.values():
             compiled = re.compile(pat.get("regex", ""))
-            if compiled.fullmatch(text):
+            if compiled.fullmatch(appended_text):
                 return True
 
+        # No pattern matched — return False and let the routing table try the next condition.
         return False
 
     return condition
 
 
 def _guard_pattern_value(op_type: str, value) -> re.Pattern | str:
+    """Validate a single pattern entry. Return the compiled pattern or an error string."""
     # Reject non-dict values and values missing the required 'regex' key.
     if not isinstance(value, dict) or "regex" not in value:
         return f"regex {op_type} must supply a dict with 'regex' key, got: {type(value).__name__} — see {_REGEX_DOC_BUFFER}"
@@ -137,6 +171,10 @@ def _guard_pattern_value(op_type: str, value) -> re.Pattern | str:
 
 
 def _validate_pattern_against_sample(pattern: str, sample_line: str) -> re.Pattern | str:
+    """Validate a regex pattern against a sample line using fullmatch semantics.
+
+    Returns the compiled pattern on success, or an error string on failure.
+    """
     # Compile the pattern first to catch SyntaxErrors early.
     try:
         compiled = re.compile(pattern)
@@ -146,7 +184,6 @@ def _validate_pattern_against_sample(pattern: str, sample_line: str) -> re.Patte
     # Reject the pattern if it does not fullmatch the entire sample_line.
     m = compiled.fullmatch(sample_line)
     if m is None:
-        # Return a clear error so the agent knows what went wrong.
         return (
             f"sample_line does not match pattern '{pattern}'. "
             f"Match failed — pattern did not match the entire line.\n"
@@ -158,179 +195,187 @@ def _validate_pattern_against_sample(pattern: str, sample_line: str) -> re.Patte
     return compiled
 
 
-async def _pattern_update_hook(factory, buf, old_json: dict, new_json: dict | None, patch) -> bool | str:
-    # If new_json is None, then the buffer is being dropped — we initiated the drop, allow it.
-    if new_json is None:
-        return True
+async def _before_update_condition(
+    factory: RegexConditionFactory,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> bool | str:
+    """Validate pattern buffer content changes.
 
-    # Compute the diff between old and new patterns to find which are added, removed, or changed.
-    added, removed, changed = _diff_keys(old_json, new_json)
+    Allows the update if all touched patterns validate against their sample_lines.
+    Blocks the update if validation fails.
+    """
+    # Parse the old buffer text as JSON; on initial creation use empty state.
+    try:
+        if old_buffer is not None:
+            old_json = json.loads(old_buffer.get_text())
+        else:
+            old_json = {}
+    except json.JSONDecodeError as e:
+        return f"old text is not valid JSON: {e.msg}"
 
-    # Collect all touched pattern names — skipping validation for removals.
+    # Parse the new buffer text as JSON.
+    try:
+        new_json = json.loads(new_buffer.get_text())
+    except json.JSONDecodeError as e:
+        return f"new text is not valid JSON: {e.msg}"
+
+    # Find which patterns were added or changed — only those need validation.
+    added = set(new_json.keys()) - set(old_json.keys())
+    changed = {k for k in set(old_json.keys()) & set(new_json.keys()) if old_json[k] != new_json[k]}
     touched_patterns = added | changed
 
-    # Validate each touched pattern against its sample_line in the new state.
+    # Validate each touched pattern against its sample_line.
     for name in sorted(touched_patterns):
-        # Reject the patch if the regex does not match its sample_line.
         validation = _guard_pattern_value("replace", new_json.get(name))
         if isinstance(validation, str):
             return validation
 
-    # Refresh the conditions listing buffer so that pattern counts stay current.
-    # To that, we read the buffer as the source of truth.
-    import json
+    return True
+
+
+async def _after_update_condition(
+    factory: RegexConditionFactory,
+    old_buffer: Buffer,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> bool | str:
+    """Synchronize the conditions list pattern_count after a pattern buffer update.
+
+    This is a side effect — the update already succeeded. We only keep
+    the conditions list view current here.
+    """
+    # Parse the updated buffer text as JSON to count patterns.
+    try:
+        new_json = json.loads(new_buffer.get_text())
+    except json.JSONDecodeError:
+        return True  # Best-effort bookkeeping; do not block.
+
+    # Read the conditions list and update the pattern count.
     read_result = factory._read_buffer(_CONDITION_LIST_BUFFER)
     if not read_result.get("ok"):
-        return f"conditions buffer could not be read: {read_result.get('error')} — the conditions buffer '{_CONDITION_LIST_BUFFER}' may have been deleted or is inaccessible"
+        return True
+
     try:
-        data = json.loads(read_result["content"])
-    except json.JSONDecodeError as e:
-        return f"conditions buffer is not valid JSON: {e.msg} — expected a JSON object with a 'conditions' key in '{_CONDITION_LIST_BUFFER}'"
+        conditions_data = json.loads(read_result["content"])
+    except json.JSONDecodeError:
+        return True
 
-    # Derive the condition name from the buffer name and update its pattern count.
-    conditions = data.get("conditions", {})
-    derived_name = buf.name.removeprefix("system:config:regex_condition:")
+    # Get the conditions dict from conditions_data and derive the condition name.
+    conditions = conditions_data.get("conditions", {})
+    derived_name = old_buffer.name.removeprefix(f"{_REGEX_PATTERN_BUFFER}:")
+
+    # Guard: the condition must exist in the catalog.
     if derived_name not in conditions:
-        raise RuntimeError(f"condition '{derived_name}' not found in conditions list — internal state corruption")
-    conditions[derived_name]["pattern_count"] = len(new_json)
+        return True  # Condition not in catalog — nothing to sync.
 
-    # Write the updated conditions list back.
-    data["conditions"] = conditions
+    # Update the pattern count and write back to conditions_data.
+    conditions[derived_name]["pattern_count"] = len(new_json)
+    conditions_data["conditions"] = conditions
+
+    # Write the updated conditions list back — non-critical bookkeeping.
     try:
         await factory.create_buffer(
             _CONDITION_LIST_BUFFER,
-            text=json.dumps(data, indent=2) + "\n",
+            text=json.dumps(conditions_data, indent=2) + "\n",
             overwrite=True,
         )
     except Exception:
-        pass  # best-effort: non-critical bookkeeping update
+        pass
 
     return True
 
 
-async def _condition_list_update_hook(factory, buf, old_json: dict, new_json: dict, patch) -> bool | str:
-    # Compute the diff between old and new conditions to find which are added, removed, or changed.
-    added, removed, changed = _diff_keys(
-        old_json.get("conditions", {}),
-        new_json.get("conditions", {}),
+async def _after_create_condition(factory: RegexConditionFactory, buffer: Buffer, args: dict[str, Any]) -> bool | str:
+    """Handle AFTER_CREATE_BUFFER on a pattern buffer: create function and register hooks.
+
+    On initial creation: pattern buffer is new, create function and register hooks.
+    On restart: function already exists in factory._functions, skip re-registration.
+    """
+    # Derive the condition name and buffer name from the pattern buffer.
+    condition_name = buffer.name.removeprefix(f"{_REGEX_PATTERN_BUFFER}:")
+    pattern_buffer_name = buffer.name
+
+    # Skip on replay — the function is already registered from the initial add.
+    # factory._functions preserves state across restart.
+    if condition_name in factory._functions:
+        return True
+
+    # Register the pattern management update hook on the new config buffer.
+    hook_result = buffer.register_hook(
+        HookPoint.BEFORE_UPDATE_BUFFER,
+        "factory",
+        _before_update_condition,
     )
+    if not hook_result.get("ok"):
+        return (
+            f"condition '{condition_name}' could not be added: "
+            f"pattern hook could not be registered on '{pattern_buffer_name}': "
+            f"{hook_result.get('error')}"
+        )
 
-    # Collect all touched condition names and track their intent.
-    touched_conditions: set[str] = added | removed | changed
+    # Create and register the condition closure so the routing table can evaluate it.
+    condition_fn = _make_condition(pattern_buffer_name, factory._read_buffer, condition_name)
+    func_result = await factory.create_function(
+        name=condition_name,
+        callable=condition_fn,
+        short_description=f"matches lines against patterns in '{pattern_buffer_name}'",
+        long_description=(
+            f"Evaluates the incoming text against all regex patterns registered in '{pattern_buffer_name}'. "
+            f"All patterns must fullmatch for this condition to return True."
+        ),
+    )
+    if not func_result.get("ok"):
+        return f"condition '{condition_name}' could not be added: {func_result.get('error')}"
 
-    # Determine whether each touched condition is an add or a remove by consulting the new state.
-    # Dispatch add or remove accordingly so the final state drives the decision.
-    conditions = new_json.get("conditions", {})
-    for name in sorted(touched_conditions):
-        # Add if present in new state
-        if name in added:
-            # Validate the entry shape.
-            entry = conditions[name]
-            if not isinstance(entry, dict):
-                return f"condition '{name}' must be a dict, got: {type(entry).__name__}"
+    # Guard the meta buffer against direct drops — remove via the conditions list.
+    meta_name = f"{_FUNCTION_STATUS_NAME_BASE}{condition_name}"
 
-            # Derive the pattern buffer name from the condition name — always deterministic.
-            pattern_buffer = _pattern_buffer_name(name)
+    meta_buffer = factory.get_buffer(meta_name)
+    reg_result = meta_buffer.register_hook(
+        HookPoint.BEFORE_DROP_BUFFER,
+        "before_drop_function_meta",
+        _before_drop_function_meta,
+    )
+    if not reg_result.get("ok"):
+        return (
+            f"condition '{condition_name}' could not be added: "
+            f"before_drop_function_meta could not be registered on '{meta_name}': "
+            f"{reg_result.get('error')}"
+        )
 
-            # Overwrite is safe — replaces content in place and preserves existing hooks.
-            import json
-            init_content = json.dumps({"patterns": {}}, indent=2)
-            create_result = await factory.create_buffer(pattern_buffer, text=init_content, overwrite=True)
-            if not create_result.get("ok"):
-                return (
-                    f"condition '{name}' could not be created due to a cascading error "
-                    f"when creating its config buffer: "
-                    f"{create_result.get('error', 'unknown error when creating its config buffer')}"
-                )
+    return True
 
-            # Only register hooks and functions on a genuine first add — replays find
-            # them already present and skip safely.
-            if name not in factory._functions:
-                # Guard the pattern buffer against direct drops — remove via the catalog.
-                pattern_buf = factory.get_buffer(pattern_buffer)
-                guard_result = pattern_buf.register_hook(
-                    HookPoint.BEFORE_DROP_BUFFER,
-                    "drop_guard",
-                    _drop_guard,
-                )
-                if not guard_result.get("ok"):
-                    return (
-                        f"condition '{name}' could not be added: "
-                        f"drop guard could not be registered on '{pattern_buffer}': "
-                        f"{guard_result.get('error')}"
-                    )
 
-                # Register the pattern management update hook on the new config buffer.
-                hook_result = pattern_buf.register_hook(
-                    HookPoint.AFTER_UPDATE_BUFFER,
-                    "factory",
-                    make_json_codec(
-                        lambda buf, old_json, new_json, patch: _pattern_update_hook(
-                            factory, buf, old_json, new_json, patch
-                        )
-                    ),
-                )
-                if not hook_result.get("ok"):
-                    return (
-                        f"condition '{name}' could not be added: "
-                        f"pattern hook could not be registered on '{pattern_buffer}': "
-                        f"{hook_result.get('error')}"
-                    )
+async def _after_drop_condition(factory: RegexConditionFactory, buffer: Buffer, args: dict[str, Any]) -> bool | str:
+    """Handle AFTER_DROP_BUFFER on a pattern buffer: update conditions list."""
+    # Derive the condition name from the pattern buffer name.
+    condition_name = buffer.name.removeprefix(f"{_REGEX_PATTERN_BUFFER}:")
 
-                # Create and register the condition closure so the routing table can evaluate it.
-                condition_fn = _condition_closure(pattern_buffer, factory._read_buffer, name)
-                func_result = await factory.create_function(
-                    name=name,
-                    callable=condition_fn,
-                    short_description=f"matches lines against patterns in '{pattern_buffer}'",
-                    long_description=(
-                        f"Evaluates the incoming text against all regex patterns registered in '{pattern_buffer}'. "
-                        f"All patterns must fullmatch for this condition to return True."
-                    ),
-                )
-                if not func_result.get("ok"):
-                    return f"condition '{name}' could not be added: {func_result.get('error')}"
+    # Remove the entry from the conditions list — the pattern buffer itself was already
+    # dropped by the system, and the function was already removed.
+    conditions_buffer = factory.get_buffer(_CONDITION_LIST_BUFFER)
 
-                # Guard the meta buffer against direct drops — remove via the conditions list.
-                meta_name = f"{_FUNCTION_STATUS_NAME_BASE}{name}"
+    # Guard: return early if the conditions list buffer is not available.
+    if conditions_buffer is None:
+        _logger.error(f"[_after_drop_condition] conditions list buffer not found")
+        return True
 
-                def _meta_drop_guard(buffer_manager: BufferManager, buffer: Buffer, args: dict[str, Any]):
-                    # Reject drop operations — meta buffers are managed by the factory.
-                    return (
-                        f"Buffer '{meta_name}' is managed by RegexConditionManager. "
-                        f"Remove entries via {_CONDITION_LIST_BUFFER} instead."
-                    )
+    # Parse the conditions list JSON.
+    try:
+        conditions = json.loads(conditions_buffer.get_text())
+    except json.JSONDecodeError:
+        _logger.error(f"[_after_drop_condition] conditions list is not valid JSON")
+        return True
 
-                meta_buf = factory.get_buffer(meta_name)
-                reg_result = meta_buf.register_hook(
-                    HookPoint.BEFORE_DROP_BUFFER,
-                    "regex_condition_meta_drop_guard",
-                    _meta_drop_guard,
-                )
-                if not reg_result.get("ok"):
-                    return (
-                        f"condition '{name}' could not be added: "
-                        f"meta drop guard could not be registered on '{meta_name}': "
-                        f"{reg_result.get('error')}"
-                    )
-
-        # Remove — the condition is absent from the new state.
-        elif name in removed:
-            # Derive the pattern buffer name from the condition name — always deterministic.
-            pattern_buffer_name = _pattern_buffer_name(name)
-            meta_name = f"{_FUNCTION_STATUS_NAME_BASE}{name}"
-
-            # Unregister our drop guards — we are authorized to drop, the sentinel must not block us.
-            factory.get_buffer(pattern_buffer_name).unregister_hook(HookPoint.BEFORE_DROP_BUFFER, "drop_guard")
-            factory.get_buffer(meta_name).unregister_hook(HookPoint.BEFORE_DROP_BUFFER, "regex_condition_meta_drop_guard")
-
-            # Drop the function and its config buffer — the condition is being removed.
-            drop_fn_result = await factory.drop_function(name)
-            if not drop_fn_result.get("ok"):
-                return f"condition '{name}' could not be removed: {drop_fn_result.get('error')}"
-            drop_buf_result = await factory.drop_buffer(pattern_buffer_name)
-            if not drop_buf_result.get("ok"):
-                return f"condition '{name}' could not be removed: {drop_buf_result.get('error')}"
+    # Guard: only remove if the condition exists in the catalog.
+    if condition_name in conditions.get("conditions", {}):
+        del conditions["conditions"][condition_name]
+        text = json.dumps(conditions, indent=2) + "\n"
+        write_result = await factory.write_buffer(_CONDITION_LIST_BUFFER, text, pos="end")
+        if not write_result.get("ok"):
+            _logger.error(f"[_after_drop_condition] failed to update conditions list: {write_result.get('error')}")
 
     return True
 
@@ -341,44 +386,57 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
 
-        # Seed the registry buffer with an empty conditions list.
-        import json
-        cond_result = self._create_buffer(
+        # Seed the conditions list buffer — a reactive view, updated by AFTER_CREATE/DROP on pattern buffers.
+        condition_result = self._create_buffer(
             _CONDITION_LIST_BUFFER,
             text=json.dumps({"conditions": {}}) + "\n",
         )
-        if not cond_result.get("ok"):
-            raise RuntimeError(f"failed to create condition list buffer: {cond_result.get('error')}")
+        if not condition_result.get("ok"):
+            raise RuntimeError(f"failed to create condition list buffer: {condition_result.get('error')}")
 
-        # Guard the conditions list against direct drops — the factory must remove entries
-        # via the catalog; agents must not drop the catalog buffer.
-        def _conditions_drop_guard(buffer_manager: BufferManager, buffer: Buffer, args: dict[str, Any]):
-            # Reject drop operations — the conditions list can only be modified through the factory API.
-            if args.get("_op") == "drop_buffer":
-                return "This buffer is protected by the RegexConditionManager."
-            return None
-
-        conditions_buf = self.get_buffer(_CONDITION_LIST_BUFFER)
-        hook_result = conditions_buf.register_hook(
+        # Guard the conditions list against direct drops — it is a system buffer.
+        conditions_buffer = self.get_buffer(_CONDITION_LIST_BUFFER)
+        hook_result = conditions_buffer.register_hook(
             HookPoint.BEFORE_DROP_BUFFER,
-            "drop_guard",
-            _conditions_drop_guard,
+            "before_drop_conditions_list",
+            _before_drop_conditions_list,
         )
         if not hook_result.get("ok"):
             raise RuntimeError(f"failed to register drop_guard on conditions list: {hook_result.get('error')}")
 
-        # Register the factory's update hook so add/remove operations on conditions are intercepted.
-        hook_result = conditions_buf.register_hook(
-            HookPoint.BEFORE_UPDATE_BUFFER,
-            "factory",
-            make_json_codec(
-                lambda buf, old_json, new_json, patch: _condition_list_update_hook(
-                    self, buf, old_json, new_json, patch
-                )
-            ),
+        # Register hooks on pattern buffers: BEFORE_CREATE validates, AFTER_CREATE creates function,
+        # BEFORE_UPDATE validates pattern changes, AFTER_UPDATE syncs pattern_count in conditions list,
+        # AFTER_DROP removes from conditions list.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_CREATE_BUFFER,
+            "before_create_condition",
+            _CONDITION_BUFFER_PATTERN,
+            lambda bm, buffer, args: _before_update_condition(bm, None, buffer, args),
         )
-        if not hook_result.get("ok"):
-            raise RuntimeError(f"failed to register factory hook: {hook_result.get('error')}")
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            "after_create_condition",
+            _CONDITION_BUFFER_PATTERN,
+            _after_create_condition,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_UPDATE_BUFFER,
+            "before_update_condition",
+            _CONDITION_BUFFER_PATTERN,
+            _before_update_condition,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_UPDATE_BUFFER,
+            "after_update_condition",
+            _CONDITION_BUFFER_PATTERN,
+            _after_update_condition,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_DROP_BUFFER,
+            "after_drop_condition",
+            _CONDITION_BUFFER_PATTERN,
+            _after_drop_condition,
+        )
 
         # Seed the schema documentation buffer.
         self._create_buffer(_REGEX_DOC_BUFFER, text=_REGEX_DOC)

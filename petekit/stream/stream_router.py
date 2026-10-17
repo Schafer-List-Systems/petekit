@@ -6,7 +6,7 @@ import inspect
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable, Dict
 
 from .stream_buffer_manager import StreamBufferManager
 from ..function.function_manager import FunctionManager
@@ -18,10 +18,36 @@ from ..text.buffer_manager import (
 
 
 _logger = logging.getLogger("stream_router")
+CONDITION_FN = Callable[[FunctionManager, str, str, dict], bool]
 
 _LOG_BUFFER = "system:log:stream_router"
 
-_ROUTING_TABLE_PATTERN = re.compile(r"^(.+)\[(routing_table:(.+))\]$")
+
+def _is_condition_fn(callable_fn: Any) -> bool:
+    """Return True if callable_fn has the condition function signature.
+
+    Condition functions take (self/factory, str, str, dict) and return bool.
+    The first argument (self) is ignored — it is always the buffer manager.
+    The second and third arguments must be str. The fourth must be dict.
+    The return annotation must be bool.
+    """
+    sig = inspect.signature(callable_fn)
+    params = list(sig.parameters.values())
+    if len(params) != 4:
+        return False
+    if params[1].annotation not in (str, "str"):
+        return False
+    if params[2].annotation not in (str, "str"):
+        return False
+    if params[3].annotation not in (dict, "dict", Dict, "Dict"):
+        return False
+    if sig.return_annotation not in (bool, "bool"):
+        return False
+    return True
+
+
+# Group 1 = origin buffer name, group 2 = routing table name.
+_ROUTING_TABLE_PATTERN = r"^(.+)\[routing_table:([^[]+)\]$"
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -30,7 +56,7 @@ _ROUTING_TABLE_PATTERN = re.compile(r"^(.+)\[(routing_table:(.+))\]$")
 
 def _is_routing_table_option(name: str) -> bool:
     """Return True if name is a valid routing_table option buffer (has the [routing_table:NAME] suffix)."""
-    return _ROUTING_TABLE_PATTERN.fullmatch(name) is not None
+    return re.compile(_ROUTING_TABLE_PATTERN).fullmatch(name) is not None
 
 
 def _routing_table_option_name(origin_name: str, table_name: str) -> str:
@@ -122,12 +148,12 @@ def _parse_routing_table_option(name: str) -> tuple[str, str] | None:
     Returns None if the name is not a routing_table option buffer.
     """
     # Attempt a full match against the routing_table pattern.
-    match = _ROUTING_TABLE_PATTERN.fullmatch(name)
+    match = re.compile(_ROUTING_TABLE_PATTERN).fullmatch(name)
     if not match:
         return None
 
     # Return the origin and table_name from the matched groups.
-    return (match.group(1), match.group(3))
+    return (match.group(1), match.group(2))
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -166,7 +192,7 @@ def _make_dispatch(
 ) -> Any:
     """Factory producing a routing dispatch hook closure for a specific table_name."""
     # Create the dispatch closure with table_name captured in the inner scope.
-    def dispatch(
+    async def dispatch(
         buffer_manager: BufferManager,
         old_buffer: Buffer,
         new_buffer: Buffer,
@@ -174,7 +200,7 @@ def _make_dispatch(
     ) -> str | None:
         # Call route_dispatch and catch errors to the log rather than propagating.
         try:
-            return route_dispatch(buffer_manager, old_buffer, new_buffer, table_name)
+            return await route_dispatch(buffer_manager, old_buffer, new_buffer, table_name)
         except Exception as e:
             buffer_manager.write_buffer(_LOG_BUFFER, f"ROUTING ERROR: {e}")
             return None
@@ -230,13 +256,10 @@ def before_update_routing_table(
 ) -> str | None:
     """Validate the routing table JSON schema before allowing the update.
 
-    Runs as a BEFORE_UPDATE_BUFFER hook.
+    Runs as a BEFORE_UPDATE_BUFFER hook on subsequent updates, and via the
+    BEFORE_CREATE_BUFFER bridge on initial creation.
     Return None to allow, or an error string to block.
     """
-    # Skip validation on initial creation — handled by after_create_routing_table.
-    if old_option_buffer is None:
-        return None
-
     # Guard: skip if the buffer name is not a routing_table option buffer.
     if not _is_routing_table_option(new_option_buffer.name):
         _logger.error(f"[before_update_routing_table] '{new_option_buffer.name}' is not a routing_table option buffer — hook fired on wrong buffer")
@@ -316,7 +339,7 @@ def after_drop_routing_table(
 # Routing dispatch                                                             #
 # -------------------------------------------------------------------------------------------------------------------- #
 
-def route_dispatch(
+async def route_dispatch(
     processor: BufferManager,
     old_buffer: Buffer,
     new_buffer: Buffer,
@@ -384,7 +407,7 @@ def route_dispatch(
 
         # All sub-conditions in this entry matched — write to the output stream and stop.
         if all_match:
-            result = processor.write_buffer(output_stream, appended_text)
+            result = await processor.write_buffer(output_stream, appended_text)
             if not result.get("ok"):
                 _safe_log(
                     processor,
@@ -450,29 +473,17 @@ def evaluate_condition(
         )
 
     method = fn_result["callable"]
-    sig = inspect.signature(method)
-    params = list(sig.parameters.keys())
 
-    # Dispatch using the 4-arg signature form.
-    _is_bool_return = (
-        sig.return_annotation is bool
-        or sig.return_annotation is inspect.Parameter.empty
-        or sig.return_annotation == "bool"
-    )
-    if params[:4] == ["function_manager", "stream", "text", "metadata"] and _is_bool_return:
-        result = method(
-            function_manager,
-            stream=stream,
-            text=text,
-            metadata={"routing_table": table_name},
-        )
-    else:
+    # Dispatch only if the method has the correct condition function signature.
+    if not _is_condition_fn(method):
+        sig = inspect.signature(method)
+        params = list(sig.parameters.keys())
         raise RoutingConditionError(
             condition=condition_name,
             routing_table=table_name,
             reason=f"incompatible signature: {params}",
         )
-
+    result = method(function_manager, stream, text, metadata={"routing_table": table_name})
     return result
 
 
@@ -482,7 +493,6 @@ def evaluate_condition(
 
 class StreamRouter(FunctionManager, StreamBufferManager):
     """You can route appended text on streams conditionally to different output streams by creating routing table option buffers.
-
     See "doc:stream_router" for details.
     """
 
@@ -498,20 +508,26 @@ class StreamRouter(FunctionManager, StreamBufferManager):
 
         # Register the routing_table pattern hooks.
         self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_CREATE_BUFFER,
+            "routing_table_validated",
+            _ROUTING_TABLE_PATTERN,
+            lambda bm, buf, args: before_update_routing_table(bm, None, buf, args),
+        )
+        self.register_buffer_pattern_hook(
             HookPoint.AFTER_CREATE_BUFFER,
             "routing_table_created",
-            r"^.+\[routing_table:.+\]$",
+            _ROUTING_TABLE_PATTERN,
             after_create_routing_table,
         )
         self.register_buffer_pattern_hook(
             HookPoint.BEFORE_UPDATE_BUFFER,
             "routing_table_updated",
-            r"^.+\[routing_table:.+\]$",
+            _ROUTING_TABLE_PATTERN,
             before_update_routing_table,
         )
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_DROP_BUFFER,
             "routing_table_dropped",
-            r"^.+\[routing_table:.+\]$",
+            _ROUTING_TABLE_PATTERN,
             after_drop_routing_table,
         )

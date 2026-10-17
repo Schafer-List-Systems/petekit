@@ -35,37 +35,30 @@ def make_json_codec(inner: Callable[..., bool | str]) -> BeforeUpdateBuffer:
 
     async def codec(
         buffer_manager: BufferManager,
-        buffer: Buffer,
+        old_buffer: Buffer,
         new_buffer: Buffer,
         args: dict[str, Any],
     ) -> bool | str | None:
         # Extract the mutation range and text from args.
         start = args.get("start", 0)
-        end = args.get("end", len(buffer.lines))
-        new_text = args.get("new_text")
-        old_text = args.get("old_text")
-
-        # Reconstruct the complete old buffer state by splicing the unchanged prefix and suffix
-        # around the old_text slice — gives the codec a full-buffer view for comparison.
-        prefix_lines = [buffer.lines[i].data for i in range(0, start)]
-        suffix_lines = [buffer.lines[i].data for i in range(end, len(buffer.lines))]
-        full_old = "\n".join(prefix_lines + [old_text or ""] + suffix_lines) + "\n"
+        end = args.get("end", len(old_buffer.lines))
+        old_text = old_buffer.get_text()
+        new_text = new_buffer.get_text()
 
         # Validate old_text — reject if the buffer is not valid JSON.
         try:
-            old_json = json.loads(full_old)
+            old_json = json.loads(old_text)
         except json.JSONDecodeError:
             return "old text in buffer is not valid JSON — codec cannot diff against corrupted state"
 
         # Parse new_text into JSON — skip if new_text is absent (drop sentinel path).
         new_json = None
         if new_text is not None:
-            full_new = "\n".join(prefix_lines + [new_text] + suffix_lines) + "\n"
             try:
-                new_json = json.loads(full_new)
+                new_json = json.loads(new_text)
             except json.JSONDecodeError as e:
                 # Report the write scenario and the parse error for the agent to act on.
-                scenario = _describe_write_scenario(buffer, start, end)
+                scenario = _describe_write_scenario(old_buffer, start, end)
                 return (
                     f"{scenario}\n"
                     f"The resulting text is not valid JSON: {e.msg} at line {e.lineno}, char {e.colno}"
@@ -75,7 +68,7 @@ def make_json_codec(inner: Callable[..., bool | str]) -> BeforeUpdateBuffer:
         patch = jsonpatch.make_patch(old_json, new_json)
 
         # Delegate to the inner codec — await if the inner is async.
-        result = inner(buffer, old_json, new_json, patch)
+        result = inner(old_buffer, old_json, new_json, patch)
         if asyncio.iscoroutine(result):
             result = await result
         return result

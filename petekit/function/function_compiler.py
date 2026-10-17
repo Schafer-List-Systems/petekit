@@ -181,7 +181,6 @@ def _make_on_update_code(compiler: "FunctionCompiler", func_name: str) -> Before
 
 def _make_on_code_drop(compiler: "FunctionCompiler", func_name: str) -> BeforeDropBuffer:
     """Factory producing the BEFORE_DROP_BUFFER hook for system:code:.* buffers.
-
     Cascades the drop to remove the callable from the function namespace. The drop
     itself is allowed to proceed; this hook only performs the side effect.
     """

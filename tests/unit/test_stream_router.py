@@ -513,6 +513,27 @@ class TestBeforeUpdateRoutingTable:
 
         assert result is None
 
+    def test_allows_creation_with_valid_routing_table(self):
+        proc = MagicMock()
+        result = before_update_routing_table(
+            proc,
+            None,
+            _mock_buffer("STREAM[routing_table:t1]", '{"routing_table": [[["true"], "out"]]}'),
+            {},
+        )
+        assert result is None
+
+    def test_blocks_creation_with_invalid_json(self):
+        proc = MagicMock()
+        result = before_update_routing_table(
+            proc,
+            None,
+            _mock_buffer("STREAM[routing_table:t1]", "not valid json"),
+            {},
+        )
+        assert result is not None
+        assert "not valid JSON" in result
+
 
 # -------------------------------------------------------------------------------------------------------------------- #
 # TestAfterDropRoutingTable                                                                                     #

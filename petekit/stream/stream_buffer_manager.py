@@ -267,7 +267,6 @@ def on_stream_option_dropped(
 
 class StreamBufferManager(OptionBufferManager, AgenticObject):
     """You can turn any buffer into a stream with time-based reading by creating a BUFFER[stream] option buffer.
-
     See "doc:stream_buffers" for details.
     """
 
@@ -342,17 +341,16 @@ class StreamBufferManager(OptionBufferManager, AgenticObject):
     ) -> dict[str, Any] | str:
         """Read a range of lines from a buffer.
 
-        Integer start/end: line-based reading.
-        Float start/end: time-based reading — available only on streams
-        (buffers with a "BUFFER[stream]" option buffer). Negative floats
-        are relative to the last entry (e.g. -60.0 means '60 seconds ago').
-        Positive floats are absolute Unix timestamps.
-
-        Returns a dict with ok/error or ok/content on success. Set raw=True
-        to get the raw string instead of a dict.
+        Omit start to read from the beginning; omit end to read to the last line.
+        Pass integer start/end for line-based reading on any buffer.
+        Pass float start/end for time-based reading — available only on streams
+        (buffers with a BUFFER[stream] option buffer). Negative floats are
+        relative to the last entry (e.g. -60.0 means '60 seconds ago');
+        positive floats are absolute Unix timestamps.
+        Set raw=True to get the raw string instead of a dict.
         """
-        # Delegate immediately for pure integer-based reading — no time conversion needed.
-        if isinstance(start, int) and isinstance(end, int):
+        # Delegate immediately for non-time-based reading — no time conversion needed.
+        if not isinstance(start, float) and not isinstance(end, float):
             return await super().read_buffer(
                 name,
                 start=start,

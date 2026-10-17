@@ -1645,8 +1645,8 @@ class BufferManager(AgenticObject):
             "name": name,
             "old_string": old_string,
             "new_string": new_string,
-            "start": start,
-            "end": end,
+            "start": lo,
+            "end": hi,
             "replace_all": replace_all,
         }
 
