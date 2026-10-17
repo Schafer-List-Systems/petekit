@@ -213,9 +213,9 @@ class Buffer:
         _hooks: dict[HookPoint, dict[str, AnyHook]] | None = None,
     ) -> None:
         self.name = name
-        self.lines = lines if lines else [BufferEntry(data="")]
         self.created_at = created_at if created_at is not None else time.time()
         self.modified_at = modified_at if modified_at is not None else self.created_at
+        self.lines = lines if lines else [BufferEntry(data="", modified_at=self.modified_at)]
         self._hooks = _hooks if _hooks is not None else {
             HookPoint.BEFORE_CREATE_BUFFER: {},
             HookPoint.AFTER_CREATE_BUFFER: {},
@@ -377,7 +377,8 @@ class Buffer:
         if lo == hi:
             return {"ok": False, "error": f"The range you specified is empty (start=end={lo}). Nothing was replaced."}
 
-        # Extract the target segment text using get_text.
+        # Extract the target segment text using get_text and keep the entries for clustering.
+        segment_entries = self.lines[lo:hi]
         segment_text = self.get_text(lo, hi)
 
         # Find every occurrence of old_string within the segment.

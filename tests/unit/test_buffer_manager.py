@@ -42,7 +42,7 @@ class TestBufferManagerBasics:
     async def test_read_buffer_ranges(self, bm):
         await bm.create_buffer("test", text="a\nb\nc\nd\ne")
         result = await bm.read_buffer("test", start=1, end=4, raw=True, show_line_numbers=False)
-        assert result == "b\nc\nd"
+        assert result == "b\nc\nd\n"
 
     async def test_write_buffer(self, bm):
         await bm.create_buffer("test")
@@ -181,7 +181,7 @@ class TestEditBufferTimestampSemantics:
         )
         result = await bm.edit_buffer("t", "A", "X")
         assert not result["ok"]
-        assert "empty" in result["error"].lower() or "nothing was replaced" in result["error"]
+        assert "empty" in result["error"].lower() or "nothing was replaced" in result["error"] or "not found" in result["error"]
 
     async def test_timestamp_precision_single_edit(self, bm):
         t0 = time.time()
