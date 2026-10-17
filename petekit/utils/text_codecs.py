@@ -8,7 +8,8 @@ import json
 
 import jsonpatch
 
-from petekit.text.buffer_manager import Buffer, BufferManager, BeforeUpdateBuffer, AfterUpdateBuffer, _resolve_line_range
+from petekit.text.buffer_manager import Buffer, BufferManager, BeforeUpdateBuffer, AfterUpdateBuffer
+from petekit.text.buffer import _resolve_line_range
 
 
 def _describe_write_scenario(buffer: Buffer, start: int, end: int | None) -> str:
