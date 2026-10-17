@@ -202,7 +202,7 @@ async def _create_buffer_implementation(
     # Compute the proposed new lines from the provided text.
     new_lines = [
         BufferEntry(data=line, modified_at=modified_at, object_at=modified_at)
-        for line in (text or "").splitlines()
+        for line in (text or "").split("\n")
     ]
 
     # For existing buffers: behave as an update — gate through pre-update hooks, modify in place.
@@ -497,7 +497,14 @@ class BufferManager(AgenticObject):
         lines = 0
 
         if text:
-            buf.lines = [BufferEntry(data=line, modified_at=created_at, object_at=created_at) for line in text.splitlines()]
+            buf.lines = [
+                BufferEntry(
+                    data=line,
+                    modified_at=created_at,
+                    object_at=created_at
+                )
+                for line in text.split("\n")
+            ]
             lines = len(buf.lines)
 
         # Register the persist hook so every subsequent modification is written to disk.

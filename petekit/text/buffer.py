@@ -319,7 +319,7 @@ class Buffer:
         
         # Capture the operation timestamp and parse the incoming text.
         now = time.time()
-        new_text_lines = new_text.splitlines()
+        new_text_lines = new_text.split("\n")
 
         # Create alias for mutation — all branches share the same aliased buffer.
         aliased = self.alias()
@@ -415,7 +415,7 @@ class Buffer:
             new_content = new_content[:r_start] + new_string + new_content[r_end:]
 
         # Split the replaced text into lines and prepare timestamp bookkeeping.
-        new_lines = new_content.splitlines()
+        new_lines = new_content.split("\n")
         now = time.time()
         result_entries: list[BufferEntry] = []
         used_old_indices: set[int] = set()
@@ -535,7 +535,7 @@ class Buffer:
 
         # Build the new buffer from the patched text.
         new_text = patched_bytes.decode("utf-8")
-        new_lines = new_text.splitlines()
+        new_lines = new_text.split("\n")
         now = time.time()
         result_entries = [
             BufferEntry(data=line, modified_at=now, object_at=now) for line in new_lines
