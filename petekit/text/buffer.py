@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import time
 from dataclasses import dataclass
@@ -663,6 +664,16 @@ class Buffer:
                         f"at '{hook_point.value}'. Unregister first, or use overwrite_existing."
                     ),
                 }
+
+        # If this is an UPDATE hook with a 3-arg signature, wrap it to accept 4 args
+        # so callers can pass old_buffer uniformly. The wrapped version discards it.
+        if hook_point in (HookPoint.BEFORE_UPDATE_BUFFER, HookPoint.AFTER_UPDATE_BUFFER):
+            param_count = len(inspect.signature(hook).parameters)
+            if param_count == 3:
+                original = hook
+                def wrapped(bm, old, new, args):
+                    return original(bm, new, args)
+                hook = wrapped
 
         # Store the hook by name on this buffer.
         self._hooks[hook_point][hook_name] = hook
