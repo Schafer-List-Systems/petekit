@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Literal
 
@@ -189,24 +190,40 @@ class BufferEntry:
     agent_at: float | None = None
 
 
-@dataclass
 class Buffer:
-    """A buffer holding a list of line entries with creation and modification timestamps."""
+    """A buffer holding a list of line entries with creation and modification timestamps.
+
+    The last line is the in-progress line — it has no trailing newline in the file.
+    The lines list must never be empty. An empty buffer has one BufferEntry(data="") —
+    a single in-progress empty line.
+    """
+
     name: str
     lines: list[BufferEntry]
     created_at: float
     modified_at: float
-    _hooks: dict[
-        HookPoint,
-        dict[str, AnyHook],
-    ] = field(default_factory=lambda: {
-        HookPoint.BEFORE_CREATE_BUFFER: {},
-        HookPoint.AFTER_CREATE_BUFFER: {},
-        HookPoint.BEFORE_UPDATE_BUFFER: {},
-        HookPoint.AFTER_UPDATE_BUFFER: {},
-        HookPoint.BEFORE_DROP_BUFFER: {},
-        HookPoint.AFTER_DROP_BUFFER: {},
-    })
+    _hooks: dict[HookPoint, dict[str, AnyHook]]
+
+    def __init__(
+        self,
+        name: str,
+        lines: list[BufferEntry] | None = None,
+        created_at: float | None = None,
+        modified_at: float | None = None,
+        _hooks: dict[HookPoint, dict[str, AnyHook]] | None = None,
+    ) -> None:
+        self.name = name
+        self.lines = lines if lines else [BufferEntry(data="")]
+        self.created_at = created_at if created_at is not None else time.time()
+        self.modified_at = modified_at if modified_at is not None else self.created_at
+        self._hooks = _hooks if _hooks is not None else {
+            HookPoint.BEFORE_CREATE_BUFFER: {},
+            HookPoint.AFTER_CREATE_BUFFER: {},
+            HookPoint.BEFORE_UPDATE_BUFFER: {},
+            HookPoint.AFTER_UPDATE_BUFFER: {},
+            HookPoint.BEFORE_DROP_BUFFER: {},
+            HookPoint.AFTER_DROP_BUFFER: {},
+        }
 
     def alias(self) -> Buffer:
         """Return an alias of this buffer sharing the same lines and hooks.
@@ -239,6 +256,98 @@ class Buffer:
             _hooks=copy.deepcopy(self._hooks),
         )
 
+    def get_text(self, start: int = 0, end: int | None = None) -> str:
+        """Return the buffer content between start and end.
+
+        The buffer's last line is the "in-progress" line — it has no trailing newline
+        in the file. When the range includes the last line of the buffer (end >=
+        len(lines)), the result has no trailing newline either. A trailing newline is
+        added only when the result ends before the buffer's last line — the range
+        is clearly bounded and the final newline can be added without ambiguity.
+
+        Args:
+            start: 0-based start index (inclusive). Negative values are relative to the end.
+            end: 0-based end index (exclusive), or None (default) to go to the last line.
+            Negative values are relative to the end.
+
+        Returns:
+            The selected slice as a single string joined by newlines, with a
+            trailing newline only when the range ends before the buffer's last line.
+            Returns an empty string with no newline if the slice is empty.
+        """
+        # Empty buffer — nothing to return.
+        if not self.lines:
+            return ""
+
+        # Resolve end to an absolute index, capping at the actual last line.
+        # The last line has no trailing newline in the file, so it is excluded from
+        # the natural range when end is None.
+        if end is None:
+            resolved_end = len(self.lines)
+        else:
+            resolved_end = min(end, len(self.lines))
+
+        # Slice the lines and join them. A trailing newline is added only when
+        # the result is a proper suffix — if the range ends before the buffer's
+        # last line, the final newline is unambiguous and is appended.
+        # If the range reaches or caps to the buffer's last line, no newline is
+        # added — that line is the in-progress line with no file-level newline.
+        return "\n".join(entry.data for entry in self.lines[start:resolved_end]) + ("\n" if end is not None and end < len(self.lines) else "")
+
+    def inserted_buffer(self, new_text: str, pos: int) -> dict[str, Any]:
+        """Return a result dict with the buffer after text is inserted at pos, or an error.
+
+        Inserting text at a line index means: the buffer's text is split at the start
+        of the target line, text is concatenated in between, and the suffix is
+        appended. The last line of the inserted text that has no trailing newline
+        merges into the first line of the suffix.
+
+        Appending (pos >= len(lines)): the first line of text is appended to the
+        buffer's last line. Remaining lines of text become new entries. The last
+        line of text with no trailing newline merges into the (now pushed) last
+        buffer line.
+
+        Returns {"ok": True, "buffer": Buffer, "count": int} if the insertion is valid.
+        Returns {"ok": False, "error": str} if the position is out of range.
+        The returned buffer shares this buffer's hooks dict — use copy() if
+        independence is needed.
+        """
+        # Guard: reject out-of-bounds positions.
+        if pos < 0 or pos > len(self.lines):
+            return {"ok": False, "error": f"Position {pos} is out of range (0–{len(self.lines)})."}
+        
+        # Capture the operation timestamp and parse the incoming text.
+        now = time.time()
+        new_text_lines = new_text.splitlines()
+
+        # Create alias for mutation — all branches share the same aliased buffer.
+        aliased = self.alias()
+        aliased.modified_at = now
+
+        # Create new BufferEntry objects for all lines of the new text.
+        new_entries = [
+            BufferEntry(data=line, modified_at=now, object_at=now)
+            for line in new_text_lines
+        ]
+
+        # If pos >= len(lines), then we append.
+        if pos >= len(self.lines):
+            # Prepend the text of the buffer's last entry to the text of the first new buffer entry.
+            new_entries[0].data = aliased.lines[-1].data + new_entries[0].data
+
+            # Set the new list of entries.
+            aliased.lines = aliased.lines[:-1] + new_entries
+
+        # Otherise, if pos < len(self.lines), then we insert.
+        else:
+            # Append the buffer's line[pos] to the last line of the new_entries.
+            new_entries[-1].data += aliased.lines[pos].data
+
+            # Set the new list of entries.
+            aliased.lines = aliased.lines[:pos] + new_entries + aliased.lines[pos + 1:]
+
+        return {"ok": True, "buffer": aliased, "count": len(new_text_lines)}
+
     def edited_buffer(
         self,
         old_string: str,
@@ -268,9 +377,8 @@ class Buffer:
         if lo == hi:
             return {"ok": False, "error": f"The range you specified is empty (start=end={lo}). Nothing was replaced."}
 
-        # Extract the target segment text and collect its entries.
-        segment_entries = self.lines[lo:hi]
-        segment_text = "\n".join(e.data for e in segment_entries) + "\n"
+        # Extract the target segment text using get_text.
+        segment_text = self.get_text(lo, hi)
 
         # Find every occurrence of old_string within the segment.
         all_ranges: list[tuple[int, int]] = []
@@ -389,34 +497,6 @@ class Buffer:
             "ok": True,
             "buffer": aliased,
             "count": len(all_ranges),
-        }
-
-    def written_buffer(self, text: str, pos: int) -> dict[str, Any]:
-        """Return a result dict with the buffer after text is inserted at pos, or an error.
-
-        Returns {"ok": True, "buffer": Buffer, "count": int} if the insertion is valid.
-        Returns {"ok": False, "error": str} if the position is out of range.
-        The returned buffer shares this buffer's hooks dict — use copy() if independence is needed.
-        """
-        if pos < 0 or pos > len(self.lines):
-            return {"ok": False, "error": f"Position {pos} is out of range (0–{len(self.lines)})."}
-
-        # Build the new entries from the provided text — a trailing newline is always appended.
-        now = time.time()
-        new_entries = [
-            BufferEntry(data=line, modified_at=now, object_at=now)
-            for line in (text + "\n").splitlines()
-        ]
-
-        # Return an alias of this buffer with the new entries inserted at pos.
-        aliased = self.alias()
-        aliased.lines = self.lines[:pos] + new_entries + self.lines[pos:]
-        aliased.modified_at = now
-
-        return {
-            "ok": True,
-            "buffer": aliased,
-            "count": len(new_entries),
         }
 
     def patched_buffer(self, patch_text: str) -> dict[str, Any]:
@@ -622,28 +702,6 @@ class Buffer:
             "removed": hook_name,
         }
 
-    def get_text(self, start: int = 0, end: int | None = None) -> str:
-        """Return the buffer content between start and end.
-
-        Returns the selected slice as a single string with entries joined by newlines
-        and a trailing newline at the end.
-
-        Args:
-            start: 0-based start index (inclusive). Negative values are relative to the end.
-            end: 0-based end index (exclusive), or None (default) to go to the last line.
-            Negative values are relative to the end.
-
-        Returns:
-            The selected slice as a single string with a trailing newline.
-            Returns an empty string with no newline if the slice is empty.
-        """
-        # Empty buffer — nothing to return.
-        if not self.lines:
-            return ""
-
-        # Slice the lines and join them, preserving the trailing newline.
-        return "\n".join(entry.data for entry in self.lines[start:end]) + "\n"
-
     def __len__(self) -> int:
         """Return the number of lines in the buffer."""
         return len(self.lines)
@@ -682,7 +740,7 @@ class Buffer:
         total_chars = sum(len(l) for l in segment) + len(segment)
         return ReadBufferResult(
             kind="content",
-            content="\n".join(segment),
+            content="\n".join(segment) + ("\n" if end < total else ""),
             start=start,
             end=end,
             total_chars=total_chars,
@@ -704,9 +762,12 @@ class Buffer:
             compiled = re.compile(pattern)
         except re.error as e:
             return GrepResult(ok=False, error=f"Invalid regex pattern '{pattern}': {e}.")
+
+        # Walk each line and test the pattern against it.
         matches = []
         for i, entry in enumerate(self.lines[start:end], start=start):
-            if compiled.search(entry.data):
+            # Add trailing newline for non-last lines so that patterns containing \n can match them.
+            if compiled.search(entry.data + ("\n" if i < len(self.lines) - 1 else "")):
                 matches.append(i)
 
         # Return the unclustered raw match list for the caller to further process.

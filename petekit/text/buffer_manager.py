@@ -557,7 +557,7 @@ class BufferManager(AgenticObject):
         pos = resolved
 
         # Produce the alias with the written content; propagate error dicts directly.
-        write_result = buf.written_buffer(text, pos)
+        write_result = buf.inserted_buffer(text, pos)
         if not write_result.get("ok"):
             return write_result
         alias = write_result["buffer"]
