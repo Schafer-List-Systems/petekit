@@ -44,8 +44,7 @@ provide configuration as JSON:
 ```json
 {{
     "message_watermark": 1,
-    "interval_secs": 60.0,
-    "persistent_thread_id": null
+    "interval_secs": 60.0
 }}
 ```
 

@@ -87,14 +87,14 @@ def _register_origin_cascade_drop(
     # Capture the full option buffer name in the closure — this is what gets dropped.
     option_name = buffer.name
 
-    def _cascade_drop_option(
+    async def _cascade_drop_option(
         hook_buffer_manager: BufferManager,
         origin_buffer: Buffer,
         args: dict[str, Any],
     ) -> None:
         """Drop the option buffer when the origin buffer is dropped."""
         if hook_buffer_manager.get_buffer(option_name) is not None:
-            hook_buffer_manager.drop_buffer(option_name)
+            await hook_buffer_manager.drop_buffer(option_name)
 
     # Register the cascade-drop hook on the origin buffer's AFTER_DROP_BUFFER hook point.
     origin.register_hook(
