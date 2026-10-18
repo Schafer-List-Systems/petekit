@@ -6,10 +6,11 @@ from petekit.text import (
     SmartBufferManager,
 )
 from petekit.stream import (
-    StreamBufferManager,
     Basher,
     Connector,
+    NotificationManager,
     SandboxedBasher,
+    StreamBufferManager,
     StreamRouter,
 )
 from petekit.stream.pattern_matchers import RegexConditionFactory
@@ -32,6 +33,7 @@ __all__ = [
     "StreamBufferManager",
     "Basher",
     "Connector",
+    "NotificationManager",
     "SandboxedBasher",
     "StreamRouter",
     "RegexConditionFactory",

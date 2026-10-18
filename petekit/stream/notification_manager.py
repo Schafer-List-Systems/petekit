@@ -25,6 +25,71 @@ _MIN_NOTIFICATION_INTERVAL = 20.0
 _MAX_NOTIFICATION_INTERVAL = 600.0
 
 
+_NOTIFICATION_MANAGER_DOC_BUFFER = "doc:notifications"
+_NOTIFICATION_MANAGER_DOC = f"""\
+## Notification Manager
+
+You can receive notifications when a stream buffer accumulates new entries.
+Notifications are delivered to you as prompts, allowing you to respond to stream
+activity without continuously polling.
+
+### Enable notifications for a stream
+
+Create a notification option buffer with the name `<STREAM>[notifications]` and
+provide configuration as JSON:
+
+```json
+{{
+    "batch_size": 1,
+    "interval_secs": 60.0,
+    "persistent_thread_id": null
+}}
+```
+
+The `[notifications]` option buffer is named `<STREAM>[notifications]`, where
+`<STREAM>` is the name of the stream buffer you want to watch. For example,
+if a stream is named `my_stream`, its notification option buffer is
+`my_stream[notifications]`.
+
+### Configuration options
+
+- **batch_size** (integer, default: 1): fire only when at least this many new
+  entries have accumulated. Set to a higher number to reduce notification
+  frequency on high-volume streams.
+
+- **interval_secs** (float, default: 20.0, min: 20.0, max: 600.0): minimum time
+  in seconds between consecutive notifications for the same stream. Even if
+  `batch_size` is reached sooner, the system waits at least this long since
+  the last notification before firing again.
+
+- **persistent_thread_id** (string, optional, default: null): the persistent
+  thread to deliver the notification to. If omitted or set to `null`, the
+  most recently active session is used automatically.
+
+### What happens when a notification fires
+
+1. All entries that are new since the last notification are marked as seen
+   (`agent_at` timestamp is set). This prevents double-notification.
+2. A prompt is delivered to you via the persistent thread containing:
+   - The stream name
+   - The count of new entries
+   - The timestamp range of the new entries
+3. You receive the prompt and can respond to the stream activity.
+
+### Disable notifications
+
+Drop the `<STREAM>[notifications]` option buffer. This cancels the notification
+timer for that stream immediately.
+
+### Requirements
+
+- The stream buffer itself must exist for notifications to fire
+- The `[notifications]` option buffer must be valid JSON with the fields
+  described above
+- `persistent_thread_id`, if provided, must be a valid thread identifier
+"""
+
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # Utility                                                                       #
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -108,8 +173,12 @@ async def notify_buffer(
         return
     unseen = [e for e in buffer.lines if e.agent_at is None]
 
+    # Skip this tick without notifying if there are no new entries.
+    if not unseen:
+        return
+
     # Not enough new entries to fire — skip this tick without notifying.
-    if not unseen or len(unseen) < batch_size:
+    if len(unseen) < batch_size:
         return
 
     # Build the notification prompt with entry count and timestamp range.
@@ -318,7 +387,7 @@ async def after_drop_notification_option(
 # -------------------------------------------------------------------------------------------------------------------- #
 
 class NotificationManager(StreamBufferManager, AgenticObject):
-    """You are a notification manager that fires agent notifications on stream buffers.
+    """You are a notification manager that fires notifications on stream buffers.
 
     Create a notification option buffer to enable notifications for a stream:
 
@@ -354,3 +423,7 @@ class NotificationManager(StreamBufferManager, AgenticObject):
             r"^.+\[notifications\]$",
             after_drop_notification_option,
         )
+
+        # Seed the documentation buffer so agents can discover the notification
+        # API without consulting the source.
+        self._create_buffer(_NOTIFICATION_MANAGER_DOC_BUFFER, text=_NOTIFICATION_MANAGER_DOC)
