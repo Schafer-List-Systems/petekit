@@ -15,7 +15,7 @@ from ...text.buffer_manager import Buffer, BufferManager, HookPoint, _sanitize_b
 from ..stream_router import RoutingConditionError, CONDITION_FN
 
 
-_CONDITION_LIST_BUFFER = "system:config:regex_condition"
+_CONDITION_LIST_BUFFER = "system:status:regex_condition"
 _REGEX_DOC_BUFFER = "doc:regex_conditions"
 _REGEX_PATTERN_BUFFER = "system:config:regex_condition"
 _CONDITION_BUFFER_PATTERN = r"^system:config:regex_condition:[^[]+$"
@@ -237,7 +237,7 @@ async def _before_update_condition(
 
 async def _after_update_condition(
     factory: RegexConditionFactory,
-    old_buffer: Buffer,
+    old_buffer: Buffer | None,
     new_buffer: Buffer,
     args: dict[str, Any],
 ) -> bool | str:
@@ -264,14 +264,12 @@ async def _after_update_condition(
 
     # Get the conditions dict from conditions_data and derive the condition name.
     conditions = conditions_data.get("conditions", {})
-    derived_name = old_buffer.name.removeprefix(f"{_REGEX_PATTERN_BUFFER}:")
+    derived_name = new_buffer.name.removeprefix(f"{_REGEX_PATTERN_BUFFER}:")
 
-    # Guard: the condition must exist in the catalog.
-    if derived_name not in conditions:
-        return True  # Condition not in catalog — nothing to sync.
-
-    # Update the pattern count and write back to conditions_data.
-    conditions[derived_name]["pattern_count"] = len(new_json)
+    # Replace the entire catalog entry with updated data — robust to missing entries.
+    conditions[derived_name] = {
+        "pattern_count": len(new_json),
+    }
     conditions_data["conditions"] = conditions
 
     # Write the updated conditions list back — non-critical bookkeeping.
@@ -345,7 +343,8 @@ async def _after_create_condition(factory: RegexConditionFactory, buffer: Buffer
             f"{reg_result.get('error')}"
         )
 
-    return True
+    # Sync the conditions list now that the condition is created.
+    return await _after_update_condition(factory, None, buffer, args)
 
 
 async def _after_drop_condition(factory: RegexConditionFactory, buffer: Buffer, args: dict[str, Any]) -> bool | str:
