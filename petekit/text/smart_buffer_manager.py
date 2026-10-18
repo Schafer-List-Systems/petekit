@@ -466,9 +466,8 @@ def on_hook_option_created(
 
 
 class SmartBufferManager(FunctionManager, OptionBufferManager, AgenticObject):
-    """Buffer manager that turns specific option buffers into active hooks on their origin buffer.
-    
-    See `doc:smart_buffers` for the full schema and behaviour."""
+    """I can register hooks (functions) on before or after changes to buffers..
+    "doc:smart_buffers" holds details."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
