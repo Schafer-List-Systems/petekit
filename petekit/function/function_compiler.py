@@ -349,8 +349,7 @@ async def _on_code_created(
 
 class FunctionCompiler(FunctionManager, AgenticObject):
     """I compile Python source-code strings into live callable functions.
-
-    See doc:function_compiler for the full schema and usage guide.
+    "doc:function_compiler" holds details.
     """
 
     def __init__(self, **kwargs: Any) -> None:

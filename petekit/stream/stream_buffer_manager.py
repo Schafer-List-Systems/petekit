@@ -274,8 +274,8 @@ def on_stream_option_dropped(
 # -------------------------------------------------------------------------------------------------------------------- #
 
 class StreamBufferManager(OptionBufferManager, AgenticObject):
-    """You can turn any buffer into a stream with time-based reading by creating a BUFFER[stream] option buffer.
-    See "doc:stream_buffers" for details.
+    """I can turn any buffer into a stream with time-based reading by creating a BUFFER[stream] option buffer.
+    The "doc:stream_buffers" holds details.
     """
 
     def __init__(self, **kwargs: Any) -> None:

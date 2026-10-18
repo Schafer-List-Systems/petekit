@@ -93,6 +93,7 @@ timer for that stream immediately.
 ### Requirements
 
 - The stream buffer itself must exist for notifications to fire
+- Without a `[notifications]` option buffer, no notifications fire on that stream
 - The `[notifications]` option buffer must be valid JSON with the fields
   described above
 - `persistent_thread_id`, if provided, must be a valid thread identifier
@@ -511,14 +512,8 @@ async def after_drop_notification_option(
 # -------------------------------------------------------------------------------------------------------------------- #
 
 class NotificationManager(StreamBufferManager, AgenticObject):
-    """You are a notification manager that fires notifications on stream buffers.
-
-    Create a notification option buffer to enable notifications for a stream:
-
-        STREAM[notifications] = {"message_watermark": 1, "interval_secs": 60.0}
-
-    Dropping the [notifications] option buffer cancels the notification timer.
-    No [notifications] option buffer means no notifications on that stream.
+    """I can enable notifications on stream buffers.
+    See "doc:notifications" for details.
     """
 
     def __init__(self, **kwargs: Any) -> None:

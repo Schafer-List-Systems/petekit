@@ -42,7 +42,7 @@ def _spill_to_buffer(caller, value: Any) -> str:
 
 
 class FunctionCaller(FunctionManager, AgenticObject):
-    """FunctionManager extension that provides a tool for calling registered functions by name.
+    """I can call registered functions by name.
     Large results are spilled to a temporary result buffer instead of being returned inline."""
 
     def __init__(self, **kwargs: Any) -> None:
