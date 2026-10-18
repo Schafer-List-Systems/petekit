@@ -376,6 +376,41 @@ def _validate_notifications_config(
     return None
 
 
+async def before_create_notification_option(
+    processor: BufferManager,
+    option_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """Resolve the persistent_thread_id at creation time if omitted.
+
+    If the proposed config has no persistent_thread_id, the current thread's ID
+    is injected so the notification is delivered to the active conversation.
+    """
+    # Guard: parse the buffer name from the option buffer name.
+    if not option_buffer.name.endswith("[notifications]"):
+        return None
+    origin_buffer_name = option_buffer.name[: -len("[notifications]")]
+    if not origin_buffer_name:
+        return None
+
+    # Parse the proposed buffer content as JSON.
+    try:
+        config = json.loads(option_buffer.get_text())
+    except json.JSONDecodeError:
+        return None
+
+    # Only inject if persistent_thread_id is absent.
+    if "persistent_thread_id" not in config:
+        current = processor.get_current_thread_id()
+        if current is not None:
+            config["persistent_thread_id"] = current
+            # Patch the buffer's lines in place before creation commits.
+            patched_text = json.dumps(config, indent=2) + "\n"
+            option_buffer.set_text(patched_text, modified_at=time.time())
+
+    return None
+
+
 async def before_update_notification_option(
     processor: BufferManager,
     old_option_buffer: Buffer,
@@ -495,6 +530,12 @@ class NotificationManager(StreamBufferManager, AgenticObject):
         self._stream_buffer_notifications: dict[str, _Notification] = {}
 
         # Register the [notifications] pattern hooks on the BufferManager.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_CREATE_BUFFER,
+            "resolve_notification_thread",
+            r"^.+\[notifications\]$",
+            before_create_notification_option,
+        )
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_CREATE_BUFFER,
             "create_notification_option",

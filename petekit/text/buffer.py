@@ -295,6 +295,25 @@ class Buffer:
         # added — that line is the in-progress line with no file-level newline.
         return "\n".join(entry.data for entry in self.lines[start:resolved_end]) + ("\n" if end is not None and end < len(self.lines) else "")
 
+    def set_text(self, text: str, modified_at: float | None = None) -> None:
+        """Replace all buffer lines with entries parsed from text.
+
+        The text is split on newlines using split() to preserve the trailing
+        empty entry if text ends with a newline. The modified_at timestamp is
+        applied to all new entries. Uses the current buffer's modified_at if
+        not provided.
+        """
+        # Resolve the timestamp to apply to all new entries.
+        ts = modified_at if modified_at is not None else self.modified_at
+
+        # Split preserving trailing empty entry, then build BufferEntry objects.
+        lines = text.split("\n")
+        self.lines = [
+            BufferEntry(data=line, modified_at=ts, object_at=ts)
+            for line in lines
+        ]
+        self.modified_at = ts
+
     def inserted_buffer(self, new_text: str, pos: int) -> dict[str, Any]:
         """Return a result dict with the buffer after text is inserted at pos, or an error.
 
