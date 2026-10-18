@@ -159,11 +159,11 @@ def _make_on_update_code(compiler: "FunctionCompiler", func_name: str) -> Before
     """
     async def on_update_code(
         buffer_manager: BufferManager,
-        buffer: Buffer,
+        old_buffer: Buffer,
         new_buffer: Buffer,
         args: dict[str, Any],
     ) -> bool | str | None:
-        new_text = args.get("text") or args.get("new_string") or args.get("new_text") or ""
+        new_text = new_buffer.get_text()
         # Validate structure and run trial compilation — raises on any error.
         try:
             compiled_name = _validate_and_trial_compile(compiler, new_text)
