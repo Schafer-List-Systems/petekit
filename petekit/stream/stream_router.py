@@ -495,8 +495,8 @@ def evaluate_condition(
 # -------------------------------------------------------------------------------------------------------------------- #
 
 class StreamRouter(FunctionManager, StreamBufferManager):
-    """You can route appended text on streams conditionally to different output streams by creating routing table option buffers.
-    See "doc:stream_router" for details.
+    """I can route appended text on streams conditionally to different output streams by creating routing table option buffers.
+    "doc:stream_router" holds details.
     """
 
     def __init__(self, **kwargs: Any) -> None:
