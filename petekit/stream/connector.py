@@ -94,7 +94,7 @@ class Connector(StreamBufferManager, AgenticObject):
             args: dict[str, Any],
         ) -> str | None:
             # Extract only the newly appended text: use the old line count as the start index.
-            appended_text = new_buffer.get_text(start=len(old_buffer))
+            appended_text = new_buffer.get_text(start=len(old_buffer)-1)
             # Forward the newly appended text to the connection.
             return self._connection_send_hook(name, appended_text)
 

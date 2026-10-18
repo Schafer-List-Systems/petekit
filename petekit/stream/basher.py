@@ -125,7 +125,7 @@ class Basher(StreamBufferManager, AgenticObject):
             args: dict[str, Any],
         ) -> str | None:
             # Extract only the newly appended text: use the old line count as the start index.
-            appended_text = new_buffer.get_text(start=len(old_buffer))
+            appended_text = new_buffer.get_text(start=len(old_buffer)-1)
 
             # Forward the newly appended text to the process's stdin.
             return self._bash_send_hook(process_id, appended_text)

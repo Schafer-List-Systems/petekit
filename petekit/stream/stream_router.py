@@ -364,7 +364,7 @@ async def route_dispatch(
         return None
 
     # Extract only the newly appended text.
-    appended_text = new_buffer.get_text(start=len(old_buffer))
+    appended_text = new_buffer.get_text(start=len(old_buffer)-1)
     if not appended_text.strip():
         return None
 
