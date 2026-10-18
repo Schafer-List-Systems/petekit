@@ -359,7 +359,11 @@ async def route_dispatch(
     try:
         config = json.loads(option_buffer.get_text())
     except json.JSONDecodeError:
-        processor.write_buffer(_LOG_BUFFER, f"ROUTING ERROR: {option_buffer_name} is not valid JSON")
+        await _safe_log(
+            processor,
+            f"ROUTING ERROR: {option_buffer_name} is not valid JSON"
+        )
+        
         return None
 
     # Extract only the newly appended text.
