@@ -84,9 +84,8 @@ def _safe_log(processor: Any, message: str) -> bool:
 
 
 _STREAM_ROUTER_DOC_BUFFER = "doc:stream_router"
-_STREAM_ROUTER_DOC = """\
+_STREAM_ROUTER_DOC = f"""\
 ## Stream Router
-
 You can route appended text conditionally to different output streams by creating
 routing table option buffers. Conditions are registered as functions with signature
 `(function_manager, stream, text, metadata) -> bool`.
@@ -102,13 +101,13 @@ stream receives the text.
 Create a "STREAM[routing_table:NAME]" option buffer with this JSON content:
 
 ```json
-{
+{{
     "routing_table": [
         [["condition1", "condition2"], "output_stream"],
         [["true"], "fallback_stream"]
     ],
     "fallthrough": "custom_fallthrough"
-}
+}}
 ```
 
 - **routing_table**: a list of [rule, output_stream] routes
@@ -133,11 +132,11 @@ Create a "STREAM[routing_table:NAME]" option buffer with this JSON content:
 ### Notifications
 
 You can enable notifications on any output stream independently via the notifications
-option buffer: "STREAM[routing_table:NAME]:fallthrough[notifications] = {...}"
+option buffer: "STREAM[routing_table:NAME]:fallthrough[notifications] = {{...}}"
 
 ### Feedback Stream
 
-The feedback stream "STREAM_ROUTER" records all routing events and errors.
+The feedback stream `{_LOG_BUFFER}` records all routing events and errors.
 """
 
 
