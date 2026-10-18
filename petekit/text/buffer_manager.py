@@ -132,12 +132,12 @@ def _make_persist_buffer_hook(bm: BufferManager) -> AfterUpdateBuffer:
     """
     def _persist_buffer_update_hook(
         buffer_manager: BufferManager,
-        buffer: Buffer,
+        old_buffer: Buffer,
         new_buffer: Buffer,
         args: dict[str, Any],
     ) -> None:
         # Persist the buffer to disk — called after every successful mutation.
-        _persist_buffer(buffer_manager, buffer)
+        _persist_buffer(buffer_manager, new_buffer)
     return _persist_buffer_update_hook
 
 
