@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from peteos import AgenticObject
@@ -66,6 +68,10 @@ if a stream is named `my_stream`, its notification option buffer is
   thread to deliver the notification to. If omitted or set to `null`, the
   most recently active session is used automatically.
 
+- **notify_on_empty** (bool, optional, default: false): fire a notification even
+  when there are no unseen entries. Useful for keep-alive or heartbeat signals
+  on low-activity streams.
+
 ### What happens when a notification fires
 
 1. All entries that are new since the last notification are marked as seen
@@ -90,9 +96,42 @@ timer for that stream immediately.
 """
 
 
+class _TriggerSource(Enum):
+    """The origin of a notification trigger."""
+
+    TIMER = "timer"
+    MESSAGE = "message"
+
+
+@dataclass
+class _Notification:
+    """Holds the state for one origin buffer's notification timer loop."""
+
+    origin_buffer_name: str
+    task: asyncio.Task
+    last_fired: float | None = None
+
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # Utility                                                                       #
 # -------------------------------------------------------------------------------------------------------------------- #
+
+def _get_notification_config(
+    processor: "NotificationManager",
+    origin_buffer_name: str,
+) -> dict[str, Any] | None:
+    """Return the notification config dict for an origin buffer, or None if not configured."""
+    # Look up the [notifications] option buffer for this origin buffer.
+    option_name = _notifications_option_name(origin_buffer_name)
+    option_buffer = processor.get_buffer(option_name)
+    if option_buffer is None:
+        return None
+
+    # Parse the option buffer JSON — return None if the config is malformed.
+    try:
+        return json.loads(option_buffer.get_text())
+    except json.JSONDecodeError:
+        return None
 
 def _most_recent_persistent_thread(obj: AgenticObject) -> str | None:
     """Return the persistent_thread_id of the session with the newest directory mtime.
@@ -140,13 +179,15 @@ def _notifications_option_name(origin_buffer_name: str) -> str:
 # -------------------------------------------------------------------------------------------------------------------- #
 
 async def notify_buffer(
-    processor: "NotificationManager",
+    processor: NotificationManager,
     origin_buffer_name: str,
+    trigger: _TriggerSource = _TriggerSource.TIMER,
 ) -> None:
     """Check batch threshold and fire notification for a single buffer.
 
-    Reads the [notifications] option buffer JSON fresh on every call to get
-    the current configuration. Marks all checked entries as seen before firing.
+    The trigger parameter indicates whether this was triggered by a new message
+    arriving (_TriggerSource.MESSAGE) or by the periodic timer (_TriggerSource.TIMER).
+    Marks all checked entries as seen before firing.
     """
     # Look up the [notifications] option buffer for this stream.
     notifications_option_name = _notifications_option_name(origin_buffer_name)
@@ -173,12 +214,13 @@ async def notify_buffer(
         return
     unseen = [e for e in buffer.lines if e.agent_at is None]
 
-    # Skip this tick without notifying if there are no new entries.
-    if not unseen:
+    # Skip this tick without notifying if there are no new entries,
+    # unless notify_on_empty is set in the config.
+    if not unseen and not config.get("notify_on_empty"):
         return
 
-    # Not enough new entries to fire — skip this tick without notifying.
-    if len(unseen) < batch_size:
+    # Not enough new entries — skip the notification for now.
+    if trigger == _TriggerSource.MESSAGE and len(unseen) < batch_size:
         return
 
     # Build the notification prompt with entry count and timestamp range.
@@ -200,6 +242,11 @@ async def notify_buffer(
         persistent_thread_id = _most_recent_persistent_thread(processor)
 
     # Deliver the notification to the agent via the resolved persistent thread.
+    # Record the fire time on the notification state so the interval throttle can use it.
+    loop = processor._stream_buffer_notifications_loop.get(origin_buffer_name)
+    if loop is not None:
+        loop.last_fired = now
+
     try:
         await processor.notify_agent(prompt, persistent_thread_id=persistent_thread_id)
     except Exception as exc:
@@ -207,8 +254,28 @@ async def notify_buffer(
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Notification timer loop                                                        #
+# Notification triggers
 # -------------------------------------------------------------------------------------------------------------------- #
+
+async def after_update_origin_buffer(
+    processor: "NotificationManager",
+    old_buffer: Buffer,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Reactive batch-size check: fire immediately when new entries arrive and batch is full.
+
+    Registered as an AFTER_UPDATE_BUFFER hook on the origin stream buffer.
+    This is in addition to the timer-based check in _notification_loop.
+    """
+    # Check if notifications are enabled for this buffer — skip if no option buffer exists.
+    option_name = _notifications_option_name(new_buffer.name)
+    if processor.get_buffer(option_name) is None:
+        return
+
+    # Fire immediately — check if batch_size is met and notify if so.
+    await notify_buffer(processor, new_buffer.name, trigger=_TriggerSource.MESSAGE)
+
 
 async def _notification_loop(
     processor: "NotificationManager",
@@ -244,7 +311,7 @@ async def _notification_loop(
             if processor.get_buffer(origin_buffer_name) is None:
                 _logger.error(f"[_notification_loop] stream buffer '{origin_buffer_name}' disappeared — timer exiting")
                 break
-            await notify_buffer(processor, origin_buffer_name)
+            await notify_buffer(processor, origin_buffer_name, trigger=_TriggerSource.TIMER)
 
     except asyncio.CancelledError:
         pass  # Clean shutdown when the timer task is cancelled.
@@ -355,9 +422,21 @@ async def after_create_notification_option(
         _logger.error(f"[after_create_notification_option] cannot parse origin buffer name from '{option_buffer.name}'")
         return
 
-    # Start the per-buffer notification timer and store the task.
+    # Start the per-buffer notification timer and store its state.
     task = asyncio.create_task(_notification_loop(processor, origin_buffer_name))
-    processor._stream_buffer_notifications_loop[origin_buffer_name] = task
+    processor._stream_buffer_notifications_loop[origin_buffer_name] = _Notification(
+        origin_buffer_name=origin_buffer_name,
+        task=task,
+    )
+
+    # Register the reactive batch-size check on the origin buffer.
+    origin = processor.get_buffer(origin_buffer_name)
+    if origin is not None:
+        origin.register_hook(
+            HookPoint.AFTER_UPDATE_BUFFER,
+            "notification",
+            after_update_origin_buffer,
+        )
 
 
 async def after_drop_notification_option(
@@ -377,9 +456,14 @@ async def after_drop_notification_option(
         return
 
     # Cancel and remove the timer task for this buffer.
-    task = processor._stream_buffer_notifications_loop.pop(origin_buffer_name, None)
-    if task is not None:
-        task.cancel()
+    loop = processor._stream_buffer_notifications_loop.pop(origin_buffer_name, None)
+    if loop is not None:
+        loop.task.cancel()
+
+    # Unregister the reactive batch-size check from the origin buffer.
+    origin = processor.get_buffer(origin_buffer_name)
+    if origin is not None:
+        origin.unregister_hook(HookPoint.AFTER_UPDATE_BUFFER, "notification")
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -401,8 +485,8 @@ class NotificationManager(StreamBufferManager, AgenticObject):
         # Initialize the StreamBufferManager base (OptionBufferManager inside).
         super().__init__(**kwargs)
 
-        # Per-origin-buffer notification timer tasks: origin_buffer_name -> asyncio.Task.
-        self._stream_buffer_notifications_loop: dict[str, asyncio.Task] = {}
+        # Per-origin-buffer notification state: buffer name -> notification loop state.
+        self._stream_buffer_notifications_loop: dict[str, _Notification] = {}
 
         # Register the [notifications] pattern hooks on the BufferManager.
         self.register_buffer_pattern_hook(
