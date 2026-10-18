@@ -108,8 +108,9 @@ class _Notification:
     """Holds the state for one origin buffer's notification timer loop."""
 
     origin_buffer_name: str
-    task: asyncio.Task
+    task: asyncio.Task | None
     last_fired: float | None = None
+    last_trigger: _TriggerSource | None = None
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -189,18 +190,10 @@ async def notify_buffer(
     arriving (_TriggerSource.MESSAGE) or by the periodic timer (_TriggerSource.TIMER).
     Marks all checked entries as seen before firing.
     """
-    # Look up the [notifications] option buffer for this stream.
-    notifications_option_name = _notifications_option_name(origin_buffer_name)
-    notifications_option = processor.get_buffer(notifications_option_name)
-    if notifications_option is None:
-        _logger.error(f"[notify_buffer] notifications option not found for '{origin_buffer_name}' — dropped before fire")
-        return
-
-    # Parse the notification configuration from the option buffer JSON.
-    try:
-        config = json.loads(notifications_option.get_text())
-    except json.JSONDecodeError:
-        _logger.error(f"[notify_buffer] '{notifications_option_name}' is not valid JSON")
+    # Load the notification config — skip if the option buffer is missing or malformed.
+    config = _get_notification_config(processor, origin_buffer_name)
+    if config is None:
+        _logger.error(f"[notify_buffer] notifications option not found or not valid JSON for '{origin_buffer_name}' — dropped before fire")
         return
 
     # Clamp batch_size to at least 1 — notification fires only when this many entries accumulate.
@@ -222,6 +215,12 @@ async def notify_buffer(
     # Not enough new entries — skip the notification for now.
     if trigger == _TriggerSource.MESSAGE and len(unseen) < batch_size:
         return
+
+    # Cancel any pending timer — a new message arrived and we will fire now.
+    if trigger == _TriggerSource.MESSAGE:
+        loop = processor._stream_buffer_notifications_loop.get(origin_buffer_name)
+        if loop is not None:
+            loop.task.cancel()
 
     # Build the notification prompt with entry count and timestamp range.
     ts_start = unseen[0].modified_at
@@ -246,19 +245,43 @@ async def notify_buffer(
     loop = processor._stream_buffer_notifications_loop.get(origin_buffer_name)
     if loop is not None:
         loop.last_fired = now
+        loop.last_trigger = trigger
 
+    # Deliver the notification to the agent via the resolved persistent thread.
     try:
         await processor.notify_agent(prompt, persistent_thread_id=persistent_thread_id)
     except Exception as exc:
         processor.write_buffer("system:log:notification_manager", f"NOTIFICATION ERROR: {exc}")
+
+    # Re-arm the timer for the next periodic check.
+    _rearm_timer(processor, origin_buffer_name)
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
 # Notification triggers
 # -------------------------------------------------------------------------------------------------------------------- #
 
+def _rearm_timer(processor: NotificationManager, origin_buffer_name: str) -> None:
+    """Rearm the one-shot notification timer for an origin buffer.
+
+    Called at the end of notify_buffer for TIMER-triggered events, and when
+    a [notifications] option buffer is first created.
+    """
+    # Guard: the notification state must exist for this origin buffer.
+    loop = processor._stream_buffer_notifications_loop.get(origin_buffer_name)
+    if loop is None:
+        return
+
+    # Cancel any existing pending timer — this call supersedes it.
+    if loop.task is not None:
+        loop.task.cancel()
+
+    # Schedule the one-shot notification timer.
+    loop.task = asyncio.create_task(_notification_timer(processor, origin_buffer_name))
+
+
 async def after_update_origin_buffer(
-    processor: "NotificationManager",
+    processor: NotificationManager,
     old_buffer: Buffer,
     new_buffer: Buffer,
     args: dict[str, Any],
@@ -266,7 +289,7 @@ async def after_update_origin_buffer(
     """Reactive batch-size check: fire immediately when new entries arrive and batch is full.
 
     Registered as an AFTER_UPDATE_BUFFER hook on the origin stream buffer.
-    This is in addition to the timer-based check in _notification_loop.
+    This is in addition to the timer-based check in _notification_timer.
     """
     # Check if notifications are enabled for this buffer — skip if no option buffer exists.
     option_name = _notifications_option_name(new_buffer.name)
@@ -277,44 +300,39 @@ async def after_update_origin_buffer(
     await notify_buffer(processor, new_buffer.name, trigger=_TriggerSource.MESSAGE)
 
 
-async def _notification_loop(
-    processor: "NotificationManager",
+async def _notification_timer(
+    processor: NotificationManager,
     origin_buffer_name: str,
 ) -> None:
-    """Per-buffer notification timer loop. Runs until cancelled or config is dropped.
+    """One-shot notification timer for a single origin buffer.
 
-    Reads the interval from the [notifications] option buffer JSON on every tick
-    so config changes take effect without restarting the timer.
+    Fires once after the configured interval, then exits. The caller (notify_buffer)
+    re-arms the timer at the end of a TIMER-triggered notification.
     """
-    try:
-        while True:
-            # Look up the [notifications] option buffer to get the current interval.
-            notifications_option_name = _notifications_option_name(origin_buffer_name)
-            notifications_option = processor.get_buffer(notifications_option_name)
-            if notifications_option is None:
-                _logger.error(f"[_notification_loop] '[notifications]' option for '{origin_buffer_name}' disappeared — timer exiting")
-                break
+    # Load the notification config — use defaults if the option buffer is missing or malformed.
+    config = _get_notification_config(processor, origin_buffer_name)
+    if config is None:
+        _logger.error(f"[_notification_timer] '[notifications]' option for '{origin_buffer_name}' disappeared or is not valid JSON — timer exiting")
+        return
 
-            # Parse the interval from JSON, capped between min and max.
-            try:
-                config = json.loads(notifications_option.get_text())
-            except json.JSONDecodeError:
-                _logger.error(f"[_notification_loop] '{notifications_option_name}' is not valid JSON — using defaults")
-                config = {}
-            interval_secs = max(
-                _MIN_NOTIFICATION_INTERVAL,
-                min(_MAX_NOTIFICATION_INTERVAL, float(config.get("interval_secs", _MIN_NOTIFICATION_INTERVAL))),
-            )
+    # Parse the interval from JSON, capped between min and max.
+    interval_secs = max(
+        _MIN_NOTIFICATION_INTERVAL,
+        min(_MAX_NOTIFICATION_INTERVAL, float(config.get("interval_secs", _MIN_NOTIFICATION_INTERVAL))),
+    )
 
-            # Sleep the configured interval, then fire a notification if the buffer still exists.
-            await asyncio.sleep(interval_secs)
-            if processor.get_buffer(origin_buffer_name) is None:
-                _logger.error(f"[_notification_loop] stream buffer '{origin_buffer_name}' disappeared — timer exiting")
-                break
-            await notify_buffer(processor, origin_buffer_name, trigger=_TriggerSource.TIMER)
+    # Sleep the configured interval, then fire a notification if the buffer still exists.
+    await asyncio.sleep(interval_secs)
+    if processor.get_buffer(origin_buffer_name) is None:
+        _logger.error(f"[_notification_timer] stream buffer '{origin_buffer_name}' disappeared — timer exiting")
+        return
 
-    except asyncio.CancelledError:
-        pass  # Clean shutdown when the timer task is cancelled.
+    # Reset the task to None — the timer has fired and will be re-armed by notify_buffer.
+    loop = processor._stream_buffer_notifications_loop.get(origin_buffer_name)
+    if loop is not None:
+        loop.task = None
+
+    await notify_buffer(processor, origin_buffer_name, trigger=_TriggerSource.TIMER)
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -423,7 +441,7 @@ async def after_create_notification_option(
         return
 
     # Start the per-buffer notification timer and store its state.
-    task = asyncio.create_task(_notification_loop(processor, origin_buffer_name))
+    task = asyncio.create_task(_notification_timer(processor, origin_buffer_name))
     processor._stream_buffer_notifications_loop[origin_buffer_name] = _Notification(
         origin_buffer_name=origin_buffer_name,
         task=task,
