@@ -129,6 +129,8 @@ def _enforce_append_only(
 
     The update is append-only when new_buffer's full text starts with
     old_buffer's full text — no prior content is removed or replaced.
+    Additionally, new_buffer must end with a trailing newline to maintain
+    buffer consistency.
     """
     # Capture the full text of both states to compare containment.
     old_text = old_buffer.get_text()
@@ -139,6 +141,12 @@ def _enforce_append_only(
         return (
             f"Stream '{old_buffer.name}' requires append-only writes. "
             f"The update removes or replaces existing content — rejected."
+        )
+
+    # Reject if new text does not end with a trailing newline.
+    if not new_text.endswith("\n"):
+        return (
+            f"Append a trailing newline `\n` when writing to streams like '{old_buffer.name}'."
         )
 
 
