@@ -26,6 +26,15 @@ from .buffer import (
 )
 
 
+from peteos.oap.agentic_object import AgenticObject
+from peteos import tool, sandbox
+
+
+# Managed buffer names — system:status: namespace and diff namespace
+_STATUS_BUFFER = "system:status:buffers"
+_DIFF_BUFFER_PREFIX = "diff:"
+
+
 @dataclass
 class PatternHook:
     """A single pattern-based hook registered on the registry.
@@ -66,13 +75,85 @@ class HookPointRegistry:
         return matching_hooks
 
 
-from peteos.oap.agentic_object import AgenticObject
-from peteos import tool, sandbox
+###############################################################################
+# Buffers-buffer maintenance hooks
+# Keep the system:status:buffers JSON listing consistent after any buffer mutation.
+###############################################################################
 
+async def _refresh_buffers_buffer_on_mutation(
+    buffer_manager,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer | None,
+    args: dict[str, Any],
+) -> None:
+    """Keep the system:status:buffers registry current after any buffer structural change.
 
-# Managed buffer names — system:status: namespace and diff namespace
-_STATUS_BUFFER = "system:status:buffers"
-_DIFF_BUFFER_PREFIX = "diff:"
+    Incremental update: patches the JSON listing in-place rather than rebuilding
+    from scratch. Avoids the extra create_buffer call and its attendant hook storms.
+
+    On AFTER_CREATE_BUFFER:  old_buffer is None, new_buffer is the freshly created buffer.
+    On AFTER_DROP_BUFFER:    old_buffer is the dropped buffer, new_buffer is None.
+    On AFTER_UPDATE_BUFFER:  old_buffer is pre-mutation (with prior line count),
+                              new_buffer is post-mutation (with current line count).
+
+    The handler never recurses: if the buffer being mutated is system:status:buffers
+    itself, the refresh is a no-op to prevent the listing refresh from triggering itself.
+    """
+    # Guard: never recurse on the registry buffer itself.
+    if (new_buffer is not None and new_buffer.name == _STATUS_BUFFER) or \
+       (old_buffer is not None and old_buffer.name == _STATUS_BUFFER):
+        return
+
+    # Pull the current registry buffer — created at init so it must exist.
+    status_buffer = buffer_manager.get_buffer(_STATUS_BUFFER)
+    if status_buffer is None:
+        import logging
+        logging.error(
+            f"[buffers_buffer] system:status:buffers buffer not found in manager "
+            f"after mutation hook — expected it to exist since it is created at init. "
+            f"The status buffer may have been dropped or corrupted."
+        )
+        return
+
+    # Parse the current JSON listing. An empty file is a valid start state.
+    current_text = status_buffer.get_text()
+    try:
+        records = json.loads(current_text) if current_text.strip() else []
+    except json.JSONDecodeError:
+        records = []
+
+    # Build a lookup dict for O(1) mutations without linear scan.
+    records_by_name = {record["name"]: record for record in records}
+
+    # Apply the incremental mutation based on which hook point fired.
+    if new_buffer is not None:
+        # AFTER_CREATE_BUFFER or AFTER_UPDATE_BUFFER — add or overwrite the entry.
+        records_by_name[new_buffer.name] = {
+            "name": new_buffer.name,
+            "lines": len(new_buffer.lines),
+        }
+
+    elif old_buffer is not None:
+        # AFTER_DROP_BUFFER — remove the dropped buffer's entry.
+        records_by_name.pop(old_buffer.name, None)
+
+    else:
+        # Neither buffer changed — nothing to do.
+        return
+
+    # Sort for deterministic output and serialize back to text.
+    sorted_records = sorted(records_by_name.values(), key=lambda r: r["name"])
+    new_text = json.dumps(sorted_records, indent=2)
+
+    # Write the updated listing to the status buffer. The AFTER_UPDATE_BUFFER hook on the
+    # status buffer fires, but the recursion guard at the top of this handler returns
+    # early since both new_buffer and old_buffer are the status buffer.
+    result = await buffer_manager.create_buffer(_STATUS_BUFFER, text=new_text, overwrite=True)
+    if not result.get("ok"):
+        raise RuntimeError(
+            f"failed to refresh buffer registry: "
+            f"create_buffer failed: {result.get('error', 'unknown')}"
+        )
 
 
 def _diff_buffer_name(a: str, b: str) -> str:
@@ -265,12 +346,6 @@ async def _create_buffer_implementation(
         if post_result is not True and post_result is not None:
             post_result = str(post_result)
 
-    # Refresh the system buffer listing so the new buffer is visible to the agent.
-    if name != _STATUS_BUFFER:
-        refresh_result = await bm._refresh_buffers_buffer()
-        if not refresh_result.get("ok"):
-            raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
-
     # Signal whether this was a fresh creation or an overwrite, and how many lines were written.
     return {"ok": True, "created": not existed, "overwritten": existed, "lines": create_result.get("lines", 0)}
 
@@ -342,6 +417,17 @@ async def _restore_create_buffers(self: BufferManager) -> None:
             # Best-effort: non-critical restore — log and continue.
             import logging
             logging.warning(f"[_restore_create_buffers] failed to restore buffer '{name}': {e}")
+
+        # Reconcile: the status buffer was created with an empty listing. Populate it now
+        # with an entry for every buffer currently in the manager, including itself.
+        # This is not recursive — we write directly via create_buffer, not through a hook.
+        records = [{"name": name, "lines": len(buffer)} for name, buffer in self._buffers.items()]
+        status_text = json.dumps(records, indent=2)
+        result = self._create_buffer(_STATUS_BUFFER, text=status_text)
+        if not result.get("ok"):
+            raise RuntimeError(
+                f"failed to seed status buffer: {result.get('error', 'unknown')}"
+            )
 
 
 def _lines_to_skip(segment: list[str], start_offset: int, max_chars: int) -> tuple[list[tuple[int, int]], int]:
@@ -454,13 +540,37 @@ class BufferManager(AgenticObject):
         # Bootstrap the system status buffer — this must exist before any agent runs.
         self._create_buffer(_STATUS_BUFFER, text="[]")
 
+        # Register the buffers-buffer maintenance hooks as pattern hooks so every buffer
+        # created from this point forward automatically participates in keeping the
+        # registry current. apply_to_existing=True handles the status buffer right now.
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            "maintain_buffers_buffer",
+            ".*",
+            lambda buffer_manager, buffer, args: _refresh_buffers_buffer_on_mutation(
+                buffer_manager, None, buffer, args
+            ),
+            apply_to_existing=True,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_UPDATE_BUFFER,
+            "maintain_buffers_buffer",
+            ".*",
+            _refresh_buffers_buffer_on_mutation,
+            apply_to_existing=True,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_DROP_BUFFER,
+            "maintain_buffers_buffer",
+            ".*",
+            lambda buffer_manager, buffer, args: _refresh_buffers_buffer_on_mutation(
+                buffer_manager, buffer, None, args
+            ),
+            apply_to_existing=True,
+        )
+
         # Register the restore hook so persisted buffers survive instance restarts.
         self._register_restore_hook("create_buffers", _restore_create_buffers)
-
-    async def _refresh_buffers_buffer(self) -> dict[str, Any]:
-        records = [{"name": name, "lines": len(buf.lines)} for name, buf in self._buffers.items()]
-        text = json.dumps(records, indent=2)
-        return await self.create_buffer(_STATUS_BUFFER, text=text, overwrite=True)
 
     def get_buffer(self, name: str) -> Buffer | None:
         """Protected buffer lookup — returns the Buffer object or None if not found.
@@ -594,14 +704,6 @@ class BufferManager(AgenticObject):
             write_args,
         )
 
-        # Refresh the buffer registry to keep the system listing current.
-        if name != _STATUS_BUFFER:
-            refresh_result = await self._refresh_buffers_buffer()
-            if not refresh_result.get("ok"):
-                # TODO(design): buffer already modified — rolling back would require restoring prior
-                # content. Until a rollback strategy is defined, raising the error leaves the
-                # BufferManager in an inconsistent state (content changed, listing stale).
-                raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
         return {"ok": True, "lines_written": count, "total_lines": len(buf.lines)}
 
     @tool
@@ -638,13 +740,6 @@ class BufferManager(AgenticObject):
         # Fire AFTER_DROP_BUFFER post-drop hooks — buffer is gone from the manager.
         # The buffer object itself is still alive for the duration of this call.
         await buf._fire_hooks(self, None, HookPoint.AFTER_DROP_BUFFER, drop_args)
-
-        refresh_result = await self._refresh_buffers_buffer()
-        if not refresh_result.get("ok"):
-            # TODO(design): buffer already deleted from self._buffers — rolling back would require
-            # restoring from a snapshot. Until a rollback strategy is defined, raising the error
-            # leaves BufferManager in an inconsistent state (buffer gone, listing stale).
-            raise RuntimeError(f"failed to refresh buffers list: {refresh_result.get('error')}")
 
         # Remove the persisted files for this buffer now that the drop has succeeded.
         _drop_persisted_buffer(self, name)
