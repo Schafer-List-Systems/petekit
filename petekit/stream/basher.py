@@ -28,8 +28,9 @@ The system manages process lifecycle — you work directly with the buffers.
 
 ### Start a process
 
-Create a buffer named `bash:<title>` containing your command or script. The buffer's text is
-the command or script to execute — any valid bash code is accepted. The system starts the process and creates four stream buffers
+Create a buffer named `bash:<title>` (in that scope, not a subscope) containing your
+command or script. The buffer's text is the command or script to execute — any valid
+bash code is accepted. The system starts the process and creates four stream buffers
 for you automatically.
 
 For example, to run `ls -la` in `/tmp`:

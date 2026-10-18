@@ -86,6 +86,7 @@ async def _safe_log(processor: Any, message: str) -> bool:
 _STREAM_ROUTER_DOC_BUFFER = "doc:stream_router"
 _STREAM_ROUTER_DOC = f"""\
 ## Stream Router
+
 You can route appended text conditionally to different output streams by creating
 routing table option buffers. Conditions are registered as functions with signature
 `(function_manager, stream, text, metadata) -> bool`.
@@ -98,7 +99,8 @@ All conditions in a route's rule must return True for the route to fire and have
 its text written to the output stream. When no route matches, the fallthrough
 stream receives the text.
 
-Create a "STREAM[routing_table:NAME]" option buffer with this JSON content:
+For a stream buffer `my_stream`, create a `my_stream[routing_table:NAME]` option
+buffer with this JSON content:
 
 ```json
 {{
@@ -124,7 +126,7 @@ Create a "STREAM[routing_table:NAME]" option buffer with this JSON content:
 - Prefix a condition name with "!" to negate its result
 - Use "true" as a catch-all condition that always matches
 - When no route matches, text is written to the configured fallthrough stream,
-  or by default to "STREAM[routing_table:NAME]:fallthrough"
+  or by default to `my_stream[routing_table:NAME]:fallthrough`
 - Every routing table writes appended text to exactly one output stream — whether
   that stream is the matched route's output or the table's fallthrough stream.
   With N routing tables applied, the same text appears N times in total.
@@ -132,7 +134,7 @@ Create a "STREAM[routing_table:NAME]" option buffer with this JSON content:
 ### Notifications
 
 You can enable notifications on any output stream independently via the notifications
-option buffer: "STREAM[routing_table:NAME]:fallthrough[notifications] = {{...}}"
+option buffer: `my_stream[routing_table:NAME]:fallthrough[notifications] = {{...}}`
 
 ### Feedback Stream
 

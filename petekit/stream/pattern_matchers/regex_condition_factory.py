@@ -34,8 +34,8 @@ _REGEX_DOC = f"""\
 ## Regex Conditions
 
 A regex condition matches incoming text against one or more regular expression
-patterns. The text must fullmatch at least one pattern (^...$) for the
-condition to return True.
+patterns. The text must fullmatch (the entire line including the trailing newline
+character '\\n') at least one pattern (^...\\n$) for the condition to return True.
 
 ### Create a condition
 
@@ -45,8 +45,8 @@ and provide at least one pattern entry:
 ```json
 {{
     "<pattern_name>": {{
-        "regex": "<regular expression>",
-        "sample_line": "<example text that the regex must match>"
+        "regex": "<regular expression including \\n>",
+        "sample_line": "<example text that the regex must match>\\n"
     }}
 }}
 ```
@@ -63,8 +63,9 @@ condition is deregistered and its entry is removed from the conditions catalog.
 
 ### Requirements per pattern
 
-- `regex` — a valid regular expression
+- `regex` — a valid regular expression. Note that it should include the trailing '\\n'
 - `sample_line` — a line of text that the regex must fullmatch exactly
+  (including the trailing '\\n')
 
 The `sample_line` is used for validation only. It is not stored after creation.
 

@@ -34,12 +34,12 @@ _STREAM_DOC_BUFFER = "doc:stream_buffers"
 _STREAM_DOC = """\
 ## Stream Buffers
 
-A buffer becomes a stream when an option buffer "BUFFER[stream]" is created.
+A buffer `my_buffer` becomes a stream when an option buffer `my_buffer[stream]` is created.
 Streams support time-based reading and enforce append-only writes.
 
 ### Option Buffer
 
-Create an option buffer "BUFFER[stream]" (no JSON content needed). This makes
+Create an option buffer `my_buffer[stream]` (no JSON content needed). This makes
 the buffer a stream — it then supports time-based reading and enforces that
 writes can only append (not replace or remove existing content).
 
@@ -51,7 +51,7 @@ Negative floats are relative to the last entry. Positive floats are absolute Uni
 
 ### Append-Only Enforcement
 
-The "BUFFER[stream]" option buffer registers a pre-update hook that rejects any write
+The `my_buffer[stream]` option buffer registers a pre-update hook that rejects any write
 that removes or replaces existing content. The update must be a pure append —
 new text must start with the old text.
 """
