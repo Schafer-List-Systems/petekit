@@ -74,9 +74,9 @@ def _fallthrough_name(origin_name: str, table_name: str) -> str:
     return f"{origin_name}[routing_table:{table_name}]:fallthrough"
 
 
-def _safe_log(processor: Any, message: str) -> bool:
+async def _safe_log(processor: Any, message: str) -> bool:
     """Write to the log buffer; escalate to _logger.error if the in-app log write fails."""
-    result = processor.write_buffer(_LOG_BUFFER, message)
+    result = await processor.write_buffer(_LOG_BUFFER, message)
     if not result.get("ok"):
         _logger.error(f"{message}  [log write failed: {result.get('error')}]")
         return False
@@ -384,7 +384,7 @@ async def route_dispatch(
                 )
             except RoutingConditionError as e:
                 # A condition signaled fall-through for this entry — skip to the next entry.
-                _safe_log(
+                await _safe_log(
                     processor,
                     f"Routing Condition Error source={new_buffer.name} table={table_name} reason={e}",
                 )
@@ -392,7 +392,7 @@ async def route_dispatch(
                 break
             except Exception as e:
                 # An unexpected error during condition evaluation — abort routing entirely.
-                _safe_log(
+                await _safe_log(
                     processor,
                     f"CONDITION ERROR condition='{condition_name}' table='{table_name}' "
                     f"text='{appended_text[:40]}' error='{e}'",
@@ -408,7 +408,7 @@ async def route_dispatch(
         if all_match:
             result = await processor.write_buffer(output_stream, appended_text)
             if not result.get("ok"):
-                _safe_log(
+                await _safe_log(
                     processor,
                     f"SINK ERROR: failed to write to '{output_stream}': {result.get('error')}",
                 )
@@ -421,13 +421,13 @@ async def route_dispatch(
         fallthrough_stream = _fallthrough_name(new_buffer.name, table_name)
 
     # Log the fallthrough event.
-    _safe_log(
+    await _safe_log(
         processor,
         f"FALLTHROUGH source={new_buffer.name} table={table_name} -> {fallthrough_stream}",
     )
 
     # Write to the fallthrough stream.
-    result = processor.write_buffer(fallthrough_stream, appended_text)
+    result = await processor.write_buffer(fallthrough_stream, appended_text)
     if not result.get("ok"):
         _safe_log(
             processor,
@@ -500,7 +500,7 @@ class StreamRouter(FunctionManager, StreamBufferManager):
         super().__init__(**kwargs)
 
         # Create the feedback buffer for routing results and errors.
-        self.create_buffer(_LOG_BUFFER, text="")
+        self._create_buffer(_LOG_BUFFER, text="")
 
         # Seed the documentation buffer so agents can discover routing tables without consulting the source.
         self._create_buffer(_STREAM_ROUTER_DOC_BUFFER, text=_STREAM_ROUTER_DOC)
