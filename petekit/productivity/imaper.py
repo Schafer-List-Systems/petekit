@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-import imaplib
+import imapclient
 import json
 import logging
-import re
 import time
 
-from imapclient.imap_utf7 import decode as _mutf7_decode
+from email.header import decode_header
 
 from peteos.oap.agentic_object import AgenticObject
 
@@ -143,10 +142,12 @@ def _imap_connection_changed(old_config: dict, new_config: dict) -> bool:
 def _parse_mailbox_list(raw_response: tuple) -> dict[str, str | list[list[str]]] | None:
     """Extract mailbox names and delimiter from an IMAP4.list response tuple.
 
-    The raw response is a (status, entries) tuple where each entry is a bytes
-    string of the form: b'(\\HasNoChildren, ".") "INBOX/Work"'. The delimiter is
-    extracted from the first entry that carries one. Each mailbox name is split
-    by the delimiter into its path segments.
+    The raw response is a (status, entries) tuple. Each entry is either:
+    - imaplib: a bytes string of the form: b'(\\HasNoChildren, ".") "INBOX/Work"'
+    - imapclient: a tuple of (flags, delimiter, name) where name is already unicode
+
+    The delimiter is extracted from the first entry that carries one. Each
+    mailbox name is split by the delimiter into its path segments.
 
     Returns a dict with "delimiter" (the server's hierarchy char) and "mailboxes"
     (list of path lists, e.g. [["INBOX"], ["INBOX", "Work"]]). Returns None if
@@ -160,39 +161,31 @@ def _parse_mailbox_list(raw_response: tuple) -> dict[str, str | list[list[str]]]
     # Pull the entries list from the IMAP response — skip on malformed response.
     entries = raw_response[1] if len(raw_response) > 1 else []
 
-    # Pass one — find the delimiter from the first entry that has one.
-    delimiter = ""
-    for entry in entries:
-        # Skip non-byte entries — nothing to extract from those.
-        if not isinstance(entry, bytes):
-            continue
+    # Pull the delimiter from the first entry — imapclient returns it as bytes at index 1.
+    # Format per entry: ((flags,...), delimiter_bytes, name_str)
+    # Set a default delimiter in case the server response is malformed.
+    delimiter = "/"
+    if entries:
+        # Extract the raw delimiter bytes from the first entry.
+        raw_delimiter = entries[0][1]
+        if isinstance(raw_delimiter, bytes):
+            # Decode the bytes delimiter to a string for later string operations.
+            try:
+                delimiter = raw_delimiter.decode("utf-8")
+            except Exception:
+                pass
 
-        # Decode and look for the first quoted hierarchy char.
-        decoded = entry.decode("utf-8", errors="continue")
-        m = re.search(r'"([./])"', decoded)
-        if m:
-            delimiter = m.group(1)
-            break
-
-    # Guard — if no delimiter was found, log and default to the most common IMAP delimiter.
-    if not delimiter:
-        _logger.error("[IMAPer] could not determine IMAP hierarchy delimiter — defaulting to '/'")
-        delimiter = "/"
-
-    # Pass two — extract all mailbox names and replace the server delimiter with slashes.
+    # Extract each mailbox name — entry[2] is the full path as a str already.
+    # Split it by the delimiter to get the individual path segments.
     names = []
     for entry in entries:
-        # Skip non-byte entries — nothing to extract from those.
-        if not isinstance(entry, bytes):
+        # Skip malformed entries — need a 3-tuple of (flags, delimiter, name).
+        if not isinstance(entry, (list, tuple)) or len(entry) < 3:
             continue
 
-        # Decode the entry and extract the last quoted string as the mailbox name.
-        decoded = entry.decode("utf-8", errors="continue")
-        m = re.search(r'"([^"]+)"\s*$', decoded)
-        if m:
-            # Decode the name from modified UTF-7 to proper UTF-8.
-            name = _mutf7_decode(m.group(1).encode("utf-8"))
-            # Split into path segments rather than concatenating with slashes.
+        # Pull the name from index 2, split it by the hierarchy delimiter, and record the path.
+        name = str(entry[2]) if entry[2] else ""
+        if name:
             path = name.split(delimiter) if delimiter else [name]
             names.append(path)
 
@@ -231,11 +224,11 @@ def _build_mailbox_tree(paths: list[list[str]]) -> dict:
     return root
 
 
-def _fetch_mailbox_status(imap_connection: imaplib.IMAP4, mailbox_name: str) -> dict | None:
+def _fetch_mailbox_status(imap_connection: imapclient.IMAPClient, mailbox_name: str) -> dict | None:
     """Return the SELECT metadata for a mailbox without fetching the email list.
 
-    Uses the SELECT command which returns EXISTS, UIDVALIDITY, FLAGS, RECENT, and
-    UNSEEN counters in one lightweight call. Returns None on any failure (logged).
+    Uses imapclient's select_folder which returns a clean dictionary with SELECT
+    response fields. Returns None on any failure (logged).
 
     Returns:
         {
@@ -250,71 +243,39 @@ def _fetch_mailbox_status(imap_connection: imaplib.IMAP4, mailbox_name: str) -> 
     if imap_connection is None:
         raise RuntimeError("no active IMAP connection")
 
-    # Select the mailbox — one round trip, returns folder-level metadata only.
+    # Select the mailbox — imapclient returns a clean dict, not raw bytes.
     try:
-        raw = imap_connection.select(mailbox_name)
-    except imaplib.IMAP4.error as e:
+        result = imap_connection.select_folder(mailbox_name)
+    except imapclient.Error as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
-    # Bail out if the server did not acknowledge the SELECT command.
-    if not raw or raw[0] != "OK":
-        _logger.error(f"[IMAPer] SELECT not OK for {mailbox_name}: {raw}")
+    # Bail out if the result is empty or invalid.
+    if not result:
+        _logger.error(f"[IMAPer] SELECT returned empty for {mailbox_name}")
         return None
 
-    # Parse each metadata line from the SELECT response.
-    # The lines are on the form: b"12 EXISTS", b"12345 UIDVALIDITY", b"FLAGS", etc.
+    # Extract the metadata from the imapclient response dictionary.
+    # imapclient returns byte keys: b'EXISTS', b'UIDVALIDITY', b'FLAGS', etc.
     metadata: dict = {
-        "exists": 0,
-        "uidvalidity": 0,
-        "flags": [],
-        "recent": 0,
-        "unseen": 0,
+        "exists": int(result.get(b'EXISTS', [0])[0]) if isinstance(result.get(b'EXISTS'), (list, tuple)) else int(result.get(b'EXISTS', 0)),
+        "uidvalidity": int(result.get(b'UIDVALIDITY', [0])[0]) if isinstance(result.get(b'UIDVALIDITY'), (list, tuple)) else int(result.get(b'UIDVALIDITY', 0)),
+        "flags": list(result.get(b'FLAGS', [])) if isinstance(result.get(b'FLAGS'), (list, tuple)) else [],
+        "recent": int(result.get(b'RECNET', [0])[0]) if isinstance(result.get(b'RECNET'), (list, tuple)) else int(result.get(b'RECNET', 0)),
+        "unseen": int(result.get(b'UNSEEN', [0])[0]) if isinstance(result.get(b'UNSEEN'), (list, tuple)) else int(result.get(b'UNSEEN', 0)),
     }
-    for line in raw[1]:
-        # Decode and parse the EXISTS count.
-        decoded = line.decode("utf-8", errors="replace")
-        m = re.match(r"^(\d+)\s+EXISTS$", decoded)
-        if m:
-            metadata["exists"] = int(m.group(1))
-            continue
-
-        # Parse the UIDVALIDITY version counter.
-        m = re.match(r"^(\d+)\s+UIDVALIDITY$", decoded)
-        if m:
-            metadata["uidvalidity"] = int(m.group(1))
-            continue
-
-        # Parse the RECENT count.
-        m = re.match(r"^(\d+)\s+RECENT$", decoded)
-        if m:
-            metadata["recent"] = int(m.group(1))
-            continue
-
-        # Parse the UNSEEN count.
-        m = re.match(r"^(\d+)\s+UNSEEN$", decoded)
-        if m:
-            metadata["unseen"] = int(m.group(1))
-            continue
-
-        # Parse the FLAGS list.
-        m = re.match(r"^\((.+)\)\s+FLAGS$", decoded)
-        if m:
-            # Flags are space-separated and may be prefixed with backslash.
-            raw_flags = m.group(1)
-            metadata["flags"] = raw_flags.split()
 
     return metadata
 
 
 def _list_mailbox_emails(
-    imap_connection: imaplib.IMAP4,
+    imap_connection: imapclient.IMAPClient,
     mailbox_name: str,
 ) -> dict | None:
     """Return the list of all emails in a mailbox with ENVELOPE and FLAGS metadata.
 
-    Searches for all emails using SEARCH ALL, then fetches ENVELOPE and FLAGS
-    for each UID. Returns None on any failure (logged).
+    Uses imapclient's select_folder, search, and fetch methods which return
+    already-parsed Python types. Returns None on any failure (logged).
 
     Returns:
         {
@@ -337,82 +298,75 @@ def _list_mailbox_emails(
     if imap_connection is None:
         raise RuntimeError("no active IMAP connection")
 
-    # Select the mailbox — SEARCH is only legal in SELECTED state, not AUTH.
+    # Select the mailbox — imapclient handles state management.
     try:
-        imap_connection.select(mailbox_name)
-    except imaplib.IMAP4.error as e:
+        imap_connection.select_folder(mailbox_name)
+    except imapclient.Error as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
-    # Search for all emails in the mailbox — returns a list of UID integers.
+    # Search for all emails — imapclient returns a clean list of message IDs.
     try:
-        status, data = imap_connection.uid("SEARCH", "ALL")
-        uid_list = [int(x) for x in data[0].split()]
-    except imaplib.IMAP4.error as e:
+        message_ids = imap_connection.search(["ALL"])
+    except imapclient.Error as e:
         _logger.error(f"[IMAPer] SEARCH failed for {mailbox_name}: {e}")
         return None
 
     # Handle the empty mailbox case — return an empty list cleanly.
-    if not uid_list:
+    if not message_ids:
         return {"mailbox": mailbox_name, "uids": [], "emails": []}
 
-    # Fetch ENVELOPE and FLAGS for all UIDs in one batch.
-    # Note: imaplib.IMAP4 uses uid("FETCH", uid_set, query) not uid_fetch().
+    # Fetch ENVELOPE and FLAGS for all message IDs in one batch.
+    # imapclient returns: {id: {'ENVELOPE': Envelope, 'FLAGS': (...)}}
     try:
-        uids_str = ",".join([str(u) for u in uid_list])
-        raw = imap_connection.uid("FETCH", uids_str, "(ENVELOPE FLAGS)")
-    except imaplib.IMAP4.error as e:
+        result = imap_connection.fetch(message_ids, ["ENVELOPE", "FLAGS"])
+    except imapclient.Error as e:
         _logger.error(f"[IMAPer] FETCH failed for {mailbox_name}: {e}")
         return None
 
-    # Bail out if the server rejected the FETCH command.
-    if not raw or raw[0] != "OK":
-        _logger.error(f"[IMAPer] FETCH not OK for {mailbox_name}: {raw}")
-        return None
-
-    # Parse each email entry from the FETCH response.
-    # The raw entry is a bytes string on the form: b'4 (UID 1439 FLAGS (...) ENVELOPE (...))'
+    # Parse each email from the fetched result.
+    # imapclient returns already-parsed Envelope and FLAGS objects.
     emails: list = []
-    for entry in raw[1]:
-        if not isinstance(entry, bytes):
-            continue
+    for uid, fields in result.items():
+        # Extract the ENVELOPE data — imapclient returns byte keys.
+        envelope = fields.get(b'ENVELOPE')
+        if envelope:
+            # Format the sender address from the first Address in the from_ tuple.
+            sender = ""
+            if envelope.from_:
+                addr = envelope.from_[0]
+                sender = _format_imap_address(addr)
 
-        # Decode the entry for regex parsing.
-        decoded = entry.decode("utf-8", errors="replace")
+            # Format the first recipient from the to tuple.
+            recipient = ""
+            if envelope.to:
+                addr = envelope.to[0]
+                recipient = _format_imap_address(addr)
 
-        # Extract the UID from the response — the number before the first space.
-        # The format is: b'4 (UID 1439 FLAGS (...) ENVELOPE (...))'
-        m = re.match(r"^\s*(\d+)\s+\(UID\s+(\d+)", decoded)
-        if not m:
-            continue
-        uid = int(m.group(2))  # Use the UID field value, not the sequence number.
+            # Extract subject and date — imapclient returns subject as bytes.
+            # Decode RFC 2047 MIME encoded words (e.g. =?UTF-8?Q?...?=) to proper unicode.
+            raw_subject = envelope.subject
+            if isinstance(raw_subject, bytes):
+                raw_subject = raw_subject.decode("utf-8")
+            if raw_subject:
+                parts = decode_header(raw_subject)
+                subject = ''.join(
+                    (p[0].decode(p[1]) if p[1] else p[0].decode('utf-8', errors='replace')) if isinstance(p[0], bytes) else str(p[0])
+                    for p in parts
+                )
+            else:
+                subject = ""
+            date = str(envelope.date) if envelope.date else ""
+        else:
+            sender = ""
+            recipient = ""
+            subject = ""
+            date = ""
 
-        # Parse the FLAGS from the FLAGS (...) section.
-        flags: list[str] = []
-        m = re.search(r"FLAGS\s+\(([^)]*)\)", decoded)
-        if m:
-            raw_flags = m.group(1)
-            # Flags may be \Seen \Answered — handle backslash-prefixed flags.
-            flags = raw_flags.split()
-
-        # Extract sender, recipient, subject, and date from the ENVELOPE field.
-        # ENVELOPE format: (date "subject" (sender_tuple) ((rcpt_tuple) ...) reply-to nil nil nil "<msgid>")
-        sender = ""
-        recipient = ""
-        subject = ""
-        date = ""
-        # Find the ENVELOPE field value — the parentized list after ENVELOPE.
-        m = re.search(r"ENVELOPE\s+\((.+)\)$", decoded, re.DOTALL)
-        if m:
-            envelope_content = m.group(1)
-            # Walk the envelope tokens to extract the fields.
-            # Format: date "subject" (sender_tuple) ((rcpt)...) ...
-            # Strip outer parentheses and extract the inner content.
-            envelope_clean = _extract_envelope_fields(envelope_content)
-            sender = envelope_clean.get("sender", "")
-            recipient = envelope_clean.get("recipient", "")
-            subject = envelope_clean.get("subject", "")
-            date = envelope_clean.get("date", "")
+        # Extract the FLAGS — imapclient uses byte keys and returns a tuple of byte flag names.
+        # Decode each flag byte to a readable string.
+        raw_flags = fields.get(b'FLAGS', [])
+        flags = [f.decode("utf-8") if isinstance(f, bytes) else str(f) for f in raw_flags]
 
         emails.append({
             "uid": uid,
@@ -426,135 +380,53 @@ def _list_mailbox_emails(
     # Return the complete mailbox email list.
     return {
         "mailbox": mailbox_name,
-        "uids": [int(u) for u in uid_list],
+        "uids": message_ids,
         "emails": emails,
     }
 
 
-def _extract_envelope_fields(envelope_str: str) -> dict:
-    """Extract sender, recipient, subject, and date from an ENVELOPE field string.
+def _format_imap_address(address: imapclient.response_types.Address) -> str:
+    """Format an imapclient Address object as a readable email address.
 
-    The ENVELOPE field is a parentized list of the form:
-    (date "subject" (sender_tuple) ((rcpt) ...) reply-to nil nil nil "<msgid>")
-
-    Returns a dict with "sender", "recipient", "subject", "date".
+    Address(mailbox=u'alice', host=u'example.com', name=u'Alice') → "Alice <alice@example.com>"
     """
-    # Strip the outer parentheses to get the inner token list.
-    if envelope_str.startswith("(") and envelope_str.endswith(")"):
-        inner = envelope_str[1:-1]
-    else:
-        inner = envelope_str
-
-    # Split the envelope content into tokens while respecting nested parentheses.
-    # This produces: [date, "subject", (sender_parts), ((rcpt_parts)...), ...]
-    tokens = _split_imap_tokens(inner)
-    if len(tokens) < 4:
-        return {}
-
-    # tokens[0] is the date string, e.g. '"Thu, 13 Feb 2025 03:28:49 -0700"'
-    # Remove outer quotes if present.
-    date = tokens[0].strip('"') if tokens else ""
-
-    # tokens[1] is the subject string, e.g. '"Data Labeling & Annotation..."'
-    subject = tokens[1].strip('"') if len(tokens) > 1 else ""
-
-    # tokens[2] is the sender tuple: (display_name route mailbox host) or all NIL.
-    # Each is a 4-tuple of (display_name, route, mailbox, host).
-    sender = ""
-    if len(tokens) > 2 and isinstance(tokens[2], str) and tokens[2].startswith("("):
-        sender = _format_address_tuple(tokens[2])
-    elif len(tokens) > 2 and isinstance(tokens[2], (list, tuple)):
-        sender = _format_address_tuple_from_list(tokens[2])
-
-    # tokens[3] is a list of recipient tuples.
-    recipient = ""
-    if len(tokens) > 3 and isinstance(tokens[3], (list, str)):
-        if isinstance(tokens[3], list) and tokens[3]:
-            recipient = _format_address_tuple_from_list(tokens[3][0]) if isinstance(tokens[3][0], (list, tuple)) else ""
-        elif isinstance(tokens[3], str) and tokens[3].startswith("("):
-            recipient = _format_address_tuple(tokens[3])
-
-    return {
-        "sender": sender,
-        "recipient": recipient,
-        "subject": subject,
-        "date": date,
-    }
-
-
-def _split_imap_tokens(s: str) -> list:
-    """Split an IMAP parentized token string into a flat list respecting nesting.
-
-    "a (b c) d" → ["a", "(b c)", "d"]
-    """
-    result = []
-    i = 0
-    while i < len(s):
-        if s[i] == "(":
-            depth = 1
-            j = i + 1
-            while j < len(s) and depth > 0:
-                if s[j] == "(":
-                    depth += 1
-                elif s[j] == ")":
-                    depth -= 1
-                j += 1
-            result.append(s[i:j])
-            i = j
-        elif s[i] in (" ", "\t", "\n"):
-            i += 1
-        else:
-            # Read a token until whitespace or '('
-            j = i
-            while j < len(s) and s[j] not in (" ", "\t", "\n", "("):
-                j += 1
-            if j < len(s) and s[j] == "(":
-                # This handles adjacent tokens: "a (b c)" → "a" then "(b c)"
-                token = s[i:j].strip()
-                if token:
-                    result.append(token)
-                i = j
-            else:
-                result.append(s[i:j])
-                i = j
-    return result
-
-
-def _format_address_tuple(tuple_str: str) -> str:
-    """Format an address tuple string as an email address.
-
-    (display_name NIL mailbox host) → "display_name <mailbox@host>"
-    """
-    if not tuple_str.startswith("("):
+    # Reject a None address — nothing to format.
+    if not address:
         return ""
-    inner = tuple_str[1:-1]
-    tokens = _split_imap_tokens(inner)
-    if len(tokens) < 4:
-        return ""
-    display_name = tokens[0].strip('"') if tokens[0] not in ("NIL", "") else ""
-    mailbox = tokens[2] if tokens[2] != "NIL" else ""
-    host = tokens[3] if tokens[3] != "NIL" else ""
+
+    # Decode bytes fields to strings — Address fields may be bytes or str.
+    def _decode(val):
+        if isinstance(val, bytes):
+            try:
+                return val.decode("utf-8")
+            except Exception:
+                pass
+        return str(val) if val else ""
+
+    name = _decode(address.name)
+    # Decode RFC 2047 MIME encoded display names (e.g. =?UTF-8?Q?=C3=9Cber?= Smith)
+    if name.startswith("=?"):
+        try:
+            parts = decode_header(name)
+            name = ''.join(
+                (p[0].decode(p[1]) if p[1] else p[0].decode('utf-8', errors='replace')) if isinstance(p[0], bytes) else str(p[0])
+                for p in parts
+            )
+        except Exception:
+            pass
+    mailbox = _decode(address.mailbox)
+    host = _decode(address.host)
+
+    # Build the full address string only when both mailbox and host are present.
     if mailbox and host:
-        address = f"{mailbox}@{host}"
-        if display_name:
-            return f'"{display_name}" <{address}>'
-        return address
-    return display_name
+        address_str = f"{mailbox}@{host}"
+        # Prefix with the display name when one exists.
+        if name:
+            return f'"{name}" <{address_str}>'
+        return address_str
 
-
-def _format_address_tuple_from_list(t: list) -> str:
-    """Format an address tuple list as an email address."""
-    if not t or len(t) < 4:
-        return ""
-    display_name = str(t[0]).strip('"') if t[0] not in ("NIL", "", None) else ""
-    mailbox = str(t[2]) if t[2] not in ("NIL", "", None) else ""
-    host = str(t[3]) if t[3] not in ("NIL", "", None) else ""
-    if mailbox and host:
-        address = f"{mailbox}@{host}"
-        if display_name:
-            return f'"{display_name}" <{address}>'
-        return address
-    return display_name
+    # Fall back to the bare name when the address is incomplete.
+    return name
 
 
 def _mailbox_to_envelopes_buffer_name(mailbox_name: str) -> str:
@@ -753,7 +625,7 @@ async def _refresh_after_drop_envelopes_hold(
 class IMAPer(BufferManager, AgenticObject):
     """."""
 
-    _imap_connection: imaplib.IMAP4 | None = None
+    _imap_connection: imapclient.IMAPClient | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -834,7 +706,7 @@ class IMAPer(BufferManager, AgenticObject):
 
         Reads the current imap:config buffer, overlays the four credential arguments,
         writes the merged result back to imap:config as authoritative state.
-        Tries SSL first, falls back to plain IMAP4 if SSL fails.
+        Uses imapclient for the IMAP connection with SSL and UID support.
         """
         # Update the config and get the merged result.
         config = await self._update_imap_connection(host, port, username, password)
@@ -848,41 +720,25 @@ class IMAPer(BufferManager, AgenticObject):
         if timeout is not None:
             timeout = int(timeout)
 
-        # Establish the IMAP connection — try SSL first, fall back to plain IMAP4.
-        self._imap_connection = None
-        ssl_error: Exception | None = None
+        # Establish the IMAP connection using imapclient.
+        # imapclient handles SSL, timeout, and connection management.
         try:
-            self._imap_connection = imaplib.IMAP4_SSL(
-                config.get("host"),
-                config.get("port"),
+            self._imap_connection = imapclient.IMAPClient(
+                host=config.get("host"),
+                port=config.get("port", 993),
+                use_uid=True,
+                ssl=True,
                 timeout=timeout,
             )
-        except OSError as e:
-            ssl_error = e
-
-        # SSL failed — try plain IMAP4 as a fallback.
-        if self._imap_connection is None:
-            try:
-                self._imap_connection = imaplib.IMAP4(
-                    config.get("host"),
-                    config.get("port"),
-                    timeout=timeout,
-                )
-            except OSError as e:
-                ssl_error = e
-
-        # Both SSL and plain IMAP4 failed — bail out.
-        if self._imap_connection is None:
-            _logger.error(f"[IMAPer] connection failed (SSL: {ssl_error})")
+        except Exception as e:
+            _logger.error(f"[IMAPer] connection failed: {e}")
+            self._imap_connection = None
             return
-
-        # Apply the socket timeout to all subsequent commands (login, list, select, etc.).
-        self._imap_connection.sock.settimeout(timeout)
 
         # Log in and confirm the connection is established.
         try:
             self._imap_connection.login(config.get("username"), config.get("password"))
-        except imaplib.IMAP4.error as e:
+        except imapclient.Error as e:
             _logger.error(f"[IMAPer] login failed: {e}")
             self._imap_connection = None
             return
@@ -943,16 +799,20 @@ class IMAPer(BufferManager, AgenticObject):
         if self._imap_connection is None:
             raise RuntimeError("no active IMAP connection")
 
-        # List all mailboxes under INBOX to get the full folder hierarchy.
+        # List all folders recursively — imapclient returns already-parsed tuples.
         try:
-            raw = self._imap_connection.list("INBOX", "*")
-        except imaplib.IMAP4.error as e:
+            folders = self._imap_connection.list_folders()
+        except imapclient.Error as e:
             # Server rejected the LIST command — log and return None.
             _logger.error(f"[IMAPer] LIST command error: {e}")
             return None
 
-        # Return the parsed mailbox list or None on server error.
-        return _parse_mailbox_list(raw)
+        # Format the result into the (status, entries) tuple that _parse_mailbox_list expects.
+        # Each entry is formatted as: (flags, delimiter, name) like imaplib returns.
+        if not folders:
+            return None
+        entries = [folder for folder in folders]
+        return _parse_mailbox_list(("OK", entries))
 
     async def _refresh_imap_mailbox_list(self) -> None:
         """Refresh the imap:tree buffer with the current list of mailboxes.
@@ -998,4 +858,4 @@ class IMAPer(BufferManager, AgenticObject):
 
         # Write the email list to the corresponding imap:box/<mailbox> buffer.
         buffer_name = _mailbox_to_envelopes_buffer_name(mailbox_name)
-        await self.create_buffer(buffer_name, text=json.dumps(result), overwrite=True)
+        await self.create_buffer(buffer_name, text=json.dumps(result, indent=2), overwrite=True)
