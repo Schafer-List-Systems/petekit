@@ -251,11 +251,11 @@ class Buffer:
             _hooks=self._hooks,
         )
 
-    def copy(self) -> Buffer:
+    def clone(self) -> Buffer:
         """Return a buffer that is fully independent of the original.
 
         The lines list is deep-copied — no BufferEntry or its data is shared with the original.
-        The hooks dict is also deep-copied — modifying a hook in the copy does not affect the original.
+        The hooks dict is also deep-copied — modifying a hook in the clone does not affect the original.
         """
         import copy
 
@@ -630,7 +630,7 @@ class Buffer:
 
     async def _fire_hooks(
         self,
-        buffer_manager: BufferManager,
+        buffer_manager: "BufferManager",
         new_buffer: Buffer | None,
         hook_point: HookPoint,
         args: dict[str, Any],
@@ -651,6 +651,7 @@ class Buffer:
             HookPoint.BEFORE_CREATE_BUFFER,
             HookPoint.BEFORE_UPDATE_BUFFER,
             HookPoint.BEFORE_DROP_BUFFER,
+            HookPoint.BEFORE_READ_BUFFER,
         )
 
         # Build the positional args list — update hooks get 4 args, create/drop get 3.

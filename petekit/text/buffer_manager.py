@@ -943,14 +943,30 @@ class BufferManager(AgenticObject):
         Returns a dict with ok/error or ok/matches.
         Use (?i) at the start for case-insensitive matching.
         """
-        # Delegate retrieval to the sandboxed helper, which surfaces raw unclustered matches.
-        result = self._grep_buffer(name, pattern, start, end)
-        if not result.get("ok"):
-            return result
+        # Guard: reject unknown buffer names to keep grep operations consistent.
+        if name not in self._buffers:
+            return {"ok": False, "error": f"No buffer named '{name}'."}
+        buf = self._buffers[name]
+
+        # Fire BEFORE_READ_BUFFER hooks — a rejection blocks the grep.
+        read_args: dict[str, Any] = {"_op": "grep_buffer", "name": name, "pattern": pattern, "start": start, "end": end}
+        pre_result = await buf._fire_hooks(self, None, HookPoint.BEFORE_READ_BUFFER, read_args)
+        if pre_result is not True and pre_result is not None:
+            return {"ok": False, "error": str(pre_result)}
+
+        # Fire AFTER_READ_BUFFER hooks with an isolated buffer copy.
+        # The hook can mutate the copy via set_text, and the subsequent grep reads the modified content.
+        buf_copy = buf.clone()
+        await buf_copy._fire_hooks(self, None, HookPoint.AFTER_READ_BUFFER, read_args)
+
+        # Perform the grep on the buffer copy — uses content the AFTER hook may have modified.
+        grep_result = buf_copy.grep(pattern=pattern, start=start, end=end)
+        if not grep_result.ok:
+            return {"ok": False, "error": grep_result.error}
 
         # Cluster the match indices to keep the agent context bounded when results are numerous.
-        clusters = _cluster_lines_to_ranges(result["matches"], self._NUM_CLUSTERS)
-        return {"ok": True, "matches": clusters, "count": result["count"]}
+        clusters = _cluster_lines_to_ranges(grep_result.matches, self._NUM_CLUSTERS)
+        return {"ok": True, "matches": clusters, "count": grep_result.count}
 
     @sandbox
     def _read_buffer(self, name: str, start: int = 0, end: int | str = "end", show_timestamps: bool = False, show_line_numbers: bool = False) -> dict[str, Any]:
@@ -1009,18 +1025,24 @@ class BufferManager(AgenticObject):
         if pre_result is not True and pre_result is not None:
             return {"ok": False, "error": str(pre_result)}
 
-        # Retrieve the full untruncated buffer content.
-        result = self._read_buffer(name, start, end, show_timestamps, show_line_numbers)
-        if not result.get("ok"):
-            return result
-        total_chars = result["total_chars"]
-
         # Fire AFTER_READ_BUFFER hooks with an isolated buffer copy.
-        # The hook can mutate the copy without affecting the original.
-        buf_copy = buf.copy()
-        after_result = await buf_copy._fire_hooks(self, None, HookPoint.AFTER_READ_BUFFER, read_args)
-        if isinstance(after_result, str):
-            result["content"] = after_result
+        # The hook populates the copy via set_text with the email content.
+        buf_copy = buf.clone()
+        await buf_copy._fire_hooks(self, None, HookPoint.AFTER_READ_BUFFER, read_args)
+
+        # Read from the buffer copy — gets content the AFTER hook populated, or untouched buffer.
+        read_result = buf_copy.read(start=start, end=end, show_timestamps=show_timestamps, show_line_numbers=show_line_numbers)
+        if read_result.kind == "error":
+            return {"ok": False, "error": read_result.error}
+        result = {
+            "ok": True,
+            "content": read_result.content,
+            "start": read_result.start,
+            "end": read_result.end,
+            "total_chars": read_result.total_chars,
+            "line_count": read_result.line_count,
+        }
+        total_chars = result["total_chars"]
 
         # Within-size path: mark entries as seen by the agent and return content directly.
         if total_chars <= BufferManager._MAX_CHUNK_CHARS:

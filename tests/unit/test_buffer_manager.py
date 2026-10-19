@@ -719,9 +719,9 @@ class TestReadHooks:
     async def test_before_read_accept_none_allows_read(self, bm):
         await bm.create_buffer("test", text="A\nB")
         bm._buffers["test"].register_hook(HookPoint.BEFORE_READ_BUFFER, "h", lambda *_: None)
-        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        result = await bm.read_buffer("test")
         assert result["ok"]
-        assert "A\nB" in result
+        assert "A\nB" in result["content"]
 
     async def test_before_read_receives_correct_args(self, bm):
         await bm.create_buffer("test", text="a\nb\nc")
@@ -746,42 +746,50 @@ class TestReadHooks:
             return True
 
         bm._buffers["test"].register_hook(HookPoint.BEFORE_READ_BUFFER, "mod", modifier)
-        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        result = await bm.read_buffer("test")
         assert result["ok"]
-        assert "modified" in result
+        assert "modified" in result["content"]
 
     async def test_after_read_modifies_content(self, bm):
         await bm.create_buffer("test", text="A\nB")
 
         def redact(bm_, buf, args):
-            return "[REDACTED]"
+            buf.set_text("[REDACTED]")
 
         bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "redact", redact)
-        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        result = await bm.read_buffer("test")
         assert result["ok"]
-        assert result == "[REDACTED]"
+        assert result["content"] == "[REDACTED]"
 
     async def test_after_read_returns_none_keeps_original(self, bm):
         await bm.create_buffer("test", text="A\nB")
         bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "h", lambda *_: None)
-        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        result = await bm.read_buffer("test")
         assert result["ok"]
-        assert "A\nB" in result
+        assert "A\nB" in result["content"]
 
     async def test_after_read_buffer_copy_is_isolated(self, bm):
         await bm.create_buffer("test", text="A\nB")
 
         def mutate(bm_, buf, args):
-            buf.lines[0].data = "TOXIC"
-            return "tampered"
+            # Populate buffer content (simulates IMAP lazy loading).
+            buf.set_text("tampered")
 
-        bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "mutate", mutate)
-        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
-        # Caller sees the hook's return value.
+        buf = bm._buffers["test"]
+        buf.register_hook(HookPoint.AFTER_READ_BUFFER, "mutate", mutate)
+
+        # First read: hook fires, populates the copy with "tampered".
+        result = await bm.read_buffer("test")
         assert result["ok"]
-        # The original buffer is untouched.
-        content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
-        assert "TOXIC" not in content
+        assert result["content"] == "tampered"
+
+        # Second read: original buffer is untouched — clone is isolated.
+        # The AFTER hook fires on a new clone, so read result is still "tampered".
+        content = await bm.read_buffer("test")
+        assert content["content"] == "tampered"
+        # The original buffer in storage is never modified by the clones.
+        assert bm._buffers["test"].lines[0].data == "A"
+        assert bm._buffers["test"].lines[1].data == "B"
 
     async def test_after_read_multiple_hooks_all_fire(self, bm):
         await bm.create_buffer("test", text="A\nB")
@@ -789,17 +797,51 @@ class TestReadHooks:
 
         def first(bm_, buf, args):
             calls.append("first")
-            return "FIRST_MODIFIED"
+            buf.set_text("FIRST_MODIFIED")
 
         def second(bm_, buf, args):
             calls.append("second")
-            return "SECOND_MODIFIED"
+            buf.set_text("SECOND_MODIFIED")
 
         bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "first", first)
         bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "second", second)
-        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        result = await bm.read_buffer("test")
         assert result["ok"]
-        # Only the first hook's return reaches the caller.
-        assert "FIRST_MODIFIED" in result
+        # Last hook's set_text content is what read returns.
+        assert "SECOND_MODIFIED" in result["content"]
         # Both hooks fired.
         assert "first" in calls and "second" in calls
+
+    async def test_before_read_rejection_blocks_grep(self, bm):
+        await bm.create_buffer("test", text="A\nB\nC")
+        bm._buffers["test"].register_hook(HookPoint.BEFORE_READ_BUFFER, "h", lambda *_: "no greping")
+        result = await bm.grep_buffer("test", "A")
+        assert not result["ok"]
+        assert "no greping" in result["error"]
+
+    async def test_before_read_accept_allows_grep(self, bm):
+        await bm.create_buffer("test", text="A\nB\nC")
+        bm._buffers["test"].register_hook(HookPoint.BEFORE_READ_BUFFER, "h", lambda *_: None)
+        result = await bm.grep_buffer("test", "A")
+        assert result["ok"]
+        assert result["count"] == 1
+
+    async def test_after_read_grep_modifies_buffer_before_grep(self, bm):
+        await bm.create_buffer("test", text="A\nB\nC")
+
+        def mutate(bm_, buf, args):
+            # Change the buffer content so grep finds a different match.
+            buf.set_text("X\nY\nA\nZ")
+
+        bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "mutate", mutate)
+        result = await bm.grep_buffer("test", "A")
+        assert result["ok"]
+        # Grep ran on the modified buffer — "A" is now at line 2, not line 0.
+        assert result["count"] == 1
+
+    async def test_after_read_grep_returns_none_keeps_original(self, bm):
+        await bm.create_buffer("test", text="A\nB\nA\nC")
+        bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "h", lambda *_: None)
+        result = await bm.grep_buffer("test", "A")
+        assert result["ok"]
+        assert result["count"] == 2  # original grep result, not modified
