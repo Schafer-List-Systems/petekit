@@ -1005,7 +1005,7 @@ class BufferManager(AgenticObject):
 
         # Fire BEFORE_READ_BUFFER hooks — a rejection blocks the read.
         read_args: dict[str, Any] = {"_op": "read_buffer", "name": name, "start": start, "end": end, "show_timestamps": show_timestamps, "show_line_numbers": show_line_numbers}
-        pre_result = await buf._fire_hooks(self, buf, HookPoint.BEFORE_READ_BUFFER, read_args)
+        pre_result = await buf._fire_hooks(self, None, HookPoint.BEFORE_READ_BUFFER, read_args)
         if pre_result is not True and pre_result is not None:
             return {"ok": False, "error": str(pre_result)}
 
@@ -1018,7 +1018,7 @@ class BufferManager(AgenticObject):
         # Fire AFTER_READ_BUFFER hooks with an isolated buffer copy.
         # The hook can mutate the copy without affecting the original.
         buf_copy = buf.copy()
-        after_result = await buf_copy._fire_hooks(self, buf_copy, HookPoint.AFTER_READ_BUFFER, read_args)
+        after_result = await buf_copy._fire_hooks(self, None, HookPoint.AFTER_READ_BUFFER, read_args)
         if isinstance(after_result, str):
             result["content"] = after_result
 
