@@ -447,6 +447,72 @@ def _mailbox_to_envelopes_hold_buffer_name(mailbox_name: str) -> str:
     return f"imap:box/{mailbox_name}/envelopes[hold]"
 
 
+def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: str, uid: int) -> dict | None:
+    """Fetch a single email by UID from the server.
+
+    Returns a dict with uid, sender, recipient, subject, date, and flags.
+    Returns None on any failure (logged).
+    """
+    # Reject if there is no active IMAP connection.
+    if imap_connection is None:
+        raise RuntimeError("no active IMAP connection")
+
+    # Select the mailbox — required before fetching message data.
+    try:
+        imap_connection.select_folder(mailbox_name)
+    except imapclient.Error as e:
+        _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
+        return None
+
+    # Fetch the ENVELOPE and FLAGS for the single UID.
+    try:
+        result = imap_connection.fetch([uid], [b'ENVELOPE', b'FLAGS'])
+    except imapclient.Error as e:
+        _logger.error(f"[IMAPer] FETCH failed for UID {uid} in {mailbox_name}: {e}")
+        return None
+
+    # Bail out if the UID was not returned in the response.
+    if not result or uid not in result:
+        return None
+
+    # Extract the envelope and flags from the response.
+    fields = result[uid]
+    envelope = fields.get(b'ENVELOPE')
+    if not envelope:
+        return None
+
+    # Format the sender and recipient from the Address objects.
+    sender = _format_imap_address(envelope.from_[0]) if envelope.from_ else ""
+    recipient = _format_imap_address(envelope.to[0]) if envelope.to else ""
+
+    # Decode the subject — imapclient may return bytes.
+    raw_subject = envelope.subject
+    if isinstance(raw_subject, bytes):
+        raw_subject = raw_subject.decode("utf-8")
+    if raw_subject:
+        parts = decode_header(raw_subject)
+        subject = ''.join(
+            (p[0].decode(p[1]) if isinstance(p[0], bytes) and p[1] else str(p[0]))
+            for p in parts
+        )
+    else:
+        subject = ""
+
+    # Extract the date and decode the FLAGS tuple to readable strings.
+    date = str(envelope.date) if envelope.date else ""
+    raw_flags = fields.get(b'FLAGS', [])
+    flags = [f.decode("utf-8") if isinstance(f, bytes) else str(f) for f in raw_flags]
+
+    return {
+        "uid": uid,
+        "sender": sender,
+        "recipient": recipient,
+        "subject": subject,
+        "date": date,
+        "flags": flags,
+    }
+
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # Config hooks                                                                                                         #
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -618,6 +684,39 @@ async def _refresh_after_drop_envelopes_hold(
     await imaper.create_buffer(hold_buffer_name, text="")
 
 
+async def _before_read_imap_email(
+    imaper: IMAPer,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> bool | str | None:
+    """Lazily fetch and populate a UID buffer on first read.
+
+    Only fires on imap:box/<mailbox>/<uid> buffers (pattern-matched).
+    If the buffer already has content, proceeds without modification.
+    If empty, fetches from the server and populates before allowing the read.
+    """
+    # Skip if the buffer already has content.
+    if buffer.get_text():
+        return True
+
+    # Extract the UID from the buffer name — the last path segment is the UID.
+    parts = buffer.name.split("/")
+    uid = int(parts[-1])
+
+    # Derive the mailbox name — the path between "imap:box" and the UID.
+    mailbox_name = "/".join(parts[1:-1])
+
+    # Fetch the email from the server.
+    email = _fetch_email_by_uid(imaper._imap_connection, mailbox_name, uid)
+    if email is None:
+        return f"[IMAPer] failed to fetch UID {uid} from {mailbox_name}"
+
+    # Populate the buffer via set_text so hooks and references stay valid.
+    buffer.set_text(json.dumps(email, indent=2))
+
+    return True
+
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # IMAPer                                                                             #
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -652,12 +751,14 @@ class IMAPer(BufferManager, AgenticObject):
             "imap_config_json_check",
             _IMAPER_CONFIG_BUFFER,
             lambda bm, buf, args: before_update_imap_config(bm, None, buf, args),
+            apply_to_existing=True,
         )
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_CREATE_BUFFER,
             "imap_config_created",
             _IMAPER_CONFIG_BUFFER,
             after_create_imap_config,
+            apply_to_existing=True,
         )
 
         # Register the tree refresh trigger before creating the hold buffer.
@@ -667,8 +768,18 @@ class IMAPer(BufferManager, AgenticObject):
             "refresh_tree_after_drop_hold",
             _IMAPER_TREE_HOLD_BUFFER,
             _refresh_after_drop_tree_hold,
+            apply_to_existing=True,
         )
         self._create_buffer(_IMAPER_TREE_HOLD_BUFFER, text="")
+
+        # Register the lazy-fetch hook for UID buffers — fires before first read of each UID.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_READ_BUFFER,
+            "lazy_fetch_imap_email",
+            r"imap:box/[^/]+/\d+$",
+            _before_read_imap_email,
+            apply_to_existing=True,
+        )
 
     async def _update_imap_connection(
         self,
@@ -842,20 +953,51 @@ class IMAPer(BufferManager, AgenticObject):
         await self.create_buffer(_IMAPER_STATUS_BUFFER, text=json.dumps(status), overwrite=True)
 
     async def _refresh_imap_box(self, mailbox_name: str) -> None:
-        """Fetch and cache the email list for a subscribed mailbox.
+        """Reconcile UID buffers for a mailbox with the server and refresh the summary.
 
-        Uses the current IMAP connection, fetches ENVELOPE and FLAGS for all
-        emails, then writes the result to the imap:box/<mailbox> buffer.
+        Fetches the current UID list from the server, diffs it against the
+        existing imap:box/<mailbox>/* buffers, creates empty buffers for new UIDs,
+        and drops buffers for UIDs no longer on the server.
         """
         # Bail out if there is no active IMAP connection.
         if self._imap_connection is None:
             raise RuntimeError("no active IMAP connection")
 
-        # Fetch the full email list with metadata for this mailbox.
+        # Fetch the current UID list from the server.
         result = _list_mailbox_emails(self._imap_connection, mailbox_name)
         if result is None:
             return
+        server_uids = set(result.get("uids", []))
 
-        # Write the email list to the corresponding imap:box/<mailbox> buffer.
+        # Compute the prefix for this mailbox's UID buffers.
+        mailbox_prefix = f"imap:box/{mailbox_name}/"
+
+        # Read the full buffer list from the status buffer — no truncation.
+        status_buf = self.get_buffer("system:status:buffers")
+        current_uid_buffers: set[str] = set()
+        if status_buf:
+            try:
+                records = json.loads(status_buf.get_text()) if status_buf.get_text().strip() else []
+            except json.JSONDecodeError:
+                records = []
+            current_uid_buffers = {
+                r["name"] for r in records
+                if r["name"].startswith(mailbox_prefix) and r["name"][len(mailbox_prefix):].isdigit()
+            }
+
+        # Diff against desired UID buffers for this mailbox.
+        desired_uid_buffers = {f"{mailbox_prefix}{uid}" for uid in server_uids}
+        to_create = sorted(desired_uid_buffers - current_uid_buffers)
+        to_drop = sorted(current_uid_buffers - desired_uid_buffers)
+
+        # Create empty buffers for new UIDs — these are lazy-loaded on first read.
+        for buf_name in to_create:
+            await self.create_buffer(buf_name, text="")
+
+        # Drop buffers for UIDs that no longer exist on the server.
+        for buf_name in to_drop:
+            await self.drop_buffer(buf_name)
+
+        # Write the summary buffer with the full email list.
         buffer_name = _mailbox_to_envelopes_buffer_name(mailbox_name)
-        await self.create_buffer(buffer_name, text=json.dumps(result, indent=2), overwrite=True)
+        await self.create_buffer(buffer_name, text=json.dumps(result, indent=2))
