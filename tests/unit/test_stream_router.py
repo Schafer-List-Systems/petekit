@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import pytest
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import sys
@@ -17,12 +17,13 @@ from petekit.stream.stream_router import (
     _is_routing_table_option,
     _parse_routing_table_option,
     evaluate_condition,
-    route_dispatch,
+    route_dispatch_batch,
     after_create_routing_table,
     before_update_routing_table,
     after_drop_routing_table,
     RoutingConditionError,
 )
+from petekit.text.buffer import BufferEntry
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -30,10 +31,17 @@ from petekit.stream.stream_router import (
 # -------------------------------------------------------------------------------------------------------------------- #
 
 def _mock_buffer(name: str, text: str = "") -> MagicMock:
-    """Return a mock Buffer with the given name and get_text returning text."""
+    """Return a mock Buffer with the given name, get_text returning text, and lines as BufferEntry list."""
     buf = MagicMock()
     buf.name = name
     buf.get_text.return_value = text
+    # lines mirrors the text split into BufferEntry objects.
+    # An empty text still produces one empty BufferEntry.
+    lines = [line for line in text.splitlines(keepends=True)]
+    buf.lines = [
+        MagicMock(spec=BufferEntry, data=line)
+        for line in lines
+    ] or [MagicMock(spec=BufferEntry, data="")]
     return buf
 
 
@@ -41,13 +49,14 @@ def _mock_processor_with_routing_table(
     table_name: str,
     routing_table: list,
     fallthrough: str | None = None,
+    route_lines: bool = True,
 ) -> MagicMock:
     """Return a processor mock with a routing_table option buffer configured.
 
     routing_table entries use the new format: [[conditions_list, output_stream], ...]
     conditions_list is a list of condition name strings, e.g. ["true"] or ["cond1", "cond2"].
     """
-    option_config = {"routing_table": routing_table}
+    option_config: dict = {"routing_table": routing_table, "route_lines": route_lines}
     if fallthrough is not None:
         option_config["fallthrough"] = fallthrough
 
@@ -57,6 +66,8 @@ def _mock_processor_with_routing_table(
         if name == f"STREAM[routing_table:{table_name}]"
         else _mock_buffer(name)
     )
+    # write_buffer is async — use AsyncMock so await works in tests.
+    proc.write_buffer = AsyncMock(return_value={"ok": True})
     return proc
 
 
@@ -118,7 +129,7 @@ class TestEvaluateCondition:
     def test_negation_prefix_negates_inner_condition(self):
         fn_mgr = MagicMock()
 
-        def inner_callable(function_manager, stream, text, metadata):
+        def inner_callable(function_manager: Any, stream: str, text: str, metadata: dict) -> bool:
             return True
 
         fn_mgr.get_function.return_value = {"ok": True, "callable": inner_callable}
@@ -147,7 +158,7 @@ class TestEvaluateCondition:
         fn_mgr = MagicMock()
         expected_result = True
 
-        def good_callable(function_manager, stream, text, metadata):
+        def good_callable(function_manager: Any, stream: str, text: str, metadata: dict) -> bool:
             assert stream == "stream"
             assert text == "input text"
             assert metadata == {"routing_table": "t1"}
@@ -164,25 +175,26 @@ class TestEvaluateCondition:
 # -------------------------------------------------------------------------------------------------------------------- #
 
 class TestRouteDispatch:
-    def test_returns_none_when_option_buffer_not_found(self):
+    async def test_returns_none_when_option_buffer_not_found(self):
         proc = MagicMock()
         proc.get_buffer.return_value = None
         old_buf = _mock_buffer("STREAM")
         new_buf = _mock_buffer("STREAM", "new text")
 
-        result = route_dispatch(proc, old_buf, new_buf, "t1")
+        result = await route_dispatch_batch(proc, old_buf, new_buf, "t1")
 
         assert result is None
 
-    def test_writes_to_matched_output_stream(self):
+    async def test_writes_to_matched_output_stream(self):
         proc = _mock_processor_with_routing_table(
             "t1",
             [[["true"], "output_a"]],
+            route_lines=False,  # batch mode — single write with full text
         )
-        old_buf = _mock_buffer("STREAM")
+        old_buf = _mock_buffer("STREAM", "")
         new_buf = _mock_buffer("STREAM", "hello world")
 
-        route_dispatch(proc, old_buf, new_buf, "t1")
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
 
         # Verify write_buffer was called with the matched output stream.
         proc.write_buffer.assert_called_once()
@@ -190,59 +202,63 @@ class TestRouteDispatch:
         assert call_args[0][0] == "output_a"
         assert call_args[0][1] == "hello world"
 
-    def test_all_conditions_must_match_in_entry(self):
+    async def test_all_conditions_must_match_in_entry(self):
         # Both conditions in the list must match — entry fires only if all conditions return True.
         proc = _mock_processor_with_routing_table(
             "t1",
             [[["true", "true"], "output_a"], [["false"], "output_b"]],
+            route_lines=False,
         )
-        old_buf = _mock_buffer("STREAM")
+        old_buf = _mock_buffer("STREAM", "")
         new_buf = _mock_buffer("STREAM", "text")
 
-        route_dispatch(proc, old_buf, new_buf, "t1")
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
 
         # Both conditions matched — write to output_a (first entry wins).
         assert proc.write_buffer.call_count == 1
         assert proc.write_buffer.call_args[0][0] == "output_a"
 
-    def test_falls_through_when_any_condition_fails_in_entry(self):
+    async def test_falls_through_when_any_condition_fails_in_entry(self):
         # One condition fails — entry is skipped, falls through to output_b.
         proc = _mock_processor_with_routing_table(
             "t1",
             [[["true", "false"], "output_a"], [["true"], "output_b"]],
+            route_lines=False,
         )
-        old_buf = _mock_buffer("STREAM")
+        old_buf = _mock_buffer("STREAM", "")
         new_buf = _mock_buffer("STREAM", "text")
 
-        route_dispatch(proc, old_buf, new_buf, "t1")
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
 
         # First entry skipped (second condition false), second entry matches — write to output_b.
         last_call = proc.write_buffer.call_args_list[-1]
         assert last_call[0][0] == "output_b"
 
-    def test_tries_entries_top_to_bottom_first_match_wins(self):
+    async def test_tries_entries_top_to_bottom_first_match_wins(self):
         proc = _mock_processor_with_routing_table(
             "t1",
             [[["false"], "output_a"], [["true"], "output_b"]],
+            route_lines=False,
         )
-        old_buf = _mock_buffer("STREAM")
+        old_buf = _mock_buffer("STREAM", "")
         new_buf = _mock_buffer("STREAM", "text")
 
-        route_dispatch(proc, old_buf, new_buf, "t1")
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
 
         # Only the second entry matches — write to output_b.
         assert proc.write_buffer.call_count == 1
         assert proc.write_buffer.call_args[0][0] == "output_b"
 
-    def test_falls_through_to_default_when_no_match(self):
+    async def test_falls_through_to_default_when_no_match(self):
         proc = _mock_processor_with_routing_table(
             "t1",
             [[["false"], "output_a"]],  # nothing matches
+            route_lines=False,
         )
-        old_buf = _mock_buffer("STREAM")
+        old_buf = _mock_buffer("STREAM", "")
         new_buf = _mock_buffer("STREAM", "text")
 
-        route_dispatch(proc, old_buf, new_buf, "t1")
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
 
         # Default fallthrough: STREAM[routing_table:t1]:fallthrough
         # First call is the log line; last call is the actual write.
@@ -250,32 +266,34 @@ class TestRouteDispatch:
         assert last_call[0][0] == "STREAM[routing_table:t1]:fallthrough"
         assert last_call[0][1] == "text"
 
-    def test_uses_custom_fallthrough_when_configured(self):
+    async def test_uses_custom_fallthrough_when_configured(self):
         proc = _mock_processor_with_routing_table(
             "t1",
             [[["false"], "output_a"]],
             fallthrough="my_fallthrough",
+            route_lines=False,
         )
-        old_buf = _mock_buffer("STREAM")
+        old_buf = _mock_buffer("STREAM", "")
         new_buf = _mock_buffer("STREAM", "text")
 
-        route_dispatch(proc, old_buf, new_buf, "t1")
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
 
         # Last call is the actual write to the custom fallthrough.
         last_call = proc.write_buffer.call_args_list[-1]
         assert last_call[0][0] == "my_fallthrough"
 
-    def test_logs_routing_error_on_invalid_json(self):
+    async def test_logs_routing_error_on_invalid_json(self):
         proc = MagicMock()
         proc.get_buffer.side_effect = lambda name: (
             _mock_buffer("STREAM[routing_table:t1]", "not json")
             if name == "STREAM[routing_table:t1]"
             else _mock_buffer(name)
         )
+        proc.write_buffer = AsyncMock(return_value={"ok": True})
         old_buf = _mock_buffer("STREAM")
         new_buf = _mock_buffer("STREAM", "text")
 
-        route_dispatch(proc, old_buf, new_buf, "t1")
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
 
         # Should log the routing error and return None.
         proc.write_buffer.assert_called()
@@ -285,16 +303,17 @@ class TestRouteDispatch:
         ]
         assert len(error_calls) == 1
 
-    def test_logs_error_when_sink_write_fails(self):
+    async def test_logs_error_when_sink_write_fails(self):
         proc = _mock_processor_with_routing_table(
             "t1",
             [[["true"], "output_a"]],
+            route_lines=False,
         )
         proc.write_buffer.return_value = {"ok": False, "error": "disk full"}
-        old_buf = _mock_buffer("STREAM")
+        old_buf = _mock_buffer("STREAM", "")
         new_buf = _mock_buffer("STREAM", "text")
 
-        route_dispatch(proc, old_buf, new_buf, "t1")
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
 
         # Should log the sink error after writing to the output.
         proc.write_buffer.assert_called()
@@ -304,7 +323,7 @@ class TestRouteDispatch:
         ]
         assert len(error_calls) == 1
 
-    def test_skips_empty_appended_text(self):
+    async def test_skips_empty_appended_text(self):
         proc = _mock_processor_with_routing_table(
             "t1",
             [[["true"], "output_a"]],
@@ -312,10 +331,64 @@ class TestRouteDispatch:
         old_buf = _mock_buffer("STREAM", "")
         new_buf = _mock_buffer("STREAM", "")
 
-        route_dispatch(proc, old_buf, new_buf, "t1")
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
 
         # Nothing to route — write_buffer should not be called.
         proc.write_buffer.assert_not_called()
+
+    async def test_route_lines_true_dispatches_each_line_separately(self):
+        # With route_lines=True (default), each new buffer entry is dispatched individually.
+        proc = _mock_processor_with_routing_table(
+            "t1",
+            [[["true"], "output_a"]],
+            route_lines=True,
+        )
+        old_buf = _mock_buffer("STREAM", "line1\n")
+        new_buf = _mock_buffer("STREAM", "line1\nline2\nline3\n")
+
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
+
+        # The two new entries (line2\n, line3\n) are written to the output stream separately.
+        assert proc.write_buffer.call_count == 2
+        assert proc.write_buffer.call_args_list[0][0][0] == "output_a"
+        assert proc.write_buffer.call_args_list[0][0][1] == "line2\n"
+        assert proc.write_buffer.call_args_list[1][0][1] == "line3\n"
+
+    async def test_route_lines_false_dispatches_full_text_as_batch(self):
+        # With route_lines=False, the full appended text is dispatched as one batch.
+        proc = _mock_processor_with_routing_table(
+            "t1",
+            [[["true"], "output_a"]],
+            route_lines=False,
+        )
+        old_buf = _mock_buffer("STREAM", "")
+        new_buf = _mock_buffer("STREAM", "line1\nline2\nline3\n")
+
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
+
+        # All three lines are written as one single batch.
+        proc.write_buffer.assert_called_once()
+        call_args = proc.write_buffer.call_args
+        assert call_args[0][0] == "output_a"
+        assert call_args[0][1] == "line1\nline2\nline3\n"
+
+    async def test_route_lines_true_different_lines_match_different_routes(self):
+        # With route_lines=True, each line is evaluated independently — different
+        # lines can match different routes.
+        proc = _mock_processor_with_routing_table(
+            "t1",
+            [
+                [["true"], "all_lines"],
+            ],
+            route_lines=True,
+        )
+        old_buf = _mock_buffer("STREAM", "a\n")
+        new_buf = _mock_buffer("STREAM", "a\nb\nc\n")
+
+        await route_dispatch_batch(proc, old_buf, new_buf, "t1")
+
+        # The two new lines (b, c) go to the same output since all match "true".
+        assert proc.write_buffer.call_count == 2
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
