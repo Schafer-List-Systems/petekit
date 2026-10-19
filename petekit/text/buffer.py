@@ -17,6 +17,8 @@ class HookPoint(Enum):
     AFTER_UPDATE_BUFFER = "after_update_buffer"
     BEFORE_DROP_BUFFER = "before_drop_buffer"
     AFTER_DROP_BUFFER = "after_drop_buffer"
+    BEFORE_READ_BUFFER = "before_read_buffer"
+    AFTER_READ_BUFFER = "after_read_buffer"
 
 
 # Pre-create: fires before buffer is added to the dict. Rejection blocks creation.
@@ -37,15 +39,23 @@ BeforeDropBuffer = Callable[["BufferManager", "Buffer", dict[str, Any]], bool | 
 # Post-drop: fires after buffer is removed. Informative only — returns None.
 AfterBufferDropped = Callable[["BufferManager", "Buffer", dict[str, Any]], None]
 
-# AnyHook is the union of all six hook type aliases — use this where a parameter
+# Pre-read: fires before a read. Return True to allow, non-None to reject or redirect.
+BeforeReadBuffer = Callable[["BufferManager", "Buffer", dict[str, Any]], bool | str | None]
+
+# Post-read: fires after a read with an isolated buffer copy. Return modified content or None to keep original.
+AfterReadBuffer = Callable[["BufferManager", "Buffer", dict[str, Any]], str | None]
+
+# AnyHook is the union of all hook type aliases — use this where a parameter
 # accepts any hook regardless of hook point.
 AnyHook = (
     BeforeCreateBuffer
     | BeforeUpdateBuffer
     | BeforeDropBuffer
+    | BeforeReadBuffer
     | AfterCreateBuffer
     | AfterUpdateBuffer
     | AfterBufferDropped
+    | AfterReadBuffer
 )
 
 

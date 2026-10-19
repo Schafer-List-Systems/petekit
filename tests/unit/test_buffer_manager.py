@@ -706,3 +706,100 @@ class TestBufferHookSystem:
         await bm.create_buffer("logs/app", text="")
 
         assert set(calls) == {"a", "b"}
+
+
+class TestReadHooks:
+    async def test_before_read_rejection_blocks_read(self, bm):
+        await bm.create_buffer("test", text="secret")
+        bm._buffers["test"].register_hook(HookPoint.BEFORE_READ_BUFFER, "h", lambda *_: "access denied")
+        result = await bm.read_buffer("test")
+        assert not result["ok"]
+        assert "access denied" in result["error"]
+
+    async def test_before_read_accept_none_allows_read(self, bm):
+        await bm.create_buffer("test", text="A\nB")
+        bm._buffers["test"].register_hook(HookPoint.BEFORE_READ_BUFFER, "h", lambda *_: None)
+        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        assert result["ok"]
+        assert "A\nB" in result
+
+    async def test_before_read_receives_correct_args(self, bm):
+        await bm.create_buffer("test", text="a\nb\nc")
+        captured = []
+
+        def spy(bm_, buf, args):
+            captured.append({"buf": buf.name, "args": args.copy()})
+            return True
+
+        bm._buffers["test"].register_hook(HookPoint.BEFORE_READ_BUFFER, "spy", spy)
+        await bm.read_buffer("test", start=1, end=2)
+        assert len(captured) == 1
+        assert captured[0]["buf"] == "test"
+        assert captured[0]["args"]["start"] == 1
+        assert captured[0]["args"]["end"] == 2
+
+    async def test_before_read_modification_affects_read(self, bm):
+        await bm.create_buffer("test", text="original")
+
+        def modifier(bm_, buf, args):
+            buf.lines[0].data = "modified"
+            return True
+
+        bm._buffers["test"].register_hook(HookPoint.BEFORE_READ_BUFFER, "mod", modifier)
+        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        assert result["ok"]
+        assert "modified" in result
+
+    async def test_after_read_modifies_content(self, bm):
+        await bm.create_buffer("test", text="A\nB")
+
+        def redact(bm_, buf, args):
+            return "[REDACTED]"
+
+        bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "redact", redact)
+        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        assert result["ok"]
+        assert result == "[REDACTED]"
+
+    async def test_after_read_returns_none_keeps_original(self, bm):
+        await bm.create_buffer("test", text="A\nB")
+        bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "h", lambda *_: None)
+        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        assert result["ok"]
+        assert "A\nB" in result
+
+    async def test_after_read_buffer_copy_is_isolated(self, bm):
+        await bm.create_buffer("test", text="A\nB")
+
+        def mutate(bm_, buf, args):
+            buf.lines[0].data = "TOXIC"
+            return "tampered"
+
+        bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "mutate", mutate)
+        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        # Caller sees the hook's return value.
+        assert result["ok"]
+        # The original buffer is untouched.
+        content = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        assert "TOXIC" not in content
+
+    async def test_after_read_multiple_hooks_all_fire(self, bm):
+        await bm.create_buffer("test", text="A\nB")
+        calls = []
+
+        def first(bm_, buf, args):
+            calls.append("first")
+            return "FIRST_MODIFIED"
+
+        def second(bm_, buf, args):
+            calls.append("second")
+            return "SECOND_MODIFIED"
+
+        bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "first", first)
+        bm._buffers["test"].register_hook(HookPoint.AFTER_READ_BUFFER, "second", second)
+        result = await bm.read_buffer("test", raw=True, show_line_numbers=False)
+        assert result["ok"]
+        # Only the first hook's return reaches the caller.
+        assert "FIRST_MODIFIED" in result
+        # Both hooks fired.
+        assert "first" in calls and "second" in calls

@@ -323,6 +323,8 @@ async def _create_buffer_implementation(
         _initialize_buffer_hooks(bm, buf, HookPoint.AFTER_UPDATE_BUFFER)
         _initialize_buffer_hooks(bm, buf, HookPoint.BEFORE_DROP_BUFFER)
         _initialize_buffer_hooks(bm, buf, HookPoint.AFTER_DROP_BUFFER)
+        _initialize_buffer_hooks(bm, buf, HookPoint.BEFORE_READ_BUFFER)
+        _initialize_buffer_hooks(bm, buf, HookPoint.AFTER_READ_BUFFER)
 
         # Fire pre-create hooks — a rejection blocks the creation.
         pre_result = await buf._fire_hooks(bm, None, HookPoint.BEFORE_CREATE_BUFFER, create_args)
@@ -537,6 +539,8 @@ class BufferManager(AgenticObject):
             HookPoint.AFTER_UPDATE_BUFFER: HookPointRegistry(),
             HookPoint.BEFORE_DROP_BUFFER: HookPointRegistry(),
             HookPoint.AFTER_DROP_BUFFER: HookPointRegistry(),
+            HookPoint.BEFORE_READ_BUFFER: HookPointRegistry(),
+            HookPoint.AFTER_READ_BUFFER: HookPointRegistry(),
         }
 
         # Bootstrap the system status buffer — this must exist before any agent runs.
@@ -994,11 +998,29 @@ class BufferManager(AgenticObject):
         Set show_line_numbers=True (default) to prefix each line with its 0-based line index.
         Returns a dict with ok/error or ok/content on success.
         Set raw=True to get the raw string instead of a dict — errors always return dict."""
+        # Guard: reject unknown buffer names to keep read operations consistent.
+        if name not in self._buffers:
+            return {"ok": False, "error": f"No buffer named '{name}'."}
+        buf = self._buffers[name]
+
+        # Fire BEFORE_READ_BUFFER hooks — a rejection blocks the read.
+        read_args: dict[str, Any] = {"_op": "read_buffer", "name": name, "start": start, "end": end, "show_timestamps": show_timestamps, "show_line_numbers": show_line_numbers}
+        pre_result = await buf._fire_hooks(self, buf, HookPoint.BEFORE_READ_BUFFER, read_args)
+        if pre_result is not True and pre_result is not None:
+            return {"ok": False, "error": str(pre_result)}
+
         # Retrieve the full untruncated buffer content.
         result = self._read_buffer(name, start, end, show_timestamps, show_line_numbers)
         if not result.get("ok"):
             return result
         total_chars = result["total_chars"]
+
+        # Fire AFTER_READ_BUFFER hooks with an isolated buffer copy.
+        # The hook can mutate the copy without affecting the original.
+        buf_copy = buf.copy()
+        after_result = await buf_copy._fire_hooks(self, buf_copy, HookPoint.AFTER_READ_BUFFER, read_args)
+        if isinstance(after_result, str):
+            result["content"] = after_result
 
         # Within-size path: mark entries as seen by the agent and return content directly.
         if total_chars <= BufferManager._MAX_CHUNK_CHARS:
