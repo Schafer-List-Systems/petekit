@@ -1,6 +1,7 @@
 """StreamRouter — routes stream data based on routing table option buffers."""
 
 from __future__ import annotations
+from peteos import AgenticObject
 
 import inspect
 import json
@@ -519,7 +520,7 @@ def evaluate_condition(
 # StreamRouter class                                                           #
 # -------------------------------------------------------------------------------------------------------------------- #
 
-class StreamRouter(FunctionManager, StreamBufferManager):
+class StreamRouter(FunctionManager, StreamBufferManager, AgenticObject):
     """I can route appended text on streams conditionally to different output streams by creating routing table option buffers.
     "doc:stream_router" holds details.
     """

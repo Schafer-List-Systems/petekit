@@ -194,7 +194,9 @@ def _persist_buffer(bm: BufferManager, buffer: Buffer) -> None:
         "created_at": buffer.created_at,
         "modified_at": buffer.modified_at,
     }
-    (dir / f".{buffer.name}.json").write_text(json.dumps(meta, indent=2))
+    meta_path = dir / f".{buffer.name}.json"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(meta, indent=2))
 
 
 def _drop_persisted_buffer(bm: BufferManager, buffer_name: str) -> None:

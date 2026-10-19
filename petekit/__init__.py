@@ -23,6 +23,7 @@ from petekit.image import (
 )
 from petekit.reflection import SelfReflector
 from petekit.function import FunctionCaller, FunctionCompiler, FunctionManager
+from petekit.productivity import IMAPer
 
 __all__ = [
     "BufferManager",
@@ -46,4 +47,5 @@ __all__ = [
     "FunctionCaller",
     "FunctionCompiler",
     "FunctionManager",
+    "IMAPer",
 ]

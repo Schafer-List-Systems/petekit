@@ -1,0 +1,1001 @@
+from __future__ import annotations
+
+from typing import Any
+
+import imaplib
+import json
+import logging
+import re
+import time
+
+from imapclient.imap_utf7 import decode as _mutf7_decode
+
+from peteos.oap.agentic_object import AgenticObject
+
+from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint
+
+
+_logger = logging.getLogger("imaper")
+
+_IMAPER_DOC_BUFFER = "doc:imap"
+_IMAPER_CONFIG_BUFFER = "imap:config"
+_IMAPER_STATUS_BUFFER = "imap:status"
+_IMAPER_TREE_BUFFER = "imap:tree"
+_IMAPER_TREE_HOLD_BUFFER = "imap:tree[hold]"
+_IMAPER_DOC = """\
+## IMAPer
+
+The IMAPer manages one IMAP account for receiving emails via a buffer-based API.
+
+### Buffers
+
+- **imap:config** — holds IMAP credentials, subscribed mailboxes, and server settings
+- **imap:status** — holds runtime status such as IMAP connection state, folder count, and last refresh time
+- **imap:tree** — holds the mailbox tree as nested JSON (e.g. `{"INBOX": {"Sent": {}, "Work": {}}}`)
+- **imap:tree[hold]** — a trigger buffer; dropping it refreshes the imap:tree buffer
+- **imap:box/INBOX/envelopes** — holds the list of emails in INBOX with metadata (sender, recipient, subject, date, flags, uid)
+- **imap:box/INBOX/envelopes[hold]** — a trigger buffer; dropping it refreshes the INBOX envelopes buffer
+- **imap:box/INBOX/Sent/envelopes** — same for a subfolder; path segments use "/" as hierarchy separator
+- **imap:box/INBOX/Sent/envelopes[hold]** — trigger buffer for the Sent folder
+
+### Configuration
+
+To configure the IMAP client, write to `imap:config` with a JSON object containing:
+
+```json
+{
+  "host": "imap.example.com",
+  "port": 993,
+  "username": "your-username",
+  "password": "your-password",
+  "timeout": 15,
+  "subscribed_mailboxes": ["INBOX", "INBOX/Sent", "INBOX/Work"]
+}
+```
+
+All fields are optional. The `timeout` field controls connection timeout in seconds (defaults to 15).
+
+The `subscribed_mailboxes` field is a list of mailbox paths to subscribe to. The IMAPer fetches the email list for each subscribed mailbox and writes it to the corresponding `imap:box/<path>/envelopes` buffer. Mailboxes not in this list are not monitored.
+
+The IMAPer automatically connects when the config is written and reconnects on any credential change. It tries SSL first; if that fails, it falls back to a plain IMAP4 connection.
+
+### Refreshing the Mailbox Tree
+
+To refresh the mailbox tree (the folder hierarchy), drop the `imap:tree[hold]` buffer:
+
+```
+drop imap:tree[hold]
+```
+
+This triggers a server refresh and rewrites the `imap:tree` buffer with the current mailbox tree.
+
+### Refreshing a Single Mailbox Email List
+
+To refresh the email list for a specific mailbox, drop its hold buffer:
+
+```
+drop imap:box/INBOX/envelopes[hold]
+```
+
+This triggers a refresh of `imap:box/INBOX/envelopes` with the current list of emails and metadata.
+
+### Subscribing to Mailboxes
+
+Add or remove paths from the `subscribed_mailboxes` list in `imap:config` to control which mailboxes are monitored. Each subscribed mailbox gets its own `imap:box/<path>/envelopes` buffer containing a list of emails with the following metadata per entry:
+
+```json
+{
+  "mailbox": "INBOX",
+  "uids": [1234, 1235],
+  "emails": [
+    {
+      "uid": 1234,
+      "sender": "Alice <alice@example.com>",
+      "recipient": "bob@example.com",
+      "subject": "Meeting tomorrow",
+      "date": "19 Oct 2026 09:15",
+      "flags": ["seen", "answered"]
+    }
+  ]
+}
+```
+
+The `flags` field lists the IMAP flags: `seen` (read), `answered`, `flagged`, `deleted`, `draft`.
+"""
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Util                                                                         #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+def _get_imap_config(config_buffer: Buffer | None) -> dict:
+    """Read and parse the imap:config buffer contents as JSON.
+
+    Returns an empty dict if the buffer is None (e.g. on first creation).
+    Raises json.JSONDecodeError on invalid JSON.
+    """
+    if config_buffer is None:
+        return {}
+    # Parse and return the config as a dict.
+    return json.loads(config_buffer.get_text())
+
+
+def _imap_connection_changed(old_config: dict, new_config: dict) -> bool:
+    """Return True if any IMAP connection credential has changed.
+
+    Compares host, port, username, and password fields between the two configs.
+    A change in any of these fields signals that the IMAP connection must be
+    re-established.
+    """
+    # Check each credential field for a difference.
+    if old_config.get("host") != new_config.get("host"):
+        return True
+    if old_config.get("port") != new_config.get("port"):
+        return True
+    if old_config.get("username") != new_config.get("username"):
+        return True
+    if old_config.get("password") != new_config.get("password"):
+        return True
+
+    return False
+
+
+def _parse_mailbox_list(raw_response: tuple) -> dict[str, str | list[list[str]]] | None:
+    """Extract mailbox names and delimiter from an IMAP4.list response tuple.
+
+    The raw response is a (status, entries) tuple where each entry is a bytes
+    string of the form: b'(\\HasNoChildren, ".") "INBOX/Work"'. The delimiter is
+    extracted from the first entry that carries one. Each mailbox name is split
+    by the delimiter into its path segments.
+
+    Returns a dict with "delimiter" (the server's hierarchy char) and "mailboxes"
+    (list of path lists, e.g. [["INBOX"], ["INBOX", "Work"]]). Returns None if
+    the server response is not OK.
+    """
+    # Reject non-OK responses — the command failed on the server side.
+    if not raw_response or raw_response[0] != 'OK':
+        _logger.error(f"[IMAPer] mailbox list response not OK: {raw_response[0] if raw_response else 'empty'}")
+        return None
+
+    # Pull the entries list from the IMAP response — skip on malformed response.
+    entries = raw_response[1] if len(raw_response) > 1 else []
+
+    # Pass one — find the delimiter from the first entry that has one.
+    delimiter = ""
+    for entry in entries:
+        # Skip non-byte entries — nothing to extract from those.
+        if not isinstance(entry, bytes):
+            continue
+
+        # Decode and look for the first quoted hierarchy char.
+        decoded = entry.decode("utf-8", errors="continue")
+        m = re.search(r'"([./])"', decoded)
+        if m:
+            delimiter = m.group(1)
+            break
+
+    # Guard — if no delimiter was found, log and default to the most common IMAP delimiter.
+    if not delimiter:
+        _logger.error("[IMAPer] could not determine IMAP hierarchy delimiter — defaulting to '/'")
+        delimiter = "/"
+
+    # Pass two — extract all mailbox names and replace the server delimiter with slashes.
+    names = []
+    for entry in entries:
+        # Skip non-byte entries — nothing to extract from those.
+        if not isinstance(entry, bytes):
+            continue
+
+        # Decode the entry and extract the last quoted string as the mailbox name.
+        decoded = entry.decode("utf-8", errors="continue")
+        m = re.search(r'"([^"]+)"\s*$', decoded)
+        if m:
+            # Decode the name from modified UTF-7 to proper UTF-8.
+            name = _mutf7_decode(m.group(1).encode("utf-8"))
+            # Split into path segments rather than concatenating with slashes.
+            path = name.split(delimiter) if delimiter else [name]
+            names.append(path)
+
+    return {"delimiter": delimiter, "mailboxes": names}
+
+
+def _build_mailbox_tree(paths: list[list[str]]) -> dict:
+    """Build a nested dictionary tree from a list of mailbox path lists.
+
+    Each path list like ["INBOX", "Work", "Vorträge"] becomes a nested dict chain.
+    The resulting tree uses empty dicts as leaf placeholders.
+
+    Example:
+        [["INBOX"], ["INBOX", "Sent"], ["INBOX", "Work", "Vorträge"]]
+        becomes
+        {"INBOX": {"Sent": {}, "Work": {"Vorträge": {}}}}.
+    """
+    # Start with an empty root — the trunk of the mailbox tree.
+    root: dict = {}
+
+    # Walk each path and hang it off the root or an existing branch.
+    for path in paths:
+        # Begin at the root for every path — descend from here.
+        node = root
+
+        # Walk each segment of the current path and build out the tree.
+        for segment in path:
+            # Create a new branch if this segment has not been seen yet.
+            if segment not in node:
+                node[segment] = {}
+
+            # Step into the segment for the next iteration.
+            node = node[segment]
+
+    # The fully built tree is returned — empty dicts mark leaf nodes.
+    return root
+
+
+def _fetch_mailbox_status(imap_connection: imaplib.IMAP4, mailbox_name: str) -> dict | None:
+    """Return the SELECT metadata for a mailbox without fetching the email list.
+
+    Uses the SELECT command which returns EXISTS, UIDVALIDITY, FLAGS, RECENT, and
+    UNSEEN counters in one lightweight call. Returns None on any failure (logged).
+
+    Returns:
+        {
+            "exists": int,
+            "uidvalidity": int,
+            "flags": list[str],
+            "recent": int,
+            "unseen": int,
+        }
+    """
+    # Reject if there is no active IMAP connection.
+    if imap_connection is None:
+        raise RuntimeError("no active IMAP connection")
+
+    # Select the mailbox — one round trip, returns folder-level metadata only.
+    try:
+        raw = imap_connection.select(mailbox_name)
+    except imaplib.IMAP4.error as e:
+        _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
+        return None
+
+    # Bail out if the server did not acknowledge the SELECT command.
+    if not raw or raw[0] != "OK":
+        _logger.error(f"[IMAPer] SELECT not OK for {mailbox_name}: {raw}")
+        return None
+
+    # Parse each metadata line from the SELECT response.
+    # The lines are on the form: b"12 EXISTS", b"12345 UIDVALIDITY", b"FLAGS", etc.
+    metadata: dict = {
+        "exists": 0,
+        "uidvalidity": 0,
+        "flags": [],
+        "recent": 0,
+        "unseen": 0,
+    }
+    for line in raw[1]:
+        # Decode and parse the EXISTS count.
+        decoded = line.decode("utf-8", errors="replace")
+        m = re.match(r"^(\d+)\s+EXISTS$", decoded)
+        if m:
+            metadata["exists"] = int(m.group(1))
+            continue
+
+        # Parse the UIDVALIDITY version counter.
+        m = re.match(r"^(\d+)\s+UIDVALIDITY$", decoded)
+        if m:
+            metadata["uidvalidity"] = int(m.group(1))
+            continue
+
+        # Parse the RECENT count.
+        m = re.match(r"^(\d+)\s+RECENT$", decoded)
+        if m:
+            metadata["recent"] = int(m.group(1))
+            continue
+
+        # Parse the UNSEEN count.
+        m = re.match(r"^(\d+)\s+UNSEEN$", decoded)
+        if m:
+            metadata["unseen"] = int(m.group(1))
+            continue
+
+        # Parse the FLAGS list.
+        m = re.match(r"^\((.+)\)\s+FLAGS$", decoded)
+        if m:
+            # Flags are space-separated and may be prefixed with backslash.
+            raw_flags = m.group(1)
+            metadata["flags"] = raw_flags.split()
+
+    return metadata
+
+
+def _list_mailbox_emails(
+    imap_connection: imaplib.IMAP4,
+    mailbox_name: str,
+) -> dict | None:
+    """Return the list of all emails in a mailbox with ENVELOPE and FLAGS metadata.
+
+    Searches for all emails using SEARCH ALL, then fetches ENVELOPE and FLAGS
+    for each UID. Returns None on any failure (logged).
+
+    Returns:
+        {
+            "mailbox": str,
+            "uids": list[int],
+            "emails": [
+                {
+                    "uid": int,
+                    "sender": str,
+                    "recipient": str,
+                    "subject": str,
+                    "date": str,
+                    "flags": list[str],
+                },
+                ...
+            ]
+        }
+    """
+    # Reject if there is no active IMAP connection.
+    if imap_connection is None:
+        raise RuntimeError("no active IMAP connection")
+
+    # Select the mailbox — SEARCH is only legal in SELECTED state, not AUTH.
+    try:
+        imap_connection.select(mailbox_name)
+    except imaplib.IMAP4.error as e:
+        _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
+        return None
+
+    # Search for all emails in the mailbox — returns a list of UID integers.
+    try:
+        status, data = imap_connection.uid("SEARCH", "ALL")
+        uid_list = [int(x) for x in data[0].split()]
+    except imaplib.IMAP4.error as e:
+        _logger.error(f"[IMAPer] SEARCH failed for {mailbox_name}: {e}")
+        return None
+
+    # Handle the empty mailbox case — return an empty list cleanly.
+    if not uid_list:
+        return {"mailbox": mailbox_name, "uids": [], "emails": []}
+
+    # Fetch ENVELOPE and FLAGS for all UIDs in one batch.
+    # Note: imaplib.IMAP4 uses uid("FETCH", uid_set, query) not uid_fetch().
+    try:
+        uids_str = ",".join([str(u) for u in uid_list])
+        raw = imap_connection.uid("FETCH", uids_str, "(ENVELOPE FLAGS)")
+    except imaplib.IMAP4.error as e:
+        _logger.error(f"[IMAPer] FETCH failed for {mailbox_name}: {e}")
+        return None
+
+    # Bail out if the server rejected the FETCH command.
+    if not raw or raw[0] != "OK":
+        _logger.error(f"[IMAPer] FETCH not OK for {mailbox_name}: {raw}")
+        return None
+
+    # Parse each email entry from the FETCH response.
+    # The raw entry is a bytes string on the form: b'4 (UID 1439 FLAGS (...) ENVELOPE (...))'
+    emails: list = []
+    for entry in raw[1]:
+        if not isinstance(entry, bytes):
+            continue
+
+        # Decode the entry for regex parsing.
+        decoded = entry.decode("utf-8", errors="replace")
+
+        # Extract the UID from the response — the number before the first space.
+        # The format is: b'4 (UID 1439 FLAGS (...) ENVELOPE (...))'
+        m = re.match(r"^\s*(\d+)\s+\(UID\s+(\d+)", decoded)
+        if not m:
+            continue
+        uid = int(m.group(2))  # Use the UID field value, not the sequence number.
+
+        # Parse the FLAGS from the FLAGS (...) section.
+        flags: list[str] = []
+        m = re.search(r"FLAGS\s+\(([^)]*)\)", decoded)
+        if m:
+            raw_flags = m.group(1)
+            # Flags may be \Seen \Answered — handle backslash-prefixed flags.
+            flags = raw_flags.split()
+
+        # Extract sender, recipient, subject, and date from the ENVELOPE field.
+        # ENVELOPE format: (date "subject" (sender_tuple) ((rcpt_tuple) ...) reply-to nil nil nil "<msgid>")
+        sender = ""
+        recipient = ""
+        subject = ""
+        date = ""
+        # Find the ENVELOPE field value — the parentized list after ENVELOPE.
+        m = re.search(r"ENVELOPE\s+\((.+)\)$", decoded, re.DOTALL)
+        if m:
+            envelope_content = m.group(1)
+            # Walk the envelope tokens to extract the fields.
+            # Format: date "subject" (sender_tuple) ((rcpt)...) ...
+            # Strip outer parentheses and extract the inner content.
+            envelope_clean = _extract_envelope_fields(envelope_content)
+            sender = envelope_clean.get("sender", "")
+            recipient = envelope_clean.get("recipient", "")
+            subject = envelope_clean.get("subject", "")
+            date = envelope_clean.get("date", "")
+
+        emails.append({
+            "uid": uid,
+            "sender": sender,
+            "recipient": recipient,
+            "subject": subject,
+            "date": date,
+            "flags": flags,
+        })
+
+    # Return the complete mailbox email list.
+    return {
+        "mailbox": mailbox_name,
+        "uids": [int(u) for u in uid_list],
+        "emails": emails,
+    }
+
+
+def _extract_envelope_fields(envelope_str: str) -> dict:
+    """Extract sender, recipient, subject, and date from an ENVELOPE field string.
+
+    The ENVELOPE field is a parentized list of the form:
+    (date "subject" (sender_tuple) ((rcpt) ...) reply-to nil nil nil "<msgid>")
+
+    Returns a dict with "sender", "recipient", "subject", "date".
+    """
+    # Strip the outer parentheses to get the inner token list.
+    if envelope_str.startswith("(") and envelope_str.endswith(")"):
+        inner = envelope_str[1:-1]
+    else:
+        inner = envelope_str
+
+    # Split the envelope content into tokens while respecting nested parentheses.
+    # This produces: [date, "subject", (sender_parts), ((rcpt_parts)...), ...]
+    tokens = _split_imap_tokens(inner)
+    if len(tokens) < 4:
+        return {}
+
+    # tokens[0] is the date string, e.g. '"Thu, 13 Feb 2025 03:28:49 -0700"'
+    # Remove outer quotes if present.
+    date = tokens[0].strip('"') if tokens else ""
+
+    # tokens[1] is the subject string, e.g. '"Data Labeling & Annotation..."'
+    subject = tokens[1].strip('"') if len(tokens) > 1 else ""
+
+    # tokens[2] is the sender tuple: (display_name route mailbox host) or all NIL.
+    # Each is a 4-tuple of (display_name, route, mailbox, host).
+    sender = ""
+    if len(tokens) > 2 and isinstance(tokens[2], str) and tokens[2].startswith("("):
+        sender = _format_address_tuple(tokens[2])
+    elif len(tokens) > 2 and isinstance(tokens[2], (list, tuple)):
+        sender = _format_address_tuple_from_list(tokens[2])
+
+    # tokens[3] is a list of recipient tuples.
+    recipient = ""
+    if len(tokens) > 3 and isinstance(tokens[3], (list, str)):
+        if isinstance(tokens[3], list) and tokens[3]:
+            recipient = _format_address_tuple_from_list(tokens[3][0]) if isinstance(tokens[3][0], (list, tuple)) else ""
+        elif isinstance(tokens[3], str) and tokens[3].startswith("("):
+            recipient = _format_address_tuple(tokens[3])
+
+    return {
+        "sender": sender,
+        "recipient": recipient,
+        "subject": subject,
+        "date": date,
+    }
+
+
+def _split_imap_tokens(s: str) -> list:
+    """Split an IMAP parentized token string into a flat list respecting nesting.
+
+    "a (b c) d" → ["a", "(b c)", "d"]
+    """
+    result = []
+    i = 0
+    while i < len(s):
+        if s[i] == "(":
+            depth = 1
+            j = i + 1
+            while j < len(s) and depth > 0:
+                if s[j] == "(":
+                    depth += 1
+                elif s[j] == ")":
+                    depth -= 1
+                j += 1
+            result.append(s[i:j])
+            i = j
+        elif s[i] in (" ", "\t", "\n"):
+            i += 1
+        else:
+            # Read a token until whitespace or '('
+            j = i
+            while j < len(s) and s[j] not in (" ", "\t", "\n", "("):
+                j += 1
+            if j < len(s) and s[j] == "(":
+                # This handles adjacent tokens: "a (b c)" → "a" then "(b c)"
+                token = s[i:j].strip()
+                if token:
+                    result.append(token)
+                i = j
+            else:
+                result.append(s[i:j])
+                i = j
+    return result
+
+
+def _format_address_tuple(tuple_str: str) -> str:
+    """Format an address tuple string as an email address.
+
+    (display_name NIL mailbox host) → "display_name <mailbox@host>"
+    """
+    if not tuple_str.startswith("("):
+        return ""
+    inner = tuple_str[1:-1]
+    tokens = _split_imap_tokens(inner)
+    if len(tokens) < 4:
+        return ""
+    display_name = tokens[0].strip('"') if tokens[0] not in ("NIL", "") else ""
+    mailbox = tokens[2] if tokens[2] != "NIL" else ""
+    host = tokens[3] if tokens[3] != "NIL" else ""
+    if mailbox and host:
+        address = f"{mailbox}@{host}"
+        if display_name:
+            return f'"{display_name}" <{address}>'
+        return address
+    return display_name
+
+
+def _format_address_tuple_from_list(t: list) -> str:
+    """Format an address tuple list as an email address."""
+    if not t or len(t) < 4:
+        return ""
+    display_name = str(t[0]).strip('"') if t[0] not in ("NIL", "", None) else ""
+    mailbox = str(t[2]) if t[2] not in ("NIL", "", None) else ""
+    host = str(t[3]) if t[3] not in ("NIL", "", None) else ""
+    if mailbox and host:
+        address = f"{mailbox}@{host}"
+        if display_name:
+            return f'"{display_name}" <{address}>'
+        return address
+    return display_name
+
+
+def _mailbox_to_envelopes_buffer_name(mailbox_name: str) -> str:
+    """Convert a mailbox path to its corresponding imap:box envelope buffer name.
+
+    INBOX         → imap:box/INBOX/envelopes
+    INBOX/Sent    → imap:box/INBOX/Sent/envelopes
+    """
+    return f"imap:box/{mailbox_name}/envelopes"
+
+
+def _mailbox_to_envelopes_hold_buffer_name(mailbox_name: str) -> str:
+    """Convert a mailbox path to its corresponding envelopes hold buffer name.
+
+    INBOX         → imap:box/INBOX/envelopes[hold]
+    INBOX/Sent    → imap:box/INBOX/Sent/envelopes[hold]
+    """
+    return f"imap:box/{mailbox_name}/envelopes[hold]"
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Config hooks                                                                                                         #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+async def after_create_imap_config(
+    imaper: IMAPer,
+    config_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Register the validation and update hooks on the imap:config buffer.
+
+    Called once when imap:config is created. Registers before_update_imap_config
+    and after_update_imap_config directly on the buffer so the buffer owns them
+    without needing pattern-based hook registration going forward.
+    """
+    # Wire validation and update hooks directly on the config buffer.
+    config_buffer.register_hook(
+        HookPoint.BEFORE_UPDATE_BUFFER,
+        "imap_config_validated",
+        before_update_imap_config,
+    )
+    config_buffer.register_hook(
+        HookPoint.AFTER_UPDATE_BUFFER,
+        "imap_config_updated",
+        after_update_imap_config,
+    )
+
+    # Trigger the update hook to handle initial config setup.
+    await after_update_imap_config(imaper, None, config_buffer, {})
+
+
+def before_update_imap_config(
+    imaper: IMAPer,
+    old_config_buffer: Buffer | None,
+    new_config_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """Validate that the imap:config buffer contains valid JSON.
+
+    Returns None to allow the update, or an error string to block it.
+    """
+    # Reject non-JSON config — read directly from the incoming buffer.
+    # At BEFORE_UPDATE_BUFFER the buffer text has not been updated yet,
+    # so we must parse new_config_buffer.get_text() directly.
+    try:
+        _get_imap_config(new_config_buffer)
+    except json.JSONDecodeError:
+        return f"'{_IMAPER_CONFIG_BUFFER}' is not valid JSON"
+
+    return None
+
+
+async def after_update_imap_config(
+    imaper: IMAPer,
+    old_config_buffer: Buffer | None,
+    new_config_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Called after imap:config is created or updated. Triggered on first config setup.
+
+    On creation old_config_buffer is None — this signals initial setup rather than a
+    later config change.
+    """
+    # Parse both configs so the IMAPer can diff and react to changes.
+    old_config = _get_imap_config(old_config_buffer)
+    new_config = _get_imap_config(new_config_buffer)
+
+    # React to credential changes — disconnect old connection if host/port/user/pass changed.
+    if _imap_connection_changed(old_config, new_config):
+        # Tear down the existing connection if one is alive.
+        if imaper._imap_connection is not None:
+            await imaper._disconnect_imap()
+
+        # Establish a fresh connection with the new credentials.
+        await imaper._connect_imap(
+            new_config.get("host", ""),
+            new_config.get("port", 993),
+            new_config.get("username", ""),
+            new_config.get("password", ""),
+        )
+    else:
+        # No credential change — react to subscription changes only.
+        pass
+
+    # Diff the subscribed_mailboxes list and handle adds and removes.
+    old_subscribed = set(old_config.get("subscribed_mailboxes", []))
+    new_subscribed = set(new_config.get("subscribed_mailboxes", []))
+    added = new_subscribed - old_subscribed
+    removed = old_subscribed - new_subscribed
+
+    # Handle removed subscriptions — drop their envelopes buffer and hold buffer.
+    for mailbox in removed:
+        # Derive the envelope buffer name and hold buffer name from the mailbox path.
+        envelopes_buf_name = _mailbox_to_envelopes_buffer_name(mailbox)
+        hold_buf_name = _mailbox_to_envelopes_hold_buffer_name(mailbox)
+
+        # Drop the envelopes data buffer and the hold trigger buffer by name.
+        await imaper.drop_buffer(envelopes_buf_name)
+        await imaper.drop_buffer(hold_buf_name)
+
+    # Handle added subscriptions — register hook first, then create buffer.
+    # Only process adds when there was no credential change (otherwise _connect_imap handled it).
+    if not _imap_connection_changed(old_config, new_config):
+        for mailbox in added:
+            # Compute the hold buffer name from the mailbox path.
+            hold_buf = _mailbox_to_envelopes_hold_buffer_name(mailbox)
+
+            # Register the refresh hook before creating the hold buffer.
+            imaper.register_buffer_pattern_hook(
+                HookPoint.AFTER_DROP_BUFFER,
+                f"refresh_envelopes_hold_{mailbox}",
+                hold_buf,
+                _refresh_after_drop_envelopes_hold,
+            )
+
+            # Create the hold buffer if it does not exist yet.
+            if imaper.get_buffer(hold_buf) is None:
+                imaper._create_buffer(hold_buf, text="")
+
+            # Refresh the envelopes buffer for the new subscription.
+            if imaper._imap_connection is not None:
+                await imaper._refresh_imap_box(mailbox)
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Buffer hooks                                                                                                      #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+async def _refresh_after_drop_tree_hold(
+    imaper: IMAPer,
+    buffer: Buffer,
+    name: str,
+    revision: int,
+) -> None:
+    """Called after imap:tree[hold] is dropped. Triggers a refresh of the tree buffer."""
+    # Refresh the imap:tree buffer after the drop completes.
+    await imaper._refresh_imap_mailbox_list()
+
+    # Recreate the hold buffer via the public API so the AFTER_DROP_BUFFER hook re-registers.
+    await imaper.create_buffer(_IMAPER_TREE_HOLD_BUFFER, text="")
+
+
+async def _refresh_after_drop_envelopes_hold(
+    imaper: IMAPer,
+    buffer: Buffer,
+    name: str,
+    revision: int,
+) -> None:
+    """Called after an envelopes hold buffer is dropped. Triggers a refresh of that mailbox."""
+    # Bail out if the buffer name does not end with "[hold]" — malformed call.
+    if not name.endswith("[hold]"):
+        return
+
+    # Strip the "[hold]" suffix to get the base buffer name.
+    name_without_hold = name.removesuffix("[hold]")
+
+    # Strip the "imap:box/" prefix to extract the raw mailbox path.
+    prefix = "imap:box/"
+    if not name_without_hold.startswith(prefix):
+        return
+    mailbox_name = name_without_hold.removeprefix(prefix)
+
+    # Refresh the envelopes buffer for this mailbox.
+    await imaper._refresh_imap_box(mailbox_name)
+
+    # Recreate the hold buffer so the AFTER_DROP_BUFFER hook re-registers.
+    hold_buffer_name = _mailbox_to_envelopes_hold_buffer_name(mailbox_name)
+    await imaper.create_buffer(hold_buffer_name, text="")
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# IMAPer                                                                             #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+class IMAPer(BufferManager, AgenticObject):
+    """."""
+
+    _imap_connection: imaplib.IMAP4 | None = None
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._imap_connection = None
+
+        # Seed the doc buffer with the module documentation.
+        self._create_buffer(_IMAPER_DOC_BUFFER, text=_IMAPER_DOC)
+
+        # Seed the status buffer with an empty JSON object.
+        self._create_buffer(_IMAPER_STATUS_BUFFER, text="{}")
+
+        # Reject any attempt to drop the status buffer — it belongs to the IMAPer.
+        status_buffer = self.get_buffer(_IMAPER_STATUS_BUFFER)
+        if status_buffer is not None:
+            status_buffer.register_hook(
+                HookPoint.BEFORE_DROP_BUFFER,
+                "imap_status_no_drop",
+                lambda bm, buf, args: "imap:status cannot be dropped",
+            )
+
+        # Validate JSON on create, wire hooks on buffer once created.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_CREATE_BUFFER,
+            "imap_config_json_check",
+            _IMAPER_CONFIG_BUFFER,
+            lambda bm, buf, args: before_update_imap_config(bm, None, buf, args),
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            "imap_config_created",
+            _IMAPER_CONFIG_BUFFER,
+            after_create_imap_config,
+        )
+
+        # Register the tree refresh trigger before creating the hold buffer.
+        # The pattern hook wires the AFTER_DROP_BUFFER hook at buffer creation time.
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_DROP_BUFFER,
+            "refresh_tree_after_drop_hold",
+            _IMAPER_TREE_HOLD_BUFFER,
+            _refresh_after_drop_tree_hold,
+        )
+        self._create_buffer(_IMAPER_TREE_HOLD_BUFFER, text="")
+
+    async def _update_imap_connection(
+        self,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+    ) -> dict:
+        """Read the existing imap:config, overlay the four credentials, write back if changed.
+
+        Returns the new merged config dict.
+        """
+        # Read the existing config to preserve all other fields.
+        old = _get_imap_config(self.get_buffer(_IMAPER_CONFIG_BUFFER))
+        merged = {**old}
+        merged["host"] = host
+        merged["port"] = port
+        merged["username"] = username
+        merged["password"] = password
+
+        # Only write to the buffer if at least one credential changed.
+        if _imap_connection_changed(old, merged):
+            await self.create_buffer(_IMAPER_CONFIG_BUFFER, text=json.dumps(merged), overwrite=True)
+
+        return merged
+
+    async def _connect_imap(
+        self,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+    ) -> None:
+        """Establish a new IMAP connection with the given credentials.
+
+        Reads the current imap:config buffer, overlays the four credential arguments,
+        writes the merged result back to imap:config as authoritative state.
+        Tries SSL first, falls back to plain IMAP4 if SSL fails.
+        """
+        # Update the config and get the merged result.
+        config = await self._update_imap_connection(host, port, username, password)
+
+        # Tear down any existing connection first.
+        if self._imap_connection is not None:
+            await self._disconnect_imap()
+
+        # Read the timeout from config or default to 15 seconds.
+        timeout = config.get("timeout", 15)
+        if timeout is not None:
+            timeout = int(timeout)
+
+        # Establish the IMAP connection — try SSL first, fall back to plain IMAP4.
+        self._imap_connection = None
+        ssl_error: Exception | None = None
+        try:
+            self._imap_connection = imaplib.IMAP4_SSL(
+                config.get("host"),
+                config.get("port"),
+                timeout=timeout,
+            )
+        except OSError as e:
+            ssl_error = e
+
+        # SSL failed — try plain IMAP4 as a fallback.
+        if self._imap_connection is None:
+            try:
+                self._imap_connection = imaplib.IMAP4(
+                    config.get("host"),
+                    config.get("port"),
+                    timeout=timeout,
+                )
+            except OSError as e:
+                ssl_error = e
+
+        # Both SSL and plain IMAP4 failed — bail out.
+        if self._imap_connection is None:
+            _logger.error(f"[IMAPer] connection failed (SSL: {ssl_error})")
+            return
+
+        # Apply the socket timeout to all subsequent commands (login, list, select, etc.).
+        self._imap_connection.sock.settimeout(timeout)
+
+        # Log in and confirm the connection is established.
+        try:
+            self._imap_connection.login(config.get("username"), config.get("password"))
+        except imaplib.IMAP4.error as e:
+            _logger.error(f"[IMAPer] login failed: {e}")
+            self._imap_connection = None
+            return
+
+        _logger.info(f"[IMAPer] connected to {config.get('host')}:{config.get('port')}")
+
+        # Populate the mailbox list after a successful login.
+        await self._refresh_imap_mailbox_list()
+
+        # Refresh envelopes for all subscribed mailboxes.
+        subscribed = config.get("subscribed_mailboxes", [])
+        for mailbox in subscribed:
+            # Compute the hold buffer name from the mailbox path.
+            hold_buf = _mailbox_to_envelopes_hold_buffer_name(mailbox)
+
+            # Register the refresh hook before creating the hold buffer.
+            self.register_buffer_pattern_hook(
+                HookPoint.AFTER_DROP_BUFFER,
+                f"refresh_envelopes_hold_{mailbox}",
+                hold_buf,
+                _refresh_after_drop_envelopes_hold,
+            )
+
+            # Create the hold buffer if it does not exist yet.
+            if self.get_buffer(hold_buf) is None:
+                self._create_buffer(hold_buf, text="")
+
+            # Fetch and cache the email list for this mailbox.
+            await self._refresh_imap_box(mailbox)
+
+    async def _disconnect_imap(self) -> None:
+        """Close the current IMAP connection if one exists.
+
+        Logs out and sets _imap_connection to None.
+        """
+        # Bail out early if there is no active connection.
+        if self._imap_connection is not None:
+            try:
+                self._imap_connection.logout()
+            except Exception:
+                # Swallow logout errors — the connection may already be dead.
+                pass
+            # Clear the reference to the connection.
+            self._imap_connection = None
+            _logger.info("[IMAPer] disconnected")
+
+    def _list_imap_mailboxes(self) -> dict[str, str | list[list[str]]] | None:
+        """List all IMAP mailbox names in the account.
+
+        Returns a dict with the server's hierarchy "delimiter" and a "mailboxes"
+        list. Each entry is a path list of segments, e.g. [["INBOX"], ["INBOX", "Work"]].
+        The delimiter is preserved so the original server name can be reconstructed
+        when needed.
+        Raises RuntimeError if there is no active IMAP connection.
+        Returns None if the server rejected the LIST command.
+        """
+        # Guard — reject if there is no active IMAP connection.
+        if self._imap_connection is None:
+            raise RuntimeError("no active IMAP connection")
+
+        # List all mailboxes under INBOX to get the full folder hierarchy.
+        try:
+            raw = self._imap_connection.list("INBOX", "*")
+        except imaplib.IMAP4.error as e:
+            # Server rejected the LIST command — log and return None.
+            _logger.error(f"[IMAPer] LIST command error: {e}")
+            return None
+
+        # Return the parsed mailbox list or None on server error.
+        return _parse_mailbox_list(raw)
+
+    async def _refresh_imap_mailbox_list(self) -> None:
+        """Refresh the imap:tree buffer with the current list of mailboxes.
+
+        Overwrites imap:tree with a JSON list of path lists (e.g. [["INBOX"], ["INBOX", "Work"]]).
+        Updates imap:status with the delimiter, count, and a refreshed timestamp.
+        """
+        # Bail out if there is no active IMAP connection.
+        if self._imap_connection is None:
+            raise RuntimeError("no active IMAP connection")
+
+        # Fetch the current mailbox list from the server.
+        mailboxes = self._list_imap_mailboxes()
+        if mailboxes is None:
+            return
+
+        # Build a nested tree from the flat path lists and write it to the box buffer.
+        tree = _build_mailbox_tree(mailboxes.get("mailboxes", []))
+        await self.create_buffer(_IMAPER_TREE_BUFFER, text=json.dumps(tree), overwrite=True)
+
+        # Update imap:status with the current folder count, delimiter, and refresh time.
+        status = {
+            "mailbox_count": len(mailboxes.get("mailboxes", [])),
+            "delimiter": mailboxes.get("delimiter", "/"),
+            "last_refreshed_at": time.time(),
+        }
+        await self.create_buffer(_IMAPER_STATUS_BUFFER, text=json.dumps(status), overwrite=True)
+
+    async def _refresh_imap_box(self, mailbox_name: str) -> None:
+        """Fetch and cache the email list for a subscribed mailbox.
+
+        Uses the current IMAP connection, fetches ENVELOPE and FLAGS for all
+        emails, then writes the result to the imap:box/<mailbox> buffer.
+        """
+        # Bail out if there is no active IMAP connection.
+        if self._imap_connection is None:
+            raise RuntimeError("no active IMAP connection")
+
+        # Fetch the full email list with metadata for this mailbox.
+        result = _list_mailbox_emails(self._imap_connection, mailbox_name)
+        if result is None:
+            return
+
+        # Write the email list to the corresponding imap:box/<mailbox> buffer.
+        buffer_name = _mailbox_to_envelopes_buffer_name(mailbox_name)
+        await self.create_buffer(buffer_name, text=json.dumps(result), overwrite=True)
