@@ -108,6 +108,7 @@ buffer with this JSON content:
         [["condition1", "condition2"], "output_stream"],
         [["true"], "fallback_stream"]
     ],
+    "route_lines": true,
     "fallthrough": "custom_fallthrough"
 }}
 ```
@@ -115,6 +116,8 @@ buffer with this JSON content:
 - **routing_table**: a list of [rule, output_stream] routes
 - **rule**: a list of condition names; all must return True for the route to fire
 - **output_stream**: the destination stream when the rule matches
+- **route_lines**: if true (default), each buffer entry is dispatched individually through the routing table;
+  if false, the full appended text is dispatched as one batch
 - **fallthrough**: optional; overrides the default fallthrough stream
 
 ### Routing Rules
@@ -199,9 +202,9 @@ def _make_dispatch(
         new_buffer: Buffer,
         args: dict[str, Any],
     ) -> str | None:
-        # Call route_dispatch and catch errors to the log rather than propagating.
+        # Call route_dispatch_batch and catch errors to the log rather than propagating.
         try:
-            return await route_dispatch(buffer_manager, old_buffer, new_buffer, table_name)
+            return await route_dispatch_batch(buffer_manager, old_buffer, new_buffer, table_name)
         except Exception as e:
             buffer_manager.write_buffer(_LOG_BUFFER, f"ROUTING ERROR: {e}")
             return None
@@ -342,6 +345,87 @@ def after_drop_routing_table(
 
 async def route_dispatch(
     processor: BufferManager,
+    config: dict,
+    stream_name: str,
+    table_name: str,
+    text: str,
+) -> None:
+    """Evaluate routing conditions against `text` and dispatch to the matched output.
+
+    Iterates the routing_table entries top-to-bottom. The first fully-matching
+    entry wins and writes to its output stream. If no entry matches, writes to
+    the configured or default fallthrough stream.
+    """
+    # Evaluate routing conditions top-to-bottom; first fully-matching entry wins.
+    for condition_list, output_stream in config.get("routing_table", []):
+        # Try each condition in this entry — all must match for the entry to fire.
+        # A RoutingConditionError or a single condition failing means this entry is skipped.
+        all_match = True
+        for condition_name in condition_list:
+            # Evaluate the condition — RoutingConditionError means fall-through for this entry.
+            try:
+                matched = evaluate_condition(
+                    processor,
+                    condition_name,
+                    text,
+                    stream_name,
+                    table_name,
+                )
+            except RoutingConditionError as e:
+                # A condition signaled fall-through for this entry — skip to the next entry.
+                await _safe_log(
+                    processor,
+                    f"Routing Condition Error source={stream_name} table={table_name} reason={e}",
+                )
+                all_match = False
+                break
+            except Exception as e:
+                # An unexpected error during condition evaluation — abort routing entirely.
+                await _safe_log(
+                    processor,
+                    f"CONDITION ERROR condition='{condition_name}' table='{table_name}' "
+                    f"text='{text[:40]}' error='{e}'",
+                )
+                return None
+
+            # The condition returned False — this entry does not match, move to the next.
+            if not matched:
+                all_match = False
+                break
+
+        # All sub-conditions in this entry matched — write to the output stream and stop.
+        if all_match:
+            result = await processor.write_buffer(output_stream, text)
+            if not result.get("ok"):
+                await _safe_log(
+                    processor,
+                    f"SINK ERROR: failed to write to '{output_stream}': {result.get('error')}",
+                )
+            return None
+
+    # No entry matched — route to the fallthrough stream.
+    # Use the configured fallthrough stream, or default to STREAM[routing_table:NAME]:fallthrough.
+    fallthrough_stream = config.get("fallthrough")
+    if not fallthrough_stream:
+        fallthrough_stream = _fallthrough_name(stream_name, table_name)
+
+    # Log the fallthrough event.
+    await _safe_log(
+        processor,
+        f"FALLTHROUGH source={stream_name} table={table_name} -> {fallthrough_stream}",
+    )
+
+    # Write to the fallthrough stream.
+    result = await processor.write_buffer(fallthrough_stream, text)
+    if not result.get("ok"):
+        _safe_log(
+            processor,
+            f"FALLTHROUGH ERROR: failed to write to '{fallthrough_stream}': {result.get('error')}",
+        )
+
+
+async def route_dispatch_batch(
+    processor: BufferManager,
     old_buffer: Buffer,
     new_buffer: Buffer,
     table_name: str,
@@ -368,79 +452,18 @@ async def route_dispatch(
         
         return None
 
-    # Extract only the newly appended text.
-    appended_text = new_buffer.get_text(start=len(old_buffer)-1)
-    if not appended_text.strip():
-        return None
-
-    # Evaluate routing conditions top-to-bottom; first fully-matching entry wins.
-    for condition_list, output_stream in config.get("routing_table", []):
-        # Try each condition in this entry — all must match for the entry to fire.
-        # A RoutingConditionError or a single condition failing means this entry is skipped.
-        all_match = True
-        for condition_name in condition_list:
-            # Evaluate the condition — RoutingConditionError means fall-through for this entry.
-            try:
-                matched = evaluate_condition(
-                    processor,
-                    condition_name,
-                    appended_text,
-                    new_buffer.name,
-                    table_name,
-                )
-            except RoutingConditionError as e:
-                # A condition signaled fall-through for this entry — skip to the next entry.
-                await _safe_log(
-                    processor,
-                    f"Routing Condition Error source={new_buffer.name} table={table_name} reason={e}",
-                )
-                all_match = False
-                break
-            except Exception as e:
-                # An unexpected error during condition evaluation — abort routing entirely.
-                await _safe_log(
-                    processor,
-                    f"CONDITION ERROR condition='{condition_name}' table='{table_name}' "
-                    f"text='{appended_text[:40]}' error='{e}'",
-                )
-                return None
-
-            # The condition returned False — this entry does not match, move to the next.
-            if not matched:
-                all_match = False
-                break
-
-        # All sub-conditions in this entry matched — write to the output stream and stop.
-        if all_match:
-            result = await processor.write_buffer(output_stream, appended_text)
-            if not result.get("ok"):
-                await _safe_log(
-                    processor,
-                    f"SINK ERROR: failed to write to '{output_stream}': {result.get('error')}",
-                )
+    # Decide between per-line or batch dispatch based on the route_lines config.
+    if config.get("route_lines", True):
+        # Dispatch each new buffer entry through the routing table individually.
+        for entry in new_buffer.lines[len(old_buffer.lines):]:
+            if entry.data:
+                await route_dispatch(processor, config, new_buffer.name, table_name, entry.data)
+    else:
+        # Collect the full appended text as one batch and dispatch it.
+        appended_text = new_buffer.get_text(start=len(old_buffer)-1)
+        if not appended_text:
             return None
-
-    # No entry matched — route to the fallthrough stream.
-    # Use the configured fallthrough stream, or default to STREAM[routing_table:NAME]:fallthrough.
-    fallthrough_stream = config.get("fallthrough")
-    if not fallthrough_stream:
-        fallthrough_stream = _fallthrough_name(new_buffer.name, table_name)
-
-    # Log the fallthrough event.
-    await _safe_log(
-        processor,
-        f"FALLTHROUGH source={new_buffer.name} table={table_name} -> {fallthrough_stream}",
-    )
-
-    # Write to the fallthrough stream.
-    result = await processor.write_buffer(fallthrough_stream, appended_text)
-    if not result.get("ok"):
-        _safe_log(
-            processor,
-            f"FALLTHROUGH ERROR: failed to write to '{fallthrough_stream}': {result.get('error')}",
-        )
-
-    return None
+        await route_dispatch(processor, config, new_buffer.name, table_name, appended_text)
 
 
 def evaluate_condition(
