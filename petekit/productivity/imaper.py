@@ -38,10 +38,12 @@ The IMAPer manages one IMAP account for receiving emails via a buffer-based API.
 - **{_IMAPER_TREE_BUFFER}**  --  holds the mailbox tree as nested JSON (e.g. `{{"INBOX": {{"Sent": {{}}, "Work": {{}}}}}}`)
 - **{_IMAPER_MAILBOX_SCOPE}/INBOX/envelopes**  --  holds the list of emails in INBOX with metadata (sender, recipient, subject, date, flags, uid)
 - **{_IMAPER_MAILBOX_SCOPE}/INBOX/Sent/envelopes**  --  same for a subfolder; path segments use "/" as hierarchy separator
+- **{_IMAPER_MAILBOX_SCOPE}/<mailbox>/<uid>.body**  --  the plain-text body of a single email; referenced from the `body` field in the envelopes list
+- **{_IMAPER_MAILBOX_SCOPE}/<mailbox>/envelopes.filter**  --  optional; when present, narrows the envelopes list with server-side search criteria
 
 ### Configuration
 
-To configure the IMAP client, write to `email:config` with a JSON object containing:
+To configure the IMAP client, write to `{_IMAPER_CONFIG_BUFFER}` with a JSON object containing:
 
 ```json
 {{
@@ -59,17 +61,30 @@ The IMAPer automatically connects when the config is written and reconnects on a
 
 ### Refreshing the Mailbox Tree
 
-The `email:tree` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the tree is sufficient to keep it current.
+The `{_IMAPER_TREE_BUFFER}` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the tree is sufficient to keep it current.
 
 ### Refreshing a Single Mailbox Email List
 
-The `email:box/<mailbox>/envelopes` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the envelope buffer is sufficient to keep it current.
+The `{_IMAPER_MAILBOX_SCOPE}/<mailbox>/envelopes` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the envelope buffer is sufficient to keep it current.
 
 The response includes a `total` field: the count of all emails matching the current filter (before pagination). This lets the agent know how many pages exist.
 
+### Reading a Single Email Body
+
+The email body is stored in a separate buffer and is not included in the `envelopes` list. The `body` field in each envelope entry is a reference string pointing to the body buffer: `{_IMAPER_MAILBOX_SCOPE}/<mailbox>/<uid>.body`. To read the full message text, the agent reads the body buffer directly by that path.
+
+### Reading a Single Email (Full Flow)
+
+Reading from the IMAPer follows a strict chain  --  each step refreshes from the server and prepares the next:
+
+1. Read `{_IMAPER_TREE_BUFFER}`  --  fetches the mailbox list from the server
+2. Read `{_IMAPER_MAILBOX_SCOPE}/<mailbox>/envelopes`  --  fetches the UID list for that mailbox and creates empty UID buffers; each entry has a `body` field with the body buffer path
+3. Read `{_IMAPER_MAILBOX_SCOPE}/<mailbox>/<uid>`  --  fetches the full RFC822 message and writes the body to `<uid>.body`; the `body` field in the response holds the body buffer path
+4. Read the path stored in the `body` field  --  the plain-text body text itself
+
 ### Filtering and Paginating the Email List
 
-To narrow the email list by sender, subject, flags, or date, create a filter buffer at `email:box/<mailbox>/envelopes.filter`. When this buffer exists, its content is read on every `envelopes` refresh and applied as the search criteria. All criteria are AND-ed together  --  a message must match every criterion to be included.
+To narrow the email list by sender, subject, flags, or date, create a filter buffer at `{_IMAPER_MAILBOX_SCOPE}/<mailbox>/envelopes.filter`. When this buffer exists, its content is read on every `envelopes` refresh and applied as the search criteria. All criteria are AND-ed together  --  a message must match every criterion to be included.
 
 ```json
 {{
