@@ -29,11 +29,11 @@ The IMAPer manages one IMAP account for receiving emails via a buffer-based API.
 
 ### Buffers
 
-- **{_IMAPER_CONFIG_BUFFER}** — holds IMAP credentials and server settings
-- **{_IMAPER_STATUS_BUFFER}** — holds runtime status such as IMAP connection state, folder count, and last refresh time
-- **{_IMAPER_TREE_BUFFER}** — holds the mailbox tree as nested JSON (e.g. `{{"INBOX": {{"Sent": {{}}, "Work": {{}}}}}}`)
-- **{_IMAPER_MAILBOX_SCOPE}/INBOX/envelopes** — holds the list of emails in INBOX with metadata (sender, recipient, subject, date, flags, uid)
-- **{_IMAPER_MAILBOX_SCOPE}/INBOX/Sent/envelopes** — same for a subfolder; path segments use "/" as hierarchy separator
+- **{_IMAPER_CONFIG_BUFFER}**  --  holds IMAP credentials and server settings
+- **{_IMAPER_STATUS_BUFFER}**  --  holds runtime status such as IMAP connection state, folder count, and last refresh time
+- **{_IMAPER_TREE_BUFFER}**  --  holds the mailbox tree as nested JSON (e.g. `{{"INBOX": {{"Sent": {{}}, "Work": {{}}}}}}`)
+- **{_IMAPER_MAILBOX_SCOPE}/INBOX/envelopes**  --  holds the list of emails in INBOX with metadata (sender, recipient, subject, date, flags, uid)
+- **{_IMAPER_MAILBOX_SCOPE}/INBOX/Sent/envelopes**  --  same for a subfolder; path segments use "/" as hierarchy separator
 
 ### Configuration
 
@@ -55,11 +55,11 @@ The IMAPer automatically connects when the config is written and reconnects on a
 
 ### Refreshing the Mailbox Tree
 
-The `imap:tree` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer — reading the tree is sufficient to keep it current.
+The `imap:tree` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the tree is sufficient to keep it current.
 
 ### Refreshing a Single Mailbox Email List
 
-The `imap:box/<mailbox>/envelopes` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer — reading the envelope buffer is sufficient to keep it current.
+The `imap:box/<mailbox>/envelopes` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the envelope buffer is sufficient to keep it current.
 """
 
 
@@ -113,15 +113,15 @@ def _parse_mailbox_list(raw_response: tuple) -> dict[str, str | list[list[str]]]
     (list of path lists, e.g. [["INBOX"], ["INBOX", "Work"]]). Returns None if
     the server response is not OK.
     """
-    # Reject non-OK responses — the command failed on the server side.
+    # Reject non-OK responses  --  the command failed on the server side.
     if not raw_response or raw_response[0] != 'OK':
         _logger.error(f"[IMAPer] mailbox list response not OK: {raw_response[0] if raw_response else 'empty'}")
         return None
 
-    # Pull the entries list from the IMAP response — skip on malformed response.
+    # Pull the entries list from the IMAP response  --  skip on malformed response.
     entries = raw_response[1] if len(raw_response) > 1 else []
 
-    # Pull the delimiter from the first entry — imapclient returns it as bytes at index 1.
+    # Pull the delimiter from the first entry  --  imapclient returns it as bytes at index 1.
     # Format per entry: ((flags,...), delimiter_bytes, name_str)
     # Set a default delimiter in case the server response is malformed.
     delimiter = "/"
@@ -135,11 +135,11 @@ def _parse_mailbox_list(raw_response: tuple) -> dict[str, str | list[list[str]]]
             except Exception:
                 pass
 
-    # Extract each mailbox name — entry[2] is the full path as a str already.
+    # Extract each mailbox name  --  entry[2] is the full path as a str already.
     # Split it by the delimiter to get the individual path segments.
     names = []
     for entry in entries:
-        # Skip malformed entries — need a 3-tuple of (flags, delimiter, name).
+        # Skip malformed entries  --  need a 3-tuple of (flags, delimiter, name).
         if not isinstance(entry, (list, tuple)) or len(entry) < 3:
             continue
 
@@ -155,20 +155,20 @@ def _parse_mailbox_list(raw_response: tuple) -> dict[str, str | list[list[str]]]
 def _build_mailbox_tree(paths: list[list[str]]) -> dict:
     """Build a nested dictionary tree from a list of mailbox path lists.
 
-    Each path list like ["INBOX", "Work", "Vorträge"] becomes a nested dict chain.
+    Each path list like ["INBOX", "Work", "Work"] becomes a nested dict chain.
     The resulting tree uses empty dicts as leaf placeholders.
 
     Example:
-        [["INBOX"], ["INBOX", "Sent"], ["INBOX", "Work", "Vorträge"]]
+        [["INBOX"], ["INBOX", "Sent"], ["INBOX", "Work", "Work"]]
         becomes
-        {"INBOX": {"Sent": {}, "Work": {"Vorträge": {}}}}.
+        {"INBOX": {"Sent": {}, "Work": {"Work": {}}}}.
     """
-    # Start with an empty root — the trunk of the mailbox tree.
+    # Start with an empty root  --  the trunk of the mailbox tree.
     root: dict = {}
 
     # Walk each path and hang it off the root or an existing branch.
     for path in paths:
-        # Begin at the root for every path — descend from here.
+        # Begin at the root for every path  --  descend from here.
         node = root
 
         # Walk each segment of the current path and build out the tree.
@@ -180,7 +180,7 @@ def _build_mailbox_tree(paths: list[list[str]]) -> dict:
             # Step into the segment for the next iteration.
             node = node[segment]
 
-    # The fully built tree is returned — empty dicts mark leaf nodes.
+    # The fully built tree is returned  --  empty dicts mark leaf nodes.
     return root
 
 
@@ -203,7 +203,7 @@ def _fetch_mailbox_status(imap_connection: imapclient.IMAPClient, mailbox_name: 
     if imap_connection is None:
         raise RuntimeError("no active IMAP connection")
 
-    # Select the mailbox — imapclient returns a clean dict, not raw bytes.
+    # Select the mailbox  --  imapclient returns a clean dict, not raw bytes.
     try:
         result = imap_connection.select_folder(mailbox_name)
     except imapclient.Error as e:
@@ -258,21 +258,21 @@ def _list_mailbox_emails(
     if imap_connection is None:
         raise RuntimeError("no active IMAP connection")
 
-    # Select the mailbox — imapclient handles state management.
+    # Select the mailbox  --  imapclient handles state management.
     try:
         imap_connection.select_folder(mailbox_name)
     except imapclient.Error as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
-    # Search for all emails — imapclient returns a clean list of message IDs.
+    # Search for all emails  --  imapclient returns a clean list of message IDs.
     try:
         message_ids = imap_connection.search(["ALL"])
     except imapclient.Error as e:
         _logger.error(f"[IMAPer] SEARCH failed for {mailbox_name}: {e}")
         return None
 
-    # Handle the empty mailbox case — return an empty list cleanly.
+    # Handle the empty mailbox case  --  return an empty list cleanly.
     if not message_ids:
         return {"mailbox": mailbox_name, "uids": [], "emails": []}
 
@@ -288,7 +288,7 @@ def _list_mailbox_emails(
     # imapclient returns already-parsed Envelope and FLAGS objects.
     emails: list = []
     for uid, fields in result.items():
-        # Extract the ENVELOPE data — imapclient returns byte keys.
+        # Extract the ENVELOPE data  --  imapclient returns byte keys.
         envelope = fields.get(b'ENVELOPE')
         if envelope:
             # Format the sender address from the first Address in the from_ tuple.
@@ -303,7 +303,7 @@ def _list_mailbox_emails(
                 addr = envelope.to[0]
                 recipient = _format_imap_address(addr)
 
-            # Extract subject and date — imapclient returns subject as bytes.
+            # Extract subject and date  --  imapclient returns subject as bytes.
             # Decode RFC 2047 MIME encoded words (e.g. =?UTF-8?Q?...?=) to proper unicode.
             raw_subject = envelope.subject
             if isinstance(raw_subject, bytes):
@@ -323,7 +323,7 @@ def _list_mailbox_emails(
             subject = ""
             date = ""
 
-        # Extract the FLAGS — imapclient uses byte keys and returns a tuple of byte flag names.
+        # Extract the FLAGS  --  imapclient uses byte keys and returns a tuple of byte flag names.
         # Decode each flag byte to a readable string.
         raw_flags = fields.get(b'FLAGS', [])
         flags = [f.decode("utf-8") if isinstance(f, bytes) else str(f) for f in raw_flags]
@@ -348,13 +348,13 @@ def _list_mailbox_emails(
 def _format_imap_address(address: imapclient.response_types.Address) -> str:
     """Format an imapclient Address object as a readable email address.
 
-    Address(mailbox=u'alice', host=u'example.com', name=u'Alice') → "Alice <alice@example.com>"
+    Address(mailbox=u'alice', host=u'example.com', name=u'Alice')  ->  "Alice <alice@example.com>"
     """
-    # Reject a None address — nothing to format.
+    # Reject a None address  --  nothing to format.
     if not address:
         return ""
 
-    # Decode bytes fields to strings — Address fields may be bytes or str.
+    # Decode bytes fields to strings  --  Address fields may be bytes or str.
     def _decode(val):
         if isinstance(val, bytes):
             try:
@@ -392,8 +392,8 @@ def _format_imap_address(address: imapclient.response_types.Address) -> str:
 def _mailbox_to_envelopes_buffer_name(mailbox_name: str) -> str:
     """Convert a mailbox path to its corresponding imap:box envelope buffer name.
 
-    INBOX         → imap:box/INBOX/envelopes
-    INBOX/Sent    → imap:box/INBOX/Sent/envelopes
+    INBOX          ->  imap:box/INBOX/envelopes
+    INBOX/Sent     ->  imap:box/INBOX/Sent/envelopes
     """
     return _IMAPER_MAILBOX_SCOPE + f"/{mailbox_name}/envelopes"
 
@@ -408,7 +408,7 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
     if imap_connection is None:
         raise RuntimeError("no active IMAP connection")
 
-    # Select the mailbox — required before fetching message data.
+    # Select the mailbox  --  required before fetching message data.
     try:
         imap_connection.select_folder(mailbox_name)
     except imapclient.Error as e:
@@ -436,7 +436,7 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
     sender = _format_imap_address(envelope.from_[0]) if envelope.from_ else ""
     recipient = _format_imap_address(envelope.to[0]) if envelope.to else ""
 
-    # Decode the subject — imapclient may return bytes.
+    # Decode the subject  --  imapclient may return bytes.
     raw_subject = envelope.subject
     if isinstance(raw_subject, bytes):
         raw_subject = raw_subject.decode("utf-8")
@@ -468,11 +468,11 @@ def _flatten_tree(tree: dict) -> list[list[str]]:
     """Flatten a nested mailbox tree into a list of all leaf paths.
 
     Traverses the tree depth-first. Each leaf (an empty dict {}) becomes one
-    path list — the list of keys from the root to that leaf.
+    path list  --  the list of keys from the root to that leaf.
 
     Example:
         {"INBOX": {"Sent": {}, "Work": {}}}
-        → [["INBOX", "Sent"], ["INBOX", "Work"]]
+         ->  [["INBOX", "Sent"], ["INBOX", "Work"]]
 
     Returns an empty list if the tree is empty or not a dict.
     """
@@ -488,7 +488,7 @@ def _flatten_tree(tree: dict) -> list[list[str]]:
             if isinstance(value, dict):
                 walk(value, current_path)
 
-            # Every key marks a path — if it has children we recorded the deeper
+            # Every key marks a path  --  if it has children we recorded the deeper
             # path; if not, this is a leaf and this is the complete path.
             result.append(current_path)
 
@@ -540,7 +540,7 @@ def before_update_imap_config(
 
     Returns None to allow the update, or an error string to block it.
     """
-    # Reject non-JSON config — read directly from the incoming buffer.
+    # Reject non-JSON config  --  read directly from the incoming buffer.
     # At BEFORE_UPDATE_BUFFER the buffer text has not been updated yet,
     # so we must parse new_config_buffer.get_text() directly.
     try:
@@ -559,14 +559,14 @@ async def after_update_imap_config(
 ) -> None:
     """Called after imap:config is created or updated. Triggered on first config setup.
 
-    On creation old_config_buffer is None — this signals initial setup rather than a
+    On creation old_config_buffer is None  --  this signals initial setup rather than a
     later config change.
     """
     # Parse both configs so the IMAPer can diff and react to changes.
     old_config = _get_imap_config(old_config_buffer)
     new_config = _get_imap_config(new_config_buffer)
 
-    # React to credential changes — disconnect old connection if host/port/user/pass changed.
+    # React to credential changes  --  disconnect old connection if host/port/user/pass changed.
     if _imap_connection_changed(old_config, new_config):
         # Tear down the existing connection if one is alive.
         if imaper._imap_connection is not None:
@@ -628,11 +628,11 @@ async def _before_read_imap_email(
     if buffer.get_text():
         return True
 
-    # Extract the UID from the buffer name — the last path segment is the UID.
+    # Extract the UID from the buffer name  --  the last path segment is the UID.
     parts = buffer.name.split("/")
     uid = int(parts[-1])
 
-    # Derive the mailbox name — the path between the mailbox scope and the UID.
+    # Derive the mailbox name  --  the path between the mailbox scope and the UID.
     mailbox_name = "/".join(parts[1:-1])
 
     # Fetch the email from the server.
@@ -656,10 +656,10 @@ async def _after_update_imap_tree(
 
     Fires whenever the tree buffer is written (via create_buffer with overwrite or write_buffer).
     Use this to drive any downstream state that depends on the current mailbox tree.
-    On first creation old_buffer is None — this is initial setup, nothing to diff.
+    On first creation old_buffer is None  --  this is initial setup, nothing to diff.
     """
     # Parse both trees from their buffer text. An empty or absent old buffer
-    # means initial setup — there is nothing to diff against.
+    # means initial setup  --  there is nothing to diff against.
     try:
         old_tree = json.loads(old_buffer.get_text()) if old_buffer else {}
     except json.JSONDecodeError:
@@ -726,7 +726,7 @@ class IMAPer(BufferManager, AgenticObject):
             lambda *_: self._refresh_imap_mailbox_list(),
         )
 
-        # Reject any attempt to drop the status buffer — it belongs to the IMAPer.
+        # Reject any attempt to drop the status buffer  --  it belongs to the IMAPer.
         status_buffer = self.get_buffer(_IMAPER_STATUS_BUFFER)
         if status_buffer is not None:
             status_buffer.register_hook(
@@ -751,16 +751,16 @@ class IMAPer(BufferManager, AgenticObject):
             apply_to_existing=True,
         )
 
-        # Register the lazy-fetch hook for UID buffers — fires before first read of each UID.
+        # Register the lazy-fetch hook for UID buffers  --  fires before first read of each UID.
         self.register_buffer_pattern_hook(
             HookPoint.BEFORE_READ_BUFFER,
             "lazy_fetch_imap_email",
-            rf"{_IMAPER_MAILBOX_SCOPE}/[^/]+/\d+$",
+            rf"{_IMAPER_MAILBOX_SCOPE}/.+/\d+$",
             _before_read_imap_email,
             apply_to_existing=True,
         )
 
-        # Register the envelopes before-read hook — stub for future per-mailbox logic.
+        # Register the envelopes before-read hook  --  stub for future per-mailbox logic.
         self.register_buffer_pattern_hook(
             HookPoint.BEFORE_READ_BUFFER,
             "before_read_envelopes",
@@ -860,7 +860,7 @@ class IMAPer(BufferManager, AgenticObject):
             try:
                 self._imap_connection.logout()
             except Exception:
-                # Swallow logout errors — the connection may already be dead.
+                # Swallow logout errors  --  the connection may already be dead.
                 pass
             # Clear the reference to the connection.
             self._imap_connection = None
@@ -876,15 +876,15 @@ class IMAPer(BufferManager, AgenticObject):
         Raises RuntimeError if there is no active IMAP connection.
         Returns None if the server rejected the LIST command.
         """
-        # Guard — reject if there is no active IMAP connection.
+        # Guard  --  reject if there is no active IMAP connection.
         if self._imap_connection is None:
             raise RuntimeError("no active IMAP connection")
 
-        # List all folders recursively — imapclient returns already-parsed tuples.
+        # List all folders recursively  --  imapclient returns already-parsed tuples.
         try:
             folders = self._imap_connection.list_folders()
         except imapclient.Error as e:
-            # Server rejected the LIST command — log and return None.
+            # Server rejected the LIST command  --  log and return None.
             _logger.error(f"[IMAPer] LIST command error: {e}")
             return None
 
@@ -942,7 +942,7 @@ class IMAPer(BufferManager, AgenticObject):
         # Compute the prefix for this mailbox's UID buffers.
         mailbox_prefix = _IMAPER_MAILBOX_SCOPE + f"/{mailbox_name}/"
 
-        # Read the full buffer list from the status buffer — no truncation.
+        # Read the full buffer list from the status buffer  --  no truncation.
         status_buf = self.get_buffer("system:status:buffers")
         current_uid_buffers: set[str] = set()
         if status_buf:
@@ -960,7 +960,7 @@ class IMAPer(BufferManager, AgenticObject):
         to_create = sorted(desired_uid_buffers - current_uid_buffers)
         to_drop = sorted(current_uid_buffers - desired_uid_buffers)
 
-        # Create empty buffers for new UIDs — these are lazy-loaded on first read.
+        # Create empty buffers for new UIDs  --  these are lazy-loaded on first read.
         for buf_name in to_create:
             await self.create_buffer(buf_name, text="")
 
