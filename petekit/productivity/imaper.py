@@ -401,7 +401,7 @@ def _mailbox_to_envelopes_buffer_name(mailbox_name: str) -> str:
 def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: str, uid: int) -> dict | None:
     """Fetch a single email by UID from the server.
 
-    Returns a dict with uid, sender, recipient, subject, date, and flags.
+    Returns a dict with uid, sender, recipient, subject, date, flags, and body.
     Returns None on any failure (logged).
     """
     # Reject if there is no active IMAP connection.
@@ -415,9 +415,9 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
-    # Fetch the ENVELOPE and FLAGS for the single UID.
+    # Fetch the ENVELOPE, FLAGS, and BODY for the single UID.
     try:
-        result = imap_connection.fetch([uid], [b'ENVELOPE', b'FLAGS'])
+        result = imap_connection.fetch([uid], [b'ENVELOPE', b'FLAGS', b'BODY[TEXT]'])
     except imapclient.Error as e:
         _logger.error(f"[IMAPer] FETCH failed for UID {uid} in {mailbox_name}: {e}")
         return None
@@ -454,6 +454,15 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
     raw_flags = fields.get(b'FLAGS', [])
     flags = [f.decode("utf-8") if isinstance(f, bytes) else str(f) for f in raw_flags]
 
+    # Extract the body text, decode to UTF-8, and normalize line endings.
+    raw_body = fields.get(b'BODY[TEXT]')
+    if isinstance(raw_body, bytes):
+        body = raw_body.decode("utf-8", errors="replace")
+    else:
+        body = str(raw_body) if raw_body else ""
+    # Normalize CRLF and lone CR to Unix newlines for readability.
+    body = body.replace("\r\n", "\n").replace("\r", "")
+
     return {
         "uid": uid,
         "sender": sender,
@@ -461,6 +470,7 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
         "subject": subject,
         "date": date,
         "flags": flags,
+        "body": body,
     }
 
 
@@ -641,6 +651,14 @@ async def _before_read_imap_email(
         return f"[IMAPer] failed to fetch UID {uid} from {mailbox_name}"
 
     # Populate the buffer via set_text so hooks and references stay valid.
+    # Store the body in a separate buffer and leave a reference in the JSON
+    # so the agent can find it without parsing the full body text.
+    body = email.pop("body", "")
+    body_buffer_name = f"{buffer.name}.body"
+    await imaper.create_buffer(body_buffer_name, text=body)
+
+    # Put the body reference back so the agent sees where to find the body.
+    email["body"] = body_buffer_name
     buffer.set_text(json.dumps(email, indent=2))
 
     return True
