@@ -234,6 +234,8 @@ class Buffer:
             HookPoint.AFTER_UPDATE_BUFFER: {},
             HookPoint.BEFORE_DROP_BUFFER: {},
             HookPoint.AFTER_DROP_BUFFER: {},
+            HookPoint.BEFORE_READ_BUFFER: {},
+            HookPoint.AFTER_READ_BUFFER: {},
         }
 
     def alias(self) -> Buffer:
