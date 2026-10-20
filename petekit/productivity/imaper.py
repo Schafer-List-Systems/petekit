@@ -7,9 +7,13 @@ import json
 import logging
 import time
 
-from email.header import decode_header
+
+from email import message_from_bytes
+from email.policy import default
+from email.utils import parseaddr
 
 from peteos.oap.agentic_object import AgenticObject
+
 
 from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint
 
@@ -276,55 +280,38 @@ def _list_mailbox_emails(
     if not message_ids:
         return {"mailbox": mailbox_name, "uids": [], "emails": []}
 
-    # Fetch ENVELOPE and FLAGS for all message IDs in one batch.
-    # imapclient returns: {id: {'ENVELOPE': Envelope, 'FLAGS': (...)}}
+    # Fetch full message and FLAGS for all message IDs in one batch.
+    # RFC822 is the full raw message bytes, parsed by the email library.
     try:
-        result = imap_connection.fetch(message_ids, ["ENVELOPE", "FLAGS"])
+        result = imap_connection.fetch(message_ids, ["RFC822", "FLAGS"])
     except imapclient.Error as e:
         _logger.error(f"[IMAPer] FETCH failed for {mailbox_name}: {e}")
         return None
 
-    # Parse each email from the fetched result.
-    # imapclient returns already-parsed Envelope and FLAGS objects.
+    # Parse each email header with the email library  --  all decoding is automatic.
     emails: list = []
     for uid, fields in result.items():
-        # Extract the ENVELOPE data  --  imapclient returns byte keys.
-        envelope = fields.get(b'ENVELOPE')
-        if envelope:
-            # Format the sender address from the first Address in the from_ tuple.
-            sender = ""
-            if envelope.from_:
-                addr = envelope.from_[0]
-                sender = _format_imap_address(addr)
-
-            # Format the first recipient from the to tuple.
-            recipient = ""
-            if envelope.to:
-                addr = envelope.to[0]
-                recipient = _format_imap_address(addr)
-
-            # Extract subject and date  --  imapclient returns subject as bytes.
-            # Decode RFC 2047 MIME encoded words (e.g. =?UTF-8?Q?...?=) to proper unicode.
-            raw_subject = envelope.subject
-            if isinstance(raw_subject, bytes):
-                raw_subject = raw_subject.decode("utf-8")
-            if raw_subject:
-                parts = decode_header(raw_subject)
-                subject = ''.join(
-                    (p[0].decode(p[1]) if p[1] else p[0].decode('utf-8', errors='replace')) if isinstance(p[0], bytes) else str(p[0])
-                    for p in parts
-                )
+        raw_headers = fields.get(b'RFC822')
+        if raw_headers and isinstance(raw_headers, bytes):
+            msg = message_from_bytes(raw_headers, policy=default)
+            # parseaddr returns (name, addr)  --  addr is the bare email address.
+            if msg["From"]:
+                _, sender = parseaddr(msg["From"])
             else:
-                subject = ""
-            date = str(envelope.date) if envelope.date else ""
+                sender = ""
+            if msg["To"]:
+                _, recipient = parseaddr(msg["To"])
+            else:
+                recipient = ""
+            subject = str(msg["Subject"]) if msg["Subject"] else ""
+            date = str(msg["Date"]) if msg["Date"] else ""
         else:
             sender = ""
             recipient = ""
             subject = ""
             date = ""
 
-        # Extract the FLAGS  --  imapclient uses byte keys and returns a tuple of byte flag names.
-        # Decode each flag byte to a readable string.
+        # FLAGS  --  server-side read/answered/etc. status.
         raw_flags = fields.get(b'FLAGS', [])
         flags = [f.decode("utf-8") if isinstance(f, bytes) else str(f) for f in raw_flags]
 
@@ -343,50 +330,6 @@ def _list_mailbox_emails(
         "uids": message_ids,
         "emails": emails,
     }
-
-
-def _format_imap_address(address: imapclient.response_types.Address) -> str:
-    """Format an imapclient Address object as a readable email address.
-
-    Address(mailbox=u'alice', host=u'example.com', name=u'Alice')  ->  "Alice <alice@example.com>"
-    """
-    # Reject a None address  --  nothing to format.
-    if not address:
-        return ""
-
-    # Decode bytes fields to strings  --  Address fields may be bytes or str.
-    def _decode(val):
-        if isinstance(val, bytes):
-            try:
-                return val.decode("utf-8")
-            except Exception:
-                pass
-        return str(val) if val else ""
-
-    name = _decode(address.name)
-    # Decode RFC 2047 MIME encoded display names (e.g. =?UTF-8?Q?=C3=9Cber?= Smith)
-    if name.startswith("=?"):
-        try:
-            parts = decode_header(name)
-            name = ''.join(
-                (p[0].decode(p[1]) if p[1] else p[0].decode('utf-8', errors='replace')) if isinstance(p[0], bytes) else str(p[0])
-                for p in parts
-            )
-        except Exception:
-            pass
-    mailbox = _decode(address.mailbox)
-    host = _decode(address.host)
-
-    # Build the full address string only when both mailbox and host are present.
-    if mailbox and host:
-        address_str = f"{mailbox}@{host}"
-        # Prefix with the display name when one exists.
-        if name:
-            return f'"{name}" <{address_str}>'
-        return address_str
-
-    # Fall back to the bare name when the address is incomplete.
-    return name
 
 
 def _mailbox_to_envelopes_buffer_name(mailbox_name: str) -> str:
@@ -415,9 +358,9 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
-    # Fetch the ENVELOPE, FLAGS, and BODY for the single UID.
+    # Fetch the full RFC 822 message  --  email library handles all parsing.
     try:
-        result = imap_connection.fetch([uid], [b'ENVELOPE', b'FLAGS', b'BODY[TEXT]'])
+        result = imap_connection.fetch([uid], ["RFC822", "FLAGS"])
     except imapclient.Error as e:
         _logger.error(f"[IMAPer] FETCH failed for UID {uid} in {mailbox_name}: {e}")
         return None
@@ -426,42 +369,38 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
     if not result or uid not in result:
         return None
 
-    # Extract the envelope and flags from the response.
+    # Parse the raw RFC 822 message  --  email library handles CRLF, charset,
+    # multipart, and all decoding.
     fields = result[uid]
-    envelope = fields.get(b'ENVELOPE')
-    if not envelope:
+    raw_message = fields.get(b'RFC822')
+    if isinstance(raw_message, bytes):
+        msg = message_from_bytes(raw_message, policy=default)
+    else:
+        _logger.error(f"[IMAPer] BODY[1] for UID {uid} is not bytes: {type(raw_message)}")
         return None
 
-    # Format the sender and recipient from the Address objects.
-    sender = _format_imap_address(envelope.from_[0]) if envelope.from_ else ""
-    recipient = _format_imap_address(envelope.to[0]) if envelope.to else ""
+    # Extract sender and recipient via parseaddr  --  gives (name, addr) tuples.
+    sender = parseaddr(msg["From"])[1] if msg["From"] else ""
+    recipient = parseaddr(msg["To"])[1] if msg["To"] else ""
 
-    # Decode the subject  --  imapclient may return bytes.
-    raw_subject = envelope.subject
-    if isinstance(raw_subject, bytes):
-        raw_subject = raw_subject.decode("utf-8")
-    if raw_subject:
-        parts = decode_header(raw_subject)
-        subject = ''.join(
-            (p[0].decode(p[1]) if isinstance(p[0], bytes) and p[1] else str(p[0]))
-            for p in parts
-        )
-    else:
-        subject = ""
+    # Subject  --  str() on the Header object to get the decoded value.
+    subject = str(msg["Subject"]) if msg["Subject"] else ""
 
-    # Extract the date and decode the FLAGS tuple to readable strings.
-    date = str(envelope.date) if envelope.date else ""
+    # Date from the header.
+    date = msg["Date"] or ""
+
+    # Flags as before  --  server-side read/answered/etc. status.
     raw_flags = fields.get(b'FLAGS', [])
     flags = [f.decode("utf-8") if isinstance(f, bytes) else str(f) for f in raw_flags]
 
-    # Extract the body text, decode to UTF-8, and normalize line endings.
-    raw_body = fields.get(b'BODY[TEXT]')
-    if isinstance(raw_body, bytes):
-        body = raw_body.decode("utf-8", errors="replace")
+    # Body  --  get_body returns the text/plain part, get_payload(decode=True)
+    # decodes Content-Transfer-Encoding (quoted-printable, base64, etc).
+    body_part = msg.get_body(("plain",))
+    if body_part is not None:
+        body_bytes = body_part.get_payload(decode=True)
+        body = body_bytes.decode(body_part.get_content_charset() or "utf-8", errors="replace") if body_bytes else ""
     else:
-        body = str(raw_body) if raw_body else ""
-    # Normalize CRLF and lone CR to Unix newlines for readability.
-    body = body.replace("\r\n", "\n").replace("\r", "")
+        body = ""
 
     return {
         "uid": uid,
@@ -659,7 +598,7 @@ async def _before_read_imap_email(
 
     # Put the body reference back so the agent sees where to find the body.
     email["body"] = body_buffer_name
-    buffer.set_text(json.dumps(email, indent=2))
+    buffer.set_text(json.dumps(email, indent=2, ensure_ascii=False))
 
     return True
 
@@ -808,7 +747,7 @@ class IMAPer(BufferManager, AgenticObject):
 
         # Only write to the buffer if at least one credential changed.
         if _imap_connection_changed(old, merged):
-            await self.create_buffer(_IMAPER_CONFIG_BUFFER, text=json.dumps(merged), overwrite=True)
+            await self.create_buffer(_IMAPER_CONFIG_BUFFER, text=json.dumps(merged, ensure_ascii=False), overwrite=True)
 
         return merged
 
@@ -930,7 +869,7 @@ class IMAPer(BufferManager, AgenticObject):
 
         # Build a nested tree from the flat path lists and write it to the box buffer.
         tree = _build_mailbox_tree(mailboxes.get("mailboxes", []))
-        await self.create_buffer(_IMAPER_TREE_BUFFER, text=json.dumps(tree), overwrite=True)
+        await self.create_buffer(_IMAPER_TREE_BUFFER, text=json.dumps(tree, ensure_ascii=False), overwrite=True)
 
         # Update imap:status with the current folder count, delimiter, and refresh time.
         status = {
@@ -938,7 +877,7 @@ class IMAPer(BufferManager, AgenticObject):
             "delimiter": mailboxes.get("delimiter", "/"),
             "last_refreshed_at": time.time(),
         }
-        await self.create_buffer(_IMAPER_STATUS_BUFFER, text=json.dumps(status), overwrite=True)
+        await self.create_buffer(_IMAPER_STATUS_BUFFER, text=json.dumps(status, ensure_ascii=False), overwrite=True)
 
     async def _refresh_imap_box(self, mailbox_name: str) -> None:
         """Reconcile UID buffers for a mailbox with the server and refresh the summary.
@@ -988,4 +927,4 @@ class IMAPer(BufferManager, AgenticObject):
 
         # Write the summary buffer with the full email list.
         buffer_name = _mailbox_to_envelopes_buffer_name(mailbox_name)
-        await self.create_buffer(buffer_name, text=json.dumps(result, indent=2), overwrite=True)
+        await self.create_buffer(buffer_name, text=json.dumps(result, indent=2, ensure_ascii=False), overwrite=True)
