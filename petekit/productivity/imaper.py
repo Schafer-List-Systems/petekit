@@ -16,38 +16,38 @@ from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint
 
 _logger = logging.getLogger("imaper")
 
+_IMAPER_SCOPE = "imap:"
 _IMAPER_DOC_BUFFER = "doc:imap"
-_IMAPER_CONFIG_BUFFER = "imap:config"
-_IMAPER_STATUS_BUFFER = "imap:status"
-_IMAPER_TREE_BUFFER = "imap:tree"
-_IMAPER_DOC = """\
+_IMAPER_CONFIG_BUFFER = _IMAPER_SCOPE + "config"
+_IMAPER_STATUS_BUFFER = _IMAPER_SCOPE + "status"
+_IMAPER_TREE_BUFFER = _IMAPER_SCOPE + "tree"
+_IMAPER_MAILBOX_SCOPE = _IMAPER_SCOPE + "box"
+_IMAPER_DOC = f"""\
 ## IMAPer
 
 The IMAPer manages one IMAP account for receiving emails via a buffer-based API.
 
 ### Buffers
 
-- **imap:config** — holds IMAP credentials, subscribed mailboxes, and server settings
-- **imap:status** — holds runtime status such as IMAP connection state, folder count, and last refresh time
-- **imap:tree** — holds the mailbox tree as nested JSON (e.g. `{"INBOX": {"Sent": {}, "Work": {}}}`)
-- **imap:box/INBOX/envelopes** — holds the list of emails in INBOX with metadata (sender, recipient, subject, date, flags, uid)
-- **imap:box/INBOX/envelopes[hold]** — a trigger buffer; dropping it refreshes the INBOX envelopes buffer
-- **imap:box/INBOX/Sent/envelopes** — same for a subfolder; path segments use "/" as hierarchy separator
-- **imap:box/INBOX/Sent/envelopes[hold]** — trigger buffer for the Sent folder
+- **{_IMAPER_CONFIG_BUFFER}** — holds IMAP credentials, subscribed mailboxes, and server settings
+- **{_IMAPER_STATUS_BUFFER}** — holds runtime status such as IMAP connection state, folder count, and last refresh time
+- **{_IMAPER_TREE_BUFFER}** — holds the mailbox tree as nested JSON (e.g. `{{"INBOX": {{"Sent": {{}}, "Work": {{}}}}}}`)
+- **{_IMAPER_MAILBOX_SCOPE}/INBOX/envelopes** — holds the list of emails in INBOX with metadata (sender, recipient, subject, date, flags, uid)
+- **{_IMAPER_MAILBOX_SCOPE}/INBOX/Sent/envelopes** — same for a subfolder; path segments use "/" as hierarchy separator
 
 ### Configuration
 
 To configure the IMAP client, write to `imap:config` with a JSON object containing:
 
 ```json
-{
+{{
   "host": "imap.example.com",
   "port": 993,
   "username": "your-username",
   "password": "your-password",
   "timeout": 15,
   "subscribed_mailboxes": ["INBOX", "INBOX/Sent", "INBOX/Work"]
-}
+}}
 ```
 
 All fields are optional. The `timeout` field controls connection timeout in seconds (defaults to 15).
@@ -62,33 +62,27 @@ The `imap:tree` buffer auto-refreshes from the server on every read. The agent d
 
 ### Refreshing a Single Mailbox Email List
 
-To refresh the email list for a specific mailbox, drop its hold buffer:
-
-```
-drop imap:box/INBOX/envelopes[hold]
-```
-
-This triggers a refresh of `imap:box/INBOX/envelopes` with the current list of emails and metadata.
+The `imap:box/<mailbox>/envelopes` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer — reading the envelope buffer is sufficient to keep it current.
 
 ### Subscribing to Mailboxes
 
 Add or remove paths from the `subscribed_mailboxes` list in `imap:config` to control which mailboxes are monitored. Each subscribed mailbox gets its own `imap:box/<path>/envelopes` buffer containing a list of emails with the following metadata per entry:
 
 ```json
-{
+{{
   "mailbox": "INBOX",
   "uids": [1234, 1235],
   "emails": [
-    {
+    {{
       "uid": 1234,
       "sender": "Alice <alice@example.com>",
       "recipient": "bob@example.com",
       "subject": "Meeting tomorrow",
       "date": "19 Oct 2026 09:15",
       "flags": ["seen", "answered"]
-    }
+    }}
   ]
-}
+}}
 ```
 
 The `flags` field lists the IMAP flags: `seen` (read), `answered`, `flagged`, `deleted`, `draft`.
@@ -427,16 +421,7 @@ def _mailbox_to_envelopes_buffer_name(mailbox_name: str) -> str:
     INBOX         → imap:box/INBOX/envelopes
     INBOX/Sent    → imap:box/INBOX/Sent/envelopes
     """
-    return f"imap:box/{mailbox_name}/envelopes"
-
-
-def _mailbox_to_envelopes_hold_buffer_name(mailbox_name: str) -> str:
-    """Convert a mailbox path to its corresponding envelopes hold buffer name.
-
-    INBOX         → imap:box/INBOX/envelopes[hold]
-    INBOX/Sent    → imap:box/INBOX/Sent/envelopes[hold]
-    """
-    return f"imap:box/{mailbox_name}/envelopes[hold]"
+    return _IMAPER_MAILBOX_SCOPE + f"/{mailbox_name}/envelopes"
 
 
 def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: str, uid: int) -> dict | None:
@@ -630,35 +615,18 @@ async def after_update_imap_config(
     added = new_subscribed - old_subscribed
     removed = old_subscribed - new_subscribed
 
-    # Handle removed subscriptions — drop their envelopes buffer and hold buffer.
+    # Handle removed subscriptions — drop their envelopes buffer.
     for mailbox in removed:
-        # Derive the envelope buffer name and hold buffer name from the mailbox path.
+        # Derive the envelope buffer name from the mailbox path.
         envelopes_buf_name = _mailbox_to_envelopes_buffer_name(mailbox)
-        hold_buf_name = _mailbox_to_envelopes_hold_buffer_name(mailbox)
 
-        # Drop the envelopes data buffer and the hold trigger buffer by name.
+        # Drop the envelopes data buffer by name.
         await imaper.drop_buffer(envelopes_buf_name)
-        await imaper.drop_buffer(hold_buf_name)
 
-    # Handle added subscriptions — register hook first, then create buffer.
+    # Handle added subscriptions — refresh their envelope buffer.
     # Only process adds when there was no credential change (otherwise _connect_imap handled it).
     if not _imap_connection_changed(old_config, new_config):
         for mailbox in added:
-            # Compute the hold buffer name from the mailbox path.
-            hold_buf = _mailbox_to_envelopes_hold_buffer_name(mailbox)
-
-            # Register the refresh hook before creating the hold buffer.
-            imaper.register_buffer_pattern_hook(
-                HookPoint.AFTER_DROP_BUFFER,
-                f"refresh_envelopes_hold_{mailbox}",
-                hold_buf,
-                _refresh_after_drop_envelopes_hold,
-            )
-
-            # Create the hold buffer if it does not exist yet.
-            if imaper.get_buffer(hold_buf) is None:
-                imaper._create_buffer(hold_buf, text="")
-
             # Refresh the envelopes buffer for the new subscription.
             if imaper._imap_connection is not None:
                 await imaper._refresh_imap_box(mailbox)
@@ -669,32 +637,31 @@ async def after_update_imap_config(
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
-async def _refresh_after_drop_envelopes_hold(
+async def _before_read_envelopes(
     imaper: IMAPer,
     buffer: Buffer,
-    name: str,
-    revision: int,
-) -> None:
-    """Called after an envelopes hold buffer is dropped. Triggers a refresh of that mailbox."""
-    # Bail out if the buffer name does not end with "[hold]" — malformed call.
-    if not name.endswith("[hold]"):
-        return
+    args: dict[str, Any],
+) -> bool | str | None:
+    """Called before an envelopes buffer is read.
 
-    # Strip the "[hold]" suffix to get the base buffer name.
-    name_without_hold = name.removesuffix("[hold]")
+    Fires on any imap:box/<mailbox>/envelopes buffer. Extracts the mailbox name
+    from the buffer name and triggers a refresh of the envelopes summary before
+    the read proceeds. This keeps the email list current on every access.
+    """
+    # Extract the mailbox name from the buffer name.
+    # The buffer name is: _IMAPER_MAILBOX_SCOPE / mailbox_name / envelopes
+    # parts = ["imap:box", "<mailbox>", ..., "envelopes"]
+    parts = buffer.name.split("/")
+    if len(parts) < 2 or parts[-1] != "envelopes":
+        return True
 
-    # Strip the "imap:box/" prefix to extract the raw mailbox path.
-    prefix = "imap:box/"
-    if not name_without_hold.startswith(prefix):
-        return
-    mailbox_name = name_without_hold.removeprefix(prefix)
+    # Join the path segments between the scope and the "envelopes" suffix.
+    mailbox_name = "/".join(parts[1:-1])
 
-    # Refresh the envelopes buffer for this mailbox.
+    # Refresh the envelopes summary for this mailbox.
     await imaper._refresh_imap_box(mailbox_name)
 
-    # Recreate the hold buffer so the AFTER_DROP_BUFFER hook re-registers.
-    hold_buffer_name = _mailbox_to_envelopes_hold_buffer_name(mailbox_name)
-    await imaper.create_buffer(hold_buffer_name, text="")
+    return True
 
 
 async def _before_read_imap_email(
@@ -716,7 +683,7 @@ async def _before_read_imap_email(
     parts = buffer.name.split("/")
     uid = int(parts[-1])
 
-    # Derive the mailbox name — the path between "imap:box" and the UID.
+    # Derive the mailbox name — the path between the mailbox scope and the UID.
     mailbox_name = "/".join(parts[1:-1])
 
     # Fetch the email from the server.
@@ -844,6 +811,15 @@ class IMAPer(BufferManager, AgenticObject):
             apply_to_existing=True,
         )
 
+        # Register the envelopes before-read hook — stub for future per-mailbox logic.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_READ_BUFFER,
+            "before_read_envelopes",
+            r"imap:box/.+/envelopes$",
+            _before_read_envelopes,
+            apply_to_existing=True,
+        )
+
     async def _update_imap_connection(
         self,
         host: str,
@@ -925,21 +901,6 @@ class IMAPer(BufferManager, AgenticObject):
         # Refresh envelopes for all subscribed mailboxes.
         subscribed = config.get("subscribed_mailboxes", [])
         for mailbox in subscribed:
-            # Compute the hold buffer name from the mailbox path.
-            hold_buf = _mailbox_to_envelopes_hold_buffer_name(mailbox)
-
-            # Register the refresh hook before creating the hold buffer.
-            self.register_buffer_pattern_hook(
-                HookPoint.AFTER_DROP_BUFFER,
-                f"refresh_envelopes_hold_{mailbox}",
-                hold_buf,
-                _refresh_after_drop_envelopes_hold,
-            )
-
-            # Create the hold buffer if it does not exist yet.
-            if self.get_buffer(hold_buf) is None:
-                self._create_buffer(hold_buf, text="")
-
             # Fetch and cache the email list for this mailbox.
             await self._refresh_imap_box(mailbox)
 
@@ -1033,7 +994,7 @@ class IMAPer(BufferManager, AgenticObject):
         server_uids = set(result.get("uids", []))
 
         # Compute the prefix for this mailbox's UID buffers.
-        mailbox_prefix = f"imap:box/{mailbox_name}/"
+        mailbox_prefix = _IMAPER_MAILBOX_SCOPE + f"/{mailbox_name}/"
 
         # Read the full buffer list from the status buffer — no truncation.
         status_buf = self.get_buffer("system:status:buffers")
