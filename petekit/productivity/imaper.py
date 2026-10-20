@@ -20,7 +20,6 @@ _IMAPER_DOC_BUFFER = "doc:imap"
 _IMAPER_CONFIG_BUFFER = "imap:config"
 _IMAPER_STATUS_BUFFER = "imap:status"
 _IMAPER_TREE_BUFFER = "imap:tree"
-_IMAPER_TREE_HOLD_BUFFER = "imap:tree[hold]"
 _IMAPER_DOC = """\
 ## IMAPer
 
@@ -31,7 +30,6 @@ The IMAPer manages one IMAP account for receiving emails via a buffer-based API.
 - **imap:config** — holds IMAP credentials, subscribed mailboxes, and server settings
 - **imap:status** — holds runtime status such as IMAP connection state, folder count, and last refresh time
 - **imap:tree** — holds the mailbox tree as nested JSON (e.g. `{"INBOX": {"Sent": {}, "Work": {}}}`)
-- **imap:tree[hold]** — a trigger buffer; dropping it refreshes the imap:tree buffer
 - **imap:box/INBOX/envelopes** — holds the list of emails in INBOX with metadata (sender, recipient, subject, date, flags, uid)
 - **imap:box/INBOX/envelopes[hold]** — a trigger buffer; dropping it refreshes the INBOX envelopes buffer
 - **imap:box/INBOX/Sent/envelopes** — same for a subfolder; path segments use "/" as hierarchy separator
@@ -60,13 +58,7 @@ The IMAPer automatically connects when the config is written and reconnects on a
 
 ### Refreshing the Mailbox Tree
 
-To refresh the mailbox tree (the folder hierarchy), drop the `imap:tree[hold]` buffer:
-
-```
-drop imap:tree[hold]
-```
-
-This triggers a server refresh and rewrites the `imap:tree` buffer with the current mailbox tree.
+The `imap:tree` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer — reading the tree is sufficient to keep it current.
 
 ### Refreshing a Single Mailbox Email List
 
@@ -513,6 +505,41 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
     }
 
 
+def _flatten_tree(tree: dict) -> list[list[str]]:
+    """Flatten a nested mailbox tree into a list of all leaf paths.
+
+    Traverses the tree depth-first. Each leaf (an empty dict {}) becomes one
+    path list — the list of keys from the root to that leaf.
+
+    Example:
+        {"INBOX": {"Sent": {}, "Work": {}}}
+        → [["INBOX", "Sent"], ["INBOX", "Work"]]
+
+    Returns an empty list if the tree is empty or not a dict.
+    """
+    result: list[list[str]] = []
+
+    # Walk the tree recursively, building the path to each leaf.
+    def walk(node: dict, path: list[str]) -> None:
+        # Visit every key in the current node. Each key extends the current path.
+        for key, value in node.items():
+            current_path = path + [key]
+
+            # If this key has children, descend into them before recording.
+            if isinstance(value, dict):
+                walk(value, current_path)
+
+            # Every key marks a path — if it has children we recorded the deeper
+            # path; if not, this is a leaf and this is the complete path.
+            result.append(current_path)
+
+    # Start the walk from the tree root with no prior path.
+    if isinstance(tree, dict):
+        walk(tree, [])
+
+    return result
+
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # Config hooks                                                                                                         #
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -642,20 +669,6 @@ async def after_update_imap_config(
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
-async def _refresh_after_drop_tree_hold(
-    imaper: IMAPer,
-    buffer: Buffer,
-    name: str,
-    revision: int,
-) -> None:
-    """Called after imap:tree[hold] is dropped. Triggers a refresh of the tree buffer."""
-    # Refresh the imap:tree buffer after the drop completes.
-    await imaper._refresh_imap_mailbox_list()
-
-    # Recreate the hold buffer via the public API so the AFTER_DROP_BUFFER hook re-registers.
-    await imaper.create_buffer(_IMAPER_TREE_HOLD_BUFFER, text="")
-
-
 async def _refresh_after_drop_envelopes_hold(
     imaper: IMAPer,
     buffer: Buffer,
@@ -717,6 +730,51 @@ async def _before_read_imap_email(
     return True
 
 
+async def _after_update_imap_tree(
+    imaper: IMAPer,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Called after imap:tree is updated.
+
+    Fires whenever the tree buffer is written (via create_buffer with overwrite or write_buffer).
+    Use this to drive any downstream state that depends on the current mailbox tree.
+    On first creation old_buffer is None — this is initial setup, nothing to diff.
+    """
+    # Parse both trees from their buffer text. An empty or absent old buffer
+    # means initial setup — there is nothing to diff against.
+    try:
+        old_tree = json.loads(old_buffer.get_text()) if old_buffer else {}
+    except json.JSONDecodeError:
+        return
+
+    try:
+        new_tree = json.loads(new_buffer.get_text())
+    except json.JSONDecodeError:
+        return
+
+    # Flatten both trees to get the complete set of mailbox paths in each.
+    old_paths = _flatten_tree(old_tree)
+    new_paths = _flatten_tree(new_tree)
+
+    # Convert each path list to the corresponding envelope buffer name.
+    old_envelopes = {_mailbox_to_envelopes_buffer_name("/".join(p)) for p in old_paths}
+    new_envelopes = {_mailbox_to_envelopes_buffer_name("/".join(p)) for p in new_paths}
+
+    # Diff the two sets to find which mailboxes appeared and which vanished.
+    added = new_envelopes - old_envelopes
+    removed = old_envelopes - new_envelopes
+
+    # Create an empty envelope buffer for every new mailbox in the tree.
+    for buf_name in added:
+        await imaper.create_buffer(buf_name, text="")
+
+    # Drop the envelope buffer for every mailbox no longer in the tree.
+    for buf_name in removed:
+        await imaper.drop_buffer(buf_name)
+
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # IMAPer                                                                             #
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -735,6 +793,22 @@ class IMAPer(BufferManager, AgenticObject):
 
         # Seed the status buffer with an empty JSON object.
         self._create_buffer(_IMAPER_STATUS_BUFFER, text="{}")
+
+        # Seed the tree buffer with an empty list and register the update hook directly.
+        self._create_buffer(_IMAPER_TREE_BUFFER, text="[]")
+        tree_buffer = self.get_buffer(_IMAPER_TREE_BUFFER)
+        if tree_buffer is None:
+            raise RuntimeError(f"failed to create tree buffer '{_IMAPER_TREE_BUFFER}'")
+        tree_buffer.register_hook(
+            HookPoint.AFTER_UPDATE_BUFFER,
+            "after_update_imap_tree",
+            _after_update_imap_tree,
+        )
+        tree_buffer.register_hook(
+            HookPoint.BEFORE_READ_BUFFER,
+            "refresh_tree_on_read",
+            lambda *_: self._refresh_imap_mailbox_list(),
+        )
 
         # Reject any attempt to drop the status buffer — it belongs to the IMAPer.
         status_buffer = self.get_buffer(_IMAPER_STATUS_BUFFER)
@@ -760,17 +834,6 @@ class IMAPer(BufferManager, AgenticObject):
             after_create_imap_config,
             apply_to_existing=True,
         )
-
-        # Register the tree refresh trigger before creating the hold buffer.
-        # The pattern hook wires the AFTER_DROP_BUFFER hook at buffer creation time.
-        self.register_buffer_pattern_hook(
-            HookPoint.AFTER_DROP_BUFFER,
-            "refresh_tree_after_drop_hold",
-            _IMAPER_TREE_HOLD_BUFFER,
-            _refresh_after_drop_tree_hold,
-            apply_to_existing=True,
-        )
-        self._create_buffer(_IMAPER_TREE_HOLD_BUFFER, text="")
 
         # Register the lazy-fetch hook for UID buffers — fires before first read of each UID.
         self.register_buffer_pattern_hook(
