@@ -20,7 +20,7 @@ from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint
 
 _logger = logging.getLogger("imaper")
 
-_IMAPER_SCOPE = "imap:"
+_IMAPER_SCOPE = "email:"
 _IMAPER_DOC_BUFFER = "doc:imap"
 _IMAPER_CONFIG_BUFFER = _IMAPER_SCOPE + "config"
 _IMAPER_STATUS_BUFFER = _IMAPER_SCOPE + "status"
@@ -41,7 +41,7 @@ The IMAPer manages one IMAP account for receiving emails via a buffer-based API.
 
 ### Configuration
 
-To configure the IMAP client, write to `imap:config` with a JSON object containing:
+To configure the IMAP client, write to `email:config` with a JSON object containing:
 
 ```json
 {{
@@ -59,17 +59,17 @@ The IMAPer automatically connects when the config is written and reconnects on a
 
 ### Refreshing the Mailbox Tree
 
-The `imap:tree` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the tree is sufficient to keep it current.
+The `email:tree` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the tree is sufficient to keep it current.
 
 ### Refreshing a Single Mailbox Email List
 
-The `imap:box/<mailbox>/envelopes` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the envelope buffer is sufficient to keep it current.
+The `email:box/<mailbox>/envelopes` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the envelope buffer is sufficient to keep it current.
 
 The response includes a `total` field: the count of all emails matching the current filter (before pagination). This lets the agent know how many pages exist.
 
 ### Filtering and Paginating the Email List
 
-To narrow the email list by sender, subject, flags, or date, create a filter buffer at `imap:box/<mailbox>/envelopes.filter`. When this buffer exists, its content is read on every `envelopes` refresh and applied as the search criteria. All criteria are AND-ed together  --  a message must match every criterion to be included.
+To narrow the email list by sender, subject, flags, or date, create a filter buffer at `email:box/<mailbox>/envelopes.filter`. When this buffer exists, its content is read on every `envelopes` refresh and applied as the search criteria. All criteria are AND-ed together  --  a message must match every criterion to be included.
 
 ```json
 {{
@@ -103,7 +103,7 @@ To mark a message as read:
   "subject": "Hello",
   "date": "Thu, 29 Jan 2026 16:25:27 +0000",
   "flags": ["\\\\Seen", "\\\\Answered"],
-  "body": "imap:box/INBOX/15.body"
+  "body": "email:box/INBOX/15.body"
 }}
 ```
 
@@ -129,7 +129,7 @@ Available IMAP flags:
 # -------------------------------------------------------------------------------------------------------------------- #
 
 def _get_imap_config(config_buffer: Buffer | None) -> dict:
-    """Read and parse the imap:config buffer contents as JSON.
+    """Read and parse the email:config buffer contents as JSON.
 
     Returns an empty dict if the buffer is None (e.g. on first creation).
     Raises json.JSONDecodeError on invalid JSON.
@@ -428,10 +428,10 @@ def _list_mailbox_emails(
 
 
 def _mailbox_to_envelopes_buffer_name(mailbox_name: str) -> str:
-    """Convert a mailbox path to its corresponding imap:box envelope buffer name.
+    """Convert a mailbox path to its corresponding email:box envelope buffer name.
 
-    INBOX          ->  imap:box/INBOX/envelopes
-    INBOX/Sent     ->  imap:box/INBOX/Sent/envelopes
+    INBOX          ->  email:box/INBOX/envelopes
+    INBOX/Sent     ->  email:box/INBOX/Sent/envelopes
     """
     return _IMAPER_MAILBOX_SCOPE + f"/{mailbox_name}/envelopes"
 
@@ -552,9 +552,9 @@ async def after_create_imap_config(
     config_buffer: Buffer,
     args: dict[str, Any],
 ) -> None:
-    """Register the validation and update hooks on the imap:config buffer.
+    """Register the validation and update hooks on the email:config buffer.
 
-    Called once when imap:config is created. Registers before_update_imap_config
+    Called once when email:config is created. Registers before_update_imap_config
     and after_update_imap_config directly on the buffer so the buffer owns them
     without needing pattern-based hook registration going forward.
     """
@@ -580,7 +580,7 @@ def before_update_imap_config(
     new_config_buffer: Buffer,
     args: dict[str, Any],
 ) -> str | None:
-    """Validate that the imap:config buffer contains valid JSON.
+    """Validate that the email:config buffer contains valid JSON.
 
     Returns None to allow the update, or an error string to block it.
     """
@@ -601,7 +601,7 @@ async def after_update_imap_config(
     new_config_buffer: Buffer,
     args: dict[str, Any],
 ) -> None:
-    """Called after imap:config is created or updated. Triggered on first config setup.
+    """Called after email:config is created or updated. Triggered on first config setup.
 
     On creation old_config_buffer is None  --  this signals initial setup rather than a
     later config change.
@@ -741,13 +741,13 @@ async def _before_read_envelopes(
 ) -> bool | str | None:
     """Called before an envelopes buffer is read.
 
-    Fires on any imap:box/<mailbox>/envelopes buffer. Extracts the mailbox name
+    Fires on any email:box/<mailbox>/envelopes buffer. Extracts the mailbox name
     from the buffer name and triggers a refresh of the envelopes summary before
     the read proceeds. This keeps the email list current on every access.
     """
     # Extract the mailbox name from the buffer name.
     # The buffer name is: _IMAPER_MAILBOX_SCOPE / mailbox_name / envelopes
-    # parts = ["imap:box", "<mailbox>", ..., "envelopes"]
+    # parts = ["email:box", "<mailbox>", ..., "envelopes"]
     parts = buffer.name.split("/")
     if len(parts) < 2 or parts[-1] != "envelopes":
         return True
@@ -768,7 +768,7 @@ async def _before_read_imap_email(
 ) -> bool | str | None:
     """Lazily fetch and populate a UID buffer on first read.
 
-    Only fires on imap:box/<mailbox>/<uid> buffers (pattern-matched).
+    Only fires on email:box/<mailbox>/<uid> buffers (pattern-matched).
     If the buffer already has content, proceeds without modification.
     If empty, fetches from the server and populates before allowing the read.
     """
@@ -808,7 +808,7 @@ async def _after_update_imap_tree(
     new_buffer: Buffer,
     args: dict[str, Any],
 ) -> None:
-    """Called after imap:tree is updated.
+    """Called after email:tree is updated.
 
     Fires whenever the tree buffer is written (via create_buffer with overwrite or write_buffer).
     Use this to drive any downstream state that depends on the current mailbox tree.
@@ -1123,7 +1123,7 @@ class IMAPer(BufferManager, AgenticObject):
         username: str,
         password: str,
     ) -> dict:
-        """Read the existing imap:config, overlay the four credentials, write back if changed.
+        """Read the existing email:config, overlay the four credentials, write back if changed.
 
         Returns the new merged config dict.
         """
@@ -1150,8 +1150,8 @@ class IMAPer(BufferManager, AgenticObject):
     ) -> None:
         """Establish a new IMAP connection with the given credentials.
 
-        Reads the current imap:config buffer, overlays the four credential arguments,
-        writes the merged result back to imap:config as authoritative state.
+        Reads the current email:config buffer, overlays the four credential arguments,
+        writes the merged result back to email:config as authoritative state.
         Uses imapclient for the IMAP connection with SSL and UID support.
         """
         # Update the config and get the merged result.
@@ -1243,10 +1243,10 @@ class IMAPer(BufferManager, AgenticObject):
         return _parse_mailbox_list(("OK", entries))
 
     async def _refresh_imap_mailbox_list(self) -> None:
-        """Refresh the imap:tree buffer with the current list of mailboxes.
+        """Refresh the email:tree buffer with the current list of mailboxes.
 
-        Overwrites imap:tree with a JSON list of path lists (e.g. [["INBOX"], ["INBOX", "Work"]]).
-        Updates imap:status with the delimiter, count, and a refreshed timestamp.
+        Overwrites email:tree with a JSON list of path lists (e.g. [["INBOX"], ["INBOX", "Work"]]).
+        Updates email:status with the delimiter, count, and a refreshed timestamp.
         """
         # Bail out if there is no active IMAP connection.
         if self._imap_connection is None:
@@ -1259,9 +1259,13 @@ class IMAPer(BufferManager, AgenticObject):
 
         # Build a nested tree from the flat path lists and write it to the box buffer.
         tree = _build_mailbox_tree(mailboxes.get("mailboxes", []))
-        await self.create_buffer(_IMAPER_TREE_BUFFER, text=json.dumps(tree, ensure_ascii=False), overwrite=True)
+        await self.create_buffer(
+            _IMAPER_TREE_BUFFER,
+            text=json.dumps(tree, ensure_ascii=False, indent=2),
+            overwrite=True
+        )
 
-        # Update imap:status with the current folder count, delimiter, and refresh time.
+        # Update email:status with the current folder count, delimiter, and refresh time.
         status = {
             "mailbox_count": len(mailboxes.get("mailboxes", [])),
             "delimiter": mailboxes.get("delimiter", "/"),
@@ -1273,7 +1277,7 @@ class IMAPer(BufferManager, AgenticObject):
         """Reconcile UID buffers for a mailbox with the server and refresh the summary.
 
         Fetches the current UID list from the server, diffs it against the
-        existing imap:box/<mailbox>/* buffers, creates empty buffers for new UIDs,
+        existing email:box/<mailbox>/* buffers, creates empty buffers for new UIDs,
         and drops buffers for UIDs no longer on the server.
         """
         # Bail out if there is no active IMAP connection.
