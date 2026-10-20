@@ -64,6 +64,42 @@ The `imap:tree` buffer auto-refreshes from the server on every read. The agent d
 ### Refreshing a Single Mailbox Email List
 
 The `imap:box/<mailbox>/envelopes` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the envelope buffer is sufficient to keep it current.
+
+### Updating Flags on a UID Buffer
+
+The agent can update the IMAP flags on a single email by writing to its UID buffer.
+Only the `flags` field can be changed  --  the sender, recipient, subject, date,
+uid, and body fields are immutable. Attempts to change any other field are
+rejected by the guard hook.
+
+To mark a message as read:
+
+```json
+{{
+  "uid": 15,
+  "sender": "alice@example.com",
+  "recipient": "bob@example.com",
+  "subject": "Hello",
+  "date": "Thu, 29 Jan 2026 16:25:27 +0000",
+  "flags": ["\\\\Seen", "\\\\Answered"],
+  "body": "imap:box/INBOX/15.body"
+}}
+```
+
+The BEFORE_UPDATE_BUFFER guard validates that only the `flags` field changed,
+computes the delta, and rejects the update if anything else was modified.
+
+The AFTER_UPDATE_BUFFER hook applies the flag deltas to the IMAP server
+using `add_flags([uid], ['\\\\Seen'])` and `remove_flags([uid], ['\\\\Seen'])` so
+the changes are reflected on the server immediately.
+
+Available IMAP flags:
+
+- `\\Seen`  --  message has been read
+- `\\Answered`  --  message has been replied to
+- `\\Flagged`  --  message is flagged/starred
+- `\\Draft`  --  message is a draft
+- `\\Deleted`  --  marked for deletion (removed on expunge)
 """
 
 
@@ -648,6 +684,133 @@ async def _after_update_imap_tree(
         await imaper.drop_buffer(buf_name)
 
 
+async def _before_update_uid(
+    imaper: IMAPer,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """Called before a UID buffer is updated.
+
+    Guards that only the 'flags' field may change. Rejects any attempt to
+    modify sender, recipient, subject, date, uid, or body.
+
+    Extracts the flag diff and stores it in args for the AFTER hook to
+    apply to the IMAP server.
+    """
+    # Reject updates on a buffer that has no prior content  --  use create not update.
+    if old_buffer is None or not old_buffer.get_text():
+        return "UID buffer has no prior content  --  use create instead of update"
+
+    # Parse both the old and new buffer content as JSON.
+    try:
+        old_email = json.loads(old_buffer.get_text())
+    except json.JSONDecodeError:
+        return "UID buffer content is not valid JSON"
+
+    try:
+        new_email = json.loads(new_buffer.get_text())
+    except json.JSONDecodeError:
+        return "UID buffer content is not valid JSON"
+
+    # The uid field may not change  --  the buffer name IS the UID.
+    if old_email.get("uid") != new_email.get("uid"):
+        return "uid field may not be changed  --  delete and recreate the UID buffer"
+
+    # Build a list of fields that are allowed to change.
+    immutable_fields = {"sender", "recipient", "subject", "date", "body", "uid"}
+
+    # Check every field in the new buffer against the old  --  reject disallowed changes.
+    for field, new_value in new_email.items():
+        if field not in immutable_fields:
+            continue
+        old_value = old_email.get(field)
+        if old_value != new_value:
+            return f"field '{field}' may not be changed  --  only 'flags' can be updated"
+
+    # Check for new fields that did not exist in the old buffer  --  reject those too.
+    for field in new_email:
+        if field not in immutable_fields:
+            continue
+        if field not in old_email:
+            return f"field '{field}' may not be added  --  only 'flags' can be added"
+
+    # Compute the flag diff between old and new.
+    old_flags = set(old_email.get("flags", []))
+    new_flags = set(new_email.get("flags", []))
+    to_add = list(new_flags - old_flags)
+    to_remove = list(old_flags - new_flags)
+
+    # Store the deltas in args so the AFTER hook can apply them to the IMAP server.
+    args["flags_to_add"] = to_add
+    args["flags_to_remove"] = to_remove
+
+    return None
+
+
+async def _after_update_uid(
+    imaper: IMAPer,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Called after a UID buffer is updated.
+
+    Applies the flag deltas stored by the BEFORE hook to the IMAP server
+    via store(). Only called if the BEFORE hook returned None  --  flags
+    are the only thing that changed.
+    """
+    # Extract the flag deltas that the BEFORE hook computed.
+    to_add = args.get("flags_to_add", [])
+    to_remove = args.get("flags_to_remove", [])
+
+    # Nothing to do if no flag deltas were computed.
+    if not to_add and not to_remove:
+        return
+
+    # Reject if there is no active IMAP connection.
+    if imaper._imap_connection is None:
+        return
+
+    # Parse the new buffer to extract the UID and mailbox name.
+    try:
+        new_email = json.loads(new_buffer.get_text())
+    except json.JSONDecodeError:
+        return
+
+    uid = new_email.get("uid")
+    if not uid:
+        return
+
+    # Derive the mailbox name from the buffer name.
+    # Buffer name: _IMAPER_MAILBOX_SCOPE / mailbox_name / uid
+    parts = new_buffer.name.split("/")
+    if len(parts) < 3:
+        return
+    mailbox_name = "/".join(parts[1:-1])
+
+    # Select the mailbox first  --  required before store.
+    try:
+        imaper._imap_connection.select_folder(mailbox_name)
+    except imapclient.Error as e:
+        _logger.error(f"[IMAPer] SELECT failed for {mailbox_name} in flag sync: {e}")
+        return
+
+    # Apply flags to add  --  use IMAP literal flag names.
+    if to_add:
+        try:
+            imaper._imap_connection.add_flags([uid], to_add)
+        except imapclient.Error as e:
+            _logger.error(f"[IMAPer] add_flags failed for UID {uid}: {e}")
+
+    # Apply flags to remove  --  use IMAP literal flag names.
+    if to_remove:
+        try:
+            imaper._imap_connection.remove_flags([uid], to_remove)
+        except imapclient.Error as e:
+            _logger.error(f"[IMAPer] remove_flags failed for UID {uid}: {e}")
+
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # IMAPer                                                                             #
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -714,6 +877,24 @@ class IMAPer(BufferManager, AgenticObject):
             "lazy_fetch_imap_email",
             rf"{_IMAPER_MAILBOX_SCOPE}/.+/\d+$",
             _before_read_imap_email,
+            apply_to_existing=True,
+        )
+
+        # Register flag sync hooks for UID buffers  --  guard allows only flags changes.
+        # BEFORE: rejects updates that touch any field other than 'flags'.
+        # AFTER: applies the flag deltas to the IMAP server via store().
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_UPDATE_BUFFER,
+            "uid_flags_guard",
+            rf"{_IMAPER_MAILBOX_SCOPE}/.+/\d+$",
+            _before_update_uid,
+            apply_to_existing=True,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_UPDATE_BUFFER,
+            "uid_flags_sync",
+            rf"{_IMAPER_MAILBOX_SCOPE}/.+/\d+$",
+            _after_update_uid,
             apply_to_existing=True,
         )
 
