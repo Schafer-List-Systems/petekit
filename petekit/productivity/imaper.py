@@ -65,6 +65,27 @@ The `imap:tree` buffer auto-refreshes from the server on every read. The agent d
 
 The `imap:box/<mailbox>/envelopes` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer  --  reading the envelope buffer is sufficient to keep it current.
 
+The response includes a `total` field: the count of all emails matching the current filter (before pagination). This lets the agent know how many pages exist.
+
+### Filtering and Paginating the Email List
+
+To narrow the email list by sender, subject, flags, or date, create a filter buffer at `imap:box/<mailbox>/envelopes.filter`. When this buffer exists, its content is read on every `envelopes` refresh and applied as the search criteria. All criteria are AND-ed together  --  a message must match every criterion to be included.
+
+```json
+{{
+  "criteria": [
+    {{"key": "UNSEEN"}},
+    {{"key": "SUBJECT", "value": "hello"}}
+  ],
+  "limit": 20,
+  "offset": 40
+}}
+```
+
+Available filter criteria keys: `ALL`, `UNSEEN`, `SEEN`, `FLAGGED`, `UNFLAGGED`, `ANSWERED`, `UNANSWERED`, `DELETED`, `DRAFT`, `FROM`, `TO`, `CC`, `SUBJECT`, `BODY`, `TEXT`, `BEFORE`, `SINCE`, `ON`.
+
+Delete the filter buffer to return to the unfiltered full list. The `limit` is optional; if absent, all matching emails are returned. Default `offset` is 0.
+
 ### Updating Flags on a UID Buffer
 
 The agent can update the IMAP flags on a single email by writing to its UID buffer.
@@ -271,15 +292,23 @@ def _fetch_mailbox_status(imap_connection: imapclient.IMAPClient, mailbox_name: 
 def _list_mailbox_emails(
     imap_connection: imapclient.IMAPClient,
     mailbox_name: str,
+    filter: dict | None = None,
 ) -> dict | None:
     """Return the list of all emails in a mailbox with ENVELOPE and FLAGS metadata.
 
-    Uses imapclient's select_folder, search, and fetch methods which return
-    already-parsed Python types. Returns None on any failure (logged).
+    If a filter dict is provided, the search is narrowed to match the criteria
+    before fetching the email list. The default limit is 50 emails at offset 0.
+
+    Args:
+        filter: Optional filter dict with:
+            - criteria: list of {"key": "...", "value": "..."} criteria
+            - limit: int (default 50)
+            - offset: int (default 0) -- page start position
 
     Returns:
         {
             "mailbox": str,
+            "total": int,
             "uids": list[int],
             "emails": [
                 {
@@ -305,16 +334,45 @@ def _list_mailbox_emails(
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
-    # Search for all emails  --  imapclient returns a clean list of message IDs.
+    # Build the IMAP search criteria from the filter dict.
+    # Each criterion is {"key": "UNSEEN"} or {"key": "FROM", "value": "alice"}.
+    imap_criteria: list = []
+    if filter:
+        for crit in filter.get("criteria", []):
+            key = str(crit.get("key", "")).upper()
+            value = str(crit.get("value", ""))
+            if value:
+                imap_criteria.append([key, value])
+            else:
+                imap_criteria.append([key])
+
+    # Extract pagination parameters from the filter.
+    # A non-positive or absent limit means unlimited  --  no slice is applied.
+    limit = int(filter.get("limit", 0) if filter else 0)
+    offset = int(filter.get("offset", 0) if filter else 0)
+    if offset < 0:
+        offset = 0
+
+    # Search with the given criteria, or ALL if no filter is provided.
     try:
-        message_ids = imap_connection.search(["ALL"])
+        if imap_criteria:
+            message_ids = imap_connection.search(imap_criteria)
+        else:
+            message_ids = imap_connection.search(["ALL"])
     except imapclient.Error as e:
         _logger.error(f"[IMAPer] SEARCH failed for {mailbox_name}: {e}")
         return None
 
+    # Record the total count of matching emails before pagination slicing.
+    total = len(message_ids)
+
     # Handle the empty mailbox case  --  return an empty list cleanly.
     if not message_ids:
-        return {"mailbox": mailbox_name, "uids": [], "emails": []}
+        return {"mailbox": mailbox_name, "total": 0, "uids": [], "emails": []}
+
+    # Apply pagination window  --  only when a positive limit was provided.
+    if limit > 0:
+        message_ids = message_ids[offset:offset + limit]
 
     # Fetch full message and FLAGS for all message IDs in one batch.
     # RFC822 is the full raw message bytes, parsed by the email library.
@@ -360,9 +418,10 @@ def _list_mailbox_emails(
             "flags": flags,
         })
 
-    # Return the complete mailbox email list.
+    # Return the complete mailbox email list with the total match count.
     return {
         "mailbox": mailbox_name,
+        "total": total,
         "uids": message_ids,
         "emails": emails,
     }
@@ -569,6 +628,110 @@ async def after_update_imap_config(
 # -------------------------------------------------------------------------------------------------------------------- #
 # Buffer hooks                                                                                                      #
 # -------------------------------------------------------------------------------------------------------------------- #
+
+
+def _before_update_filter(
+    imaper: IMAPer,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """Called before an envelopes.filter buffer is updated.
+
+    Validates that the filter JSON has the correct schema:
+    {criteria: [{key: str, value: str}, ...], limit: int, offset: int}
+    All fields are optional. Rejects with a description on any violation.
+    """
+    text = new_buffer.get_text()
+    if not text or not text.strip():
+        return None
+
+    try:
+        proposed = json.loads(text)
+    except json.JSONDecodeError:
+        return "filter buffer is not valid JSON"
+
+    if not isinstance(proposed, dict):
+        return "filter buffer must be a JSON object"
+
+    # Validate criteria is a list of {key: str, value?: str} objects.
+    if "criteria" in proposed:
+        crit_list = proposed["criteria"]
+        if not isinstance(crit_list, list):
+            return "'criteria' must be a list"
+        for i, crit in enumerate(crit_list):
+            if not isinstance(crit, dict):
+                return f"criteria[{i}] must be an object"
+            key = crit.get("key", "")
+            if not isinstance(key, str) or not key:
+                return f"criteria[{i}].key must be a non-empty string"
+            if "value" in crit and not isinstance(crit["value"], str):
+                return f"criteria[{i}].value must be a string"
+
+    # Validate limit is an int if present.
+    if "limit" in proposed:
+        if not isinstance(proposed["limit"], int):
+            return "'limit' must be an integer"
+
+    # Validate offset is an int if present.
+    if "offset" in proposed:
+        if not isinstance(proposed["offset"], int):
+            return "'offset' must be an integer"
+
+    return None
+
+
+async def _after_update_filter(
+    imaper: IMAPer,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Called after an envelopes.filter buffer is updated.
+
+    Extracts the mailbox name from the buffer name and triggers a refresh
+    of the envelopes summary with the new filter criteria applied.
+    """
+    # Extract the mailbox name from the buffer name.
+    # The buffer name is: _IMAPER_MAILBOX_SCOPE / mailbox_name / envelopes.filter
+    parts = new_buffer.name.split("/")
+    if len(parts) < 3 or parts[-1] != "envelopes.filter":
+        return
+
+    # Join the path segments between the scope and the "envelopes.filter" suffix.
+    mailbox_name = "/".join(parts[1:-1])
+
+    # Trigger the envelopes refresh with the new filter applied.
+    try:
+        await imaper._refresh_imap_box(mailbox_name)
+    except Exception as e:
+        _logger.error(f"[IMAPer] _after_update_filter failed for {mailbox_name}: {e}")
+
+
+async def _after_drop_filter(
+    imaper: IMAPer,
+    old_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Called after an envelopes.filter buffer is dropped.
+
+    Extracts the mailbox name from the buffer name and triggers a refresh
+    of the envelopes summary with no filter  --  the full list is restored.
+    """
+    # Extract the mailbox name from the dropped buffer name.
+    # The buffer name is: _IMAPER_MAILBOX_SCOPE / mailbox_name / envelopes.filter
+    parts = old_buffer.name.split("/")
+    if len(parts) < 3 or parts[-1] != "envelopes.filter":
+        return
+
+    # Join the path segments between the scope and the "envelopes.filter" suffix.
+    mailbox_name = "/".join(parts[1:-1])
+
+    # Trigger the envelopes refresh with no filter  --  restore the full list.
+    try:
+        await imaper._refresh_imap_box(mailbox_name)
+    except Exception as e:
+        _logger.error(f"[IMAPer] _after_drop_filter failed for {mailbox_name}: {e}")
 
 
 async def _before_read_envelopes(
@@ -907,6 +1070,52 @@ class IMAPer(BufferManager, AgenticObject):
             apply_to_existing=True,
         )
 
+        # Register the filter validation and refresh hooks.
+        # BEFORE: reject invalid filter schema.
+        # AFTER: call _refresh_imap_box to apply the new filter to the envelopes list.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_UPDATE_BUFFER,
+            "before_update_filter",
+            rf"{_IMAPER_MAILBOX_SCOPE}/.+/envelopes\.filter$",
+            _before_update_filter,
+            apply_to_existing=True,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_UPDATE_BUFFER,
+            "after_update_filter",
+            rf"{_IMAPER_MAILBOX_SCOPE}/.+/envelopes\.filter$",
+            _after_update_filter,
+            apply_to_existing=True,
+        )
+
+        # Also fire the same filter hooks on CREATE  --  old_buffer is None on create.
+        # CREATE hooks fire with 3 args  --  (bm, new_buffer, args).
+        # UPDATE hooks expect 4 args  --  (bm, old_buffer, new_buffer, args).
+        # The thin lambdas insert None for old_buffer to bridge the gap.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_CREATE_BUFFER,
+            "before_create_filter",
+            rf"{_IMAPER_MAILBOX_SCOPE}/.+/envelopes\.filter$",
+            lambda bm, new_buffer, args: _before_update_filter(bm, None, new_buffer, args),
+            apply_to_existing=True,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            "after_create_filter",
+            rf"{_IMAPER_MAILBOX_SCOPE}/.+/envelopes\.filter$",
+            lambda bm, new_buffer, args: _after_update_filter(bm, None, new_buffer, args),
+            apply_to_existing=True,
+        )
+
+        # Refresh envelopes when the filter buffer is dropped  --  restore full list.
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_DROP_BUFFER,
+            "after_drop_filter",
+            rf"{_IMAPER_MAILBOX_SCOPE}/.+/envelopes\.filter$",
+            _after_drop_filter,
+            apply_to_existing=True,
+        )
+
     async def _update_imap_connection(
         self,
         host: str,
@@ -1071,8 +1280,18 @@ class IMAPer(BufferManager, AgenticObject):
         if self._imap_connection is None:
             raise RuntimeError("no active IMAP connection")
 
+        # Read the filter buffer for this mailbox if it exists.
+        # The filter holds {criteria, limit, offset} for the search.
+        filter_buf = self.get_buffer(f"{_IMAPER_MAILBOX_SCOPE}/{mailbox_name}/envelopes.filter")
+        filter_dict: dict | None = None
+        if filter_buf and filter_buf.get_text().strip():
+            try:
+                filter_dict = json.loads(filter_buf.get_text())
+            except json.JSONDecodeError:
+                filter_dict = None
+
         # Fetch the current UID list from the server.
-        result = _list_mailbox_emails(self._imap_connection, mailbox_name)
+        result = _list_mailbox_emails(self._imap_connection, mailbox_name, filter=filter_dict)
         if result is None:
             return
         server_uids = set(result.get("uids", []))
