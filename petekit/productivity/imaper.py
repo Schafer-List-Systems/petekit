@@ -29,7 +29,7 @@ The IMAPer manages one IMAP account for receiving emails via a buffer-based API.
 
 ### Buffers
 
-- **{_IMAPER_CONFIG_BUFFER}** — holds IMAP credentials, subscribed mailboxes, and server settings
+- **{_IMAPER_CONFIG_BUFFER}** — holds IMAP credentials and server settings
 - **{_IMAPER_STATUS_BUFFER}** — holds runtime status such as IMAP connection state, folder count, and last refresh time
 - **{_IMAPER_TREE_BUFFER}** — holds the mailbox tree as nested JSON (e.g. `{{"INBOX": {{"Sent": {{}}, "Work": {{}}}}}}`)
 - **{_IMAPER_MAILBOX_SCOPE}/INBOX/envelopes** — holds the list of emails in INBOX with metadata (sender, recipient, subject, date, flags, uid)
@@ -45,14 +45,11 @@ To configure the IMAP client, write to `imap:config` with a JSON object containi
   "port": 993,
   "username": "your-username",
   "password": "your-password",
-  "timeout": 15,
-  "subscribed_mailboxes": ["INBOX", "INBOX/Sent", "INBOX/Work"]
+  "timeout": 15
 }}
 ```
 
 All fields are optional. The `timeout` field controls connection timeout in seconds (defaults to 15).
-
-The `subscribed_mailboxes` field is a list of mailbox paths to subscribe to. The IMAPer fetches the email list for each subscribed mailbox and writes it to the corresponding `imap:box/<path>/envelopes` buffer. Mailboxes not in this list are not monitored.
 
 The IMAPer automatically connects when the config is written and reconnects on any credential change. It tries SSL first; if that fails, it falls back to a plain IMAP4 connection.
 
@@ -63,29 +60,6 @@ The `imap:tree` buffer auto-refreshes from the server on every read. The agent d
 ### Refreshing a Single Mailbox Email List
 
 The `imap:box/<mailbox>/envelopes` buffer auto-refreshes from the server on every read. The agent does not need to manage a trigger buffer — reading the envelope buffer is sufficient to keep it current.
-
-### Subscribing to Mailboxes
-
-Add or remove paths from the `subscribed_mailboxes` list in `imap:config` to control which mailboxes are monitored. Each subscribed mailbox gets its own `imap:box/<path>/envelopes` buffer containing a list of emails with the following metadata per entry:
-
-```json
-{{
-  "mailbox": "INBOX",
-  "uids": [1234, 1235],
-  "emails": [
-    {{
-      "uid": 1234,
-      "sender": "Alice <alice@example.com>",
-      "recipient": "bob@example.com",
-      "subject": "Meeting tomorrow",
-      "date": "19 Oct 2026 09:15",
-      "flags": ["seen", "answered"]
-    }}
-  ]
-}}
-```
-
-The `flags` field lists the IMAP flags: `seen` (read), `answered`, `flagged`, `deleted`, `draft`.
 """
 
 
@@ -605,31 +579,6 @@ async def after_update_imap_config(
             new_config.get("username", ""),
             new_config.get("password", ""),
         )
-    else:
-        # No credential change — react to subscription changes only.
-        pass
-
-    # Diff the subscribed_mailboxes list and handle adds and removes.
-    old_subscribed = set(old_config.get("subscribed_mailboxes", []))
-    new_subscribed = set(new_config.get("subscribed_mailboxes", []))
-    added = new_subscribed - old_subscribed
-    removed = old_subscribed - new_subscribed
-
-    # Handle removed subscriptions — drop their envelopes buffer.
-    for mailbox in removed:
-        # Derive the envelope buffer name from the mailbox path.
-        envelopes_buf_name = _mailbox_to_envelopes_buffer_name(mailbox)
-
-        # Drop the envelopes data buffer by name.
-        await imaper.drop_buffer(envelopes_buf_name)
-
-    # Handle added subscriptions — refresh their envelope buffer.
-    # Only process adds when there was no credential change (otherwise _connect_imap handled it).
-    if not _imap_connection_changed(old_config, new_config):
-        for mailbox in added:
-            # Refresh the envelopes buffer for the new subscription.
-            if imaper._imap_connection is not None:
-                await imaper._refresh_imap_box(mailbox)
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -783,7 +732,7 @@ class IMAPer(BufferManager, AgenticObject):
             status_buffer.register_hook(
                 HookPoint.BEFORE_DROP_BUFFER,
                 "imap_status_no_drop",
-                lambda bm, buf, args: "imap:status cannot be dropped",
+                lambda bm, buf, args: f"{_IMAPER_STATUS_BUFFER} cannot be dropped",
             )
 
         # Validate JSON on create, wire hooks on buffer once created.
@@ -806,7 +755,7 @@ class IMAPer(BufferManager, AgenticObject):
         self.register_buffer_pattern_hook(
             HookPoint.BEFORE_READ_BUFFER,
             "lazy_fetch_imap_email",
-            r"imap:box/[^/]+/\d+$",
+            rf"{_IMAPER_MAILBOX_SCOPE}/[^/]+/\d+$",
             _before_read_imap_email,
             apply_to_existing=True,
         )
@@ -815,7 +764,7 @@ class IMAPer(BufferManager, AgenticObject):
         self.register_buffer_pattern_hook(
             HookPoint.BEFORE_READ_BUFFER,
             "before_read_envelopes",
-            r"imap:box/.+/envelopes$",
+            rf"{_IMAPER_MAILBOX_SCOPE}/.+/envelopes$",
             _before_read_envelopes,
             apply_to_existing=True,
         )
@@ -896,13 +845,10 @@ class IMAPer(BufferManager, AgenticObject):
         _logger.info(f"[IMAPer] connected to {config.get('host')}:{config.get('port')}")
 
         # Populate the mailbox list after a successful login.
+        # The tree refresh triggers _after_update_imap_tree which creates empty
+        # envelope buffers for all mailboxes in the tree. Envelope content is
+        # fetched lazily on first read via the BEFORE_READ_BUFFER hook.
         await self._refresh_imap_mailbox_list()
-
-        # Refresh envelopes for all subscribed mailboxes.
-        subscribed = config.get("subscribed_mailboxes", [])
-        for mailbox in subscribed:
-            # Fetch and cache the email list for this mailbox.
-            await self._refresh_imap_box(mailbox)
 
     async def _disconnect_imap(self) -> None:
         """Close the current IMAP connection if one exists.
@@ -1024,4 +970,4 @@ class IMAPer(BufferManager, AgenticObject):
 
         # Write the summary buffer with the full email list.
         buffer_name = _mailbox_to_envelopes_buffer_name(mailbox_name)
-        await self.create_buffer(buffer_name, text=json.dumps(result, indent=2))
+        await self.create_buffer(buffer_name, text=json.dumps(result, indent=2), overwrite=True)
