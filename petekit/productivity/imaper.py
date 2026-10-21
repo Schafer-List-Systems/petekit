@@ -122,13 +122,6 @@ To mark a message as read:
 }}
 ```
 
-The BEFORE_UPDATE_BUFFER guard validates that only the `flags` field changed,
-computes the delta, and rejects the update if anything else was modified.
-
-The AFTER_UPDATE_BUFFER hook applies the flag deltas to the IMAP server
-using `add_flags([uid], ['\\\\Seen'])` and `remove_flags([uid], ['\\\\Seen'])` so
-the changes are reflected on the server immediately.
-
 Available IMAP flags:
 
 - `\\Seen`  --  message has been read
@@ -400,7 +393,7 @@ def _list_mailbox_emails(
     # Parse each email header with the email library  --  all decoding is automatic.
     emails: list = []
     for uid, fields in result.items():
-        raw_headers = fields.get(b'RFC822')
+        raw_headers = fields.get(b'BODY[]')
         if raw_headers and isinstance(raw_headers, bytes):
             msg = message_from_bytes(raw_headers, policy=default)
             # parseaddr returns (name, addr)  --  addr is the bare email address.
@@ -470,7 +463,7 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
 
     # Fetch the full RFC 822 message  --  email library handles all parsing.
     try:
-        result = imap_connection.fetch([uid], ["RFC822", "FLAGS"])
+        result = imap_connection.fetch([uid], ["BODY.PEEK[]", "FLAGS"])
     except imapclient.Error as e:
         _logger.error(f"[IMAPer] FETCH failed for UID {uid} in {mailbox_name}: {e}")
         return None
@@ -482,11 +475,11 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
     # Parse the raw RFC 822 message  --  email library handles CRLF, charset,
     # multipart, and all decoding.
     fields = result[uid]
-    raw_message = fields.get(b'RFC822')
+    raw_message = fields.get(b'BODY[]')
     if isinstance(raw_message, bytes):
         msg = message_from_bytes(raw_message, policy=default)
     else:
-        _logger.error(f"[IMAPer] BODY[1] for UID {uid} is not bytes: {type(raw_message)}")
+        _logger.error(f"[IMAPer] BODY[] for UID {uid} is not bytes: {type(raw_message)}")
         return None
 
     # Extract sender and recipient via parseaddr  --  gives (name, addr) tuples.
@@ -503,6 +496,22 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
     raw_flags = fields.get(b'FLAGS', [])
     flags = [f.decode("utf-8") if isinstance(f, bytes) else str(f) for f in raw_flags]
 
+    # Extract attachment metadata from all non-plaintext message parts.
+    # Skip the plaintext body since it is already extracted separately.
+    attachments: list[dict] = []
+    for idx, part in enumerate(msg.walk(), 1):
+        part_type = part.get_content_type()
+        if part_type == "text/plain":
+            continue
+        filename = part.get_filename()
+        if not filename:
+            continue
+        attachments.append({
+            "name": filename,
+            "type": part_type,
+            "ref": f"{_IMAPER_MAILBOX_SCOPE}/{mailbox_name}/{uid}.attachments/{idx}",
+        })
+
     # Body  --  get_body returns the text/plain part, get_payload(decode=True)
     # decodes Content-Transfer-Encoding (quoted-printable, base64, etc).
     body_part = msg.get_body(("plain",))
@@ -512,7 +521,7 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
     else:
         body = ""
 
-    return {
+    result: dict = {
         "uid": uid,
         "sender": sender,
         "recipient": recipient,
@@ -521,6 +530,10 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
         "flags": flags,
         "body": body,
     }
+    if attachments:
+        result["attachments"] = attachments
+
+    return result
 
 
 def _flatten_tree(tree: dict) -> list[list[str]]:

@@ -34,13 +34,14 @@ Create an option buffer named `<buffer>[changelog]` on the buffer to log.
 The option buffer must hold a JSON object:
 
 ```json
-{"log_buffer": "<buffer>.changelog", "no_ops": false}
+{"log_buffer": "<buffer>.changelog", "no_ops": false, "detail": "brief"}
 ```
 
 ### Configuration
 
 - `log_buffer`  --  required; the name of the buffer to append log entries to.
 - `no_ops`      --  optional, defaults to false; if true, log even when old and new content are identical.
+- `detail`     --  optional, defaults to `brief`; `brief` shows counts only; `opcodes` appends the change opcode list as `[tag,i1,i2,j1,j2]...`
 
 After the [changelog] option buffer is created, every update to the
 origin buffer appends a one-line log entry to the log buffer.
@@ -49,7 +50,11 @@ origin buffer appends a one-line log entry to the log buffer.
 
 ```
 <buffer> updated +3 -1 ~2
+<buffer> updated +3 -1 ~2[insert,5,5,5,6][replace,10,12,10,12]
 ```
+
+The first form is `brief`. The second is `detail=opcodes` which appends the
+change opcodes directly to the delta summary line.
 
 `+N` = number of lines added, `-M` = number of lines removed,
 `~C` = number of lines changed. When old and new content are identical
@@ -134,6 +139,12 @@ def _before_create_changelog(
     if "no_ops" in config and not isinstance(config["no_ops"], bool):
         return "no_ops must be a boolean"
 
+    # Reject unknown detail level.
+    if "detail" in config:
+        detail = config["detail"]
+        if detail not in ("brief", "opcodes"):
+            return "detail must be 'brief' or 'opcodes'"
+
     return None
 
 
@@ -198,29 +209,35 @@ async def _after_update_origin(
     if old_text == new_text and not config.get("no_ops", False):
         return
 
-    # Create the log entry as a plain text line with delta counts.
+    # Compute the diff opcodes and summary counts.
     import difflib
     matcher = difflib.SequenceMatcher(None, old_text.splitlines(), new_text.splitlines())
-    added = sum(
-        j2 - j1 for tag, _, _, j1, j2 in matcher.get_opcodes()
-        if tag == "insert"
-    )
-    removed = sum(
-        i2 - i1 for tag, i1, i2, _, _ in matcher.get_opcodes()
-        if tag == "delete"
-    )
-    changed = sum(
-        min(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in matcher.get_opcodes()
-        if tag == "replace"
-    )
-    log_entry = f"{new_buffer.name} updated +{added} -{removed} ~{changed}\n"
+    opcodes = list(matcher.get_opcodes())
+    added = sum(j2 - j1 for tag, _, _, j1, j2 in opcodes if tag == "insert")
+    removed = sum(i2 - i1 for tag, i1, i2, _, _ in opcodes if tag == "delete")
+    changed = sum(min(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in opcodes if tag == "replace")
+
+    # Build the log entry as a single line, either brief or with opcode tags.
+    detail = config.get("detail", "brief")
+    if detail == "opcodes":
+        opcode_parts = [
+            ",".join(str(x) for x in op)
+            for op in opcodes
+            if op[0] != "equal"
+        ]
+        opcode_str = "".join(f"[{p}]" for p in opcode_parts)
+        log_entry = f"{new_buffer.name} updated +{added} -{removed} ~{changed} opcodes: {opcode_str}\n"
+    else:
+        log_entry = f"{new_buffer.name} updated +{added} -{removed} ~{changed}\n"
 
     # Ensure the log buffer exists before writing to it.
     if changelog.get_buffer(log_buffer_name) is None:
         await changelog.create_stream_buffer(log_buffer_name)
 
     # Write the log entry to the log buffer.
-    await changelog.write_buffer(log_buffer_name, text=log_entry)
+    write_result = await changelog.write_buffer(log_buffer_name, text=log_entry)
+    if not write_result.get("ok"):
+        _logger.error(f"[ChangeLogger] write to '{log_buffer_name}' failed: {write_result.get('error', 'unknown')}")
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
