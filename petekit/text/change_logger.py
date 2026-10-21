@@ -34,14 +34,14 @@ Create an option buffer named `<buffer>[changelog]` on the buffer to log.
 The option buffer must hold a JSON object:
 
 ```json
-{"log_buffer": "<buffer>.changelog", "no_ops": false, "detail": "brief"}
+{"log_buffer": "<buffer>.changelog", "no_ops": false, "detail": "full"}
 ```
 
 ### Configuration
 
 - `log_buffer`  --  required; the name of the buffer to append log entries to.
 - `no_ops`      --  optional, defaults to false; if true, log even when old and new content are identical.
-- `detail`     --  optional, defaults to `brief`; `brief` shows counts only; `opcodes` appends the change opcode list as `[tag,i1,i2,j1,j2]...`
+- `detail`     --  optional, defaults to `brief`; `brief` shows counts only; `opcodes` appends the change opcode list as `[tag,i1,i2,j1,j2]...`; `full` appends the full unified diff (multiline)
 
 After the [changelog] option buffer is created, every update to the
 origin buffer appends a one-line log entry to the log buffer.
@@ -51,10 +51,15 @@ origin buffer appends a one-line log entry to the log buffer.
 ```
 <buffer> updated +3 -1 ~2
 <buffer> updated +3 -1 ~2[insert,5,5,5,6][replace,10,12,10,12]
+--- buffer:<buffer>
++++ buffer:<buffer>
+@@ -1,3 +1,4 @@
+ old line
++new line
 ```
 
-The first form is `brief`. The second is `detail=opcodes` which appends the
-change opcodes directly to the delta summary line.
+The first form is `brief`. The second is `detail=opcodes`. The third is
+`detail=full` which appends the full unified diff.
 
 `+N` = number of lines added, `-M` = number of lines removed,
 `~C` = number of lines changed. When old and new content are identical
@@ -142,8 +147,8 @@ def _before_create_changelog(
     # Reject unknown detail level.
     if "detail" in config:
         detail = config["detail"]
-        if detail not in ("brief", "opcodes"):
-            return "detail must be 'brief' or 'opcodes'"
+        if detail not in ("brief", "opcodes", "full"):
+            return "detail must be 'brief', 'opcodes', or 'full'"
 
     return None
 
@@ -217,8 +222,10 @@ async def _after_update_origin(
     removed = sum(i2 - i1 for tag, i1, i2, _, _ in opcodes if tag == "delete")
     changed = sum(min(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in opcodes if tag == "replace")
 
-    # Build the log entry as a single line, either brief or with opcode tags.
+    # Determine the configured detail level and format the log entry.
     detail = config.get("detail", "brief")
+
+    # For opcodes: append the non-equal opcodes as [tag,i1,i2,j1,j2] tokens.
     if detail == "opcodes":
         opcode_parts = [
             ",".join(str(x) for x in op)
@@ -227,6 +234,20 @@ async def _after_update_origin(
         ]
         opcode_str = "".join(f"[{p}]" for p in opcode_parts)
         log_entry = f"{new_buffer.name} updated +{added} -{removed} ~{changed} opcodes: {opcode_str}\n"
+
+    # For full: generate the unified diff and append it as the entry body.
+    elif detail == "full":
+        old_lines = old_text.splitlines()
+        new_lines = new_text.splitlines()
+        diff_lines = list(difflib.unified_diff(
+            old_lines, new_lines,
+            fromfile=f"buffer:{old_buffer.name}" if old_buffer else "buffer:?",
+            tofile=f"buffer:{new_buffer.name}",
+            lineterm="",
+        ))
+        log_entry = "\n".join(diff_lines) + "\n"
+
+    # For brief: include only the delta counts summary.
     else:
         log_entry = f"{new_buffer.name} updated +{added} -{removed} ~{changed}\n"
 
