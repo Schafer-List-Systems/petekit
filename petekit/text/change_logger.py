@@ -217,7 +217,7 @@ async def _after_update_origin(
 
     # Ensure the log buffer exists before writing to it.
     if changelog.get_buffer(log_buffer_name) is None:
-        await changelog.create_buffer(log_buffer_name)
+        await changelog.create_stream_buffer(log_buffer_name)
 
     # Write the log entry to the log buffer.
     await changelog.write_buffer(log_buffer_name, text=log_entry)
