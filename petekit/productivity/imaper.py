@@ -392,7 +392,7 @@ def _list_mailbox_emails(
     # Fetch full message and FLAGS for all message IDs in one batch.
     # RFC822 is the full raw message bytes, parsed by the email library.
     try:
-        result = imap_connection.fetch(message_ids, ["RFC822", "FLAGS"])
+        result = imap_connection.fetch(message_ids, ["BODY.PEEK[]", "FLAGS"])
     except imapclient.Error as e:
         _logger.error(f"[IMAPer] FETCH failed for {mailbox_name}: {e}")
         return None
