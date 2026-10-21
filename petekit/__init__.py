@@ -2,6 +2,7 @@ from petekit.text import (
     TextEditor,
     WebScraper,
     BufferManager,
+    ChangeLogger,
     Croner,
     OptionBufferManager,
     SmartBufferManager,
@@ -28,6 +29,7 @@ from petekit.productivity import IMAPer
 
 __all__ = [
     "BufferManager",
+    "ChangeLogger",
     "Croner",
     "OptionBufferManager",
     "SmartBufferManager",

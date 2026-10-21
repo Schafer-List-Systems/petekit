@@ -5,9 +5,11 @@ from petekit.text.smart_buffer_manager import SmartBufferManager
 from petekit.text.text_editor import TextEditor
 from petekit.text.web_scraper import WebScraper
 from petekit.text.croner import Croner
+from petekit.text.change_logger import ChangeLogger
 
 __all__ = [
     "BufferManager",
+    "ChangeLogger",
     "Croner",
     "OptionBufferManager",
     "SmartBufferManager",
