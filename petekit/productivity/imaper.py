@@ -496,7 +496,7 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
     raw_flags = fields.get(b'FLAGS', [])
     flags = [f.decode("utf-8") if isinstance(f, bytes) else str(f) for f in raw_flags]
 
-    # Extract attachment metadata from all non-plaintext message parts.
+    # Extract attachment metadata and content from all non-plaintext message parts.
     # Skip the plaintext body since it is already extracted separately.
     attachments: list[dict] = []
     for idx, part in enumerate(msg.walk(), 1):
@@ -506,10 +506,20 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
         filename = part.get_filename()
         if not filename:
             continue
+
+        # Extract the raw bytes, then encode as base64 or decode to text.
+        import base64
+        raw_payload = part.get_payload(decode=True) or b""
+        if part_type.startswith("text/"):
+            content = raw_payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+        else:
+            content = "base64:" + base64.b64encode(raw_payload).decode("ascii")
+
         attachments.append({
             "name": filename,
             "type": part_type,
-            "ref": f"{_IMAPER_MAILBOX_SCOPE}/{mailbox_name}/{uid}.attachments/{idx}",
+            "ref": f"{_IMAPER_MAILBOX_SCOPE}/{mailbox_name}/{uid}.attachments/{len(attachments) + 1}",
+            "data": content,
         })
 
     # Body  --  get_body returns the text/plain part, get_payload(decode=True)
@@ -825,6 +835,17 @@ async def _before_read_imap_email(
 
     # Put the body reference back so the agent sees where to find the body.
     email["body"] = body_buffer_name
+
+    # Create attachment buffers with their content.
+    # Text parts are stored as plain text; binary parts are stored as base64.
+    # The ref in each attachment dict uses a stable sequential index (1, 2, 3...)
+    # independent of msg.walk() part indices.
+    attachments = email.get("attachments", [])
+    for idx, attach in enumerate(attachments, 1):
+        attach_buffer_name = f"{buffer.name}.attachments/{idx}"
+        attach_data = attach.pop("data", "")
+        await imaper.create_buffer(attach_buffer_name, text=attach_data)
+
     buffer.set_text(json.dumps(email, indent=2, ensure_ascii=False))
 
     return True
@@ -1007,7 +1028,8 @@ async def _after_update_uid(
 # -------------------------------------------------------------------------------------------------------------------- #
 
 class IMAPer(BufferManager, AgenticObject):
-    """."""
+    """I can read emails from an IMAP mailbox and manage their flags.
+    `doc:imap` holds details."""
 
     _imap_connection: imapclient.IMAPClient | None = None
 
