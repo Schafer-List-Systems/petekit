@@ -1008,20 +1008,30 @@ class IMAPer(BufferManager, AgenticObject):
         # Seed the status buffer with an empty JSON object.
         self._create_buffer(_IMAPER_STATUS_BUFFER, text="{}")
 
-        # Seed the tree buffer with an empty list and register the update hook directly.
-        self._create_buffer(_IMAPER_TREE_BUFFER, text="[]")
-        tree_buffer = self.get_buffer(_IMAPER_TREE_BUFFER)
-        if tree_buffer is None:
-            raise RuntimeError(f"failed to create tree buffer '{_IMAPER_TREE_BUFFER}'")
-        tree_buffer.register_hook(
+        # Register the AFTER_UPDATE_BUFFER hook to drive envelope buffer lifecycle.
+        self.register_buffer_pattern_hook(
             HookPoint.AFTER_UPDATE_BUFFER,
             "after_update_imap_tree",
+            _IMAPER_TREE_BUFFER,
             _after_update_imap_tree,
+            apply_to_existing=True,
         )
-        tree_buffer.register_hook(
+        # Register the AFTER_CREATE_BUFFER hook to drive envelope buffer lifecycle.
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            "after_update_imap_tree",
+            _IMAPER_TREE_BUFFER,
+            lambda bm, new_buffer, args: _after_update_imap_tree(bm, None, new_buffer, args),
+            apply_to_existing=True,
+        )
+
+        # Register the BEFORE_READ_BUFFER hook to refresh on every access.
+        self.register_buffer_pattern_hook(
             HookPoint.BEFORE_READ_BUFFER,
             "refresh_tree_on_read",
+            _IMAPER_TREE_BUFFER,
             lambda *_: self._refresh_imap_mailbox_list(),
+            apply_to_existing=True,
         )
 
         # Reject any attempt to drop the status buffer  --  it belongs to the IMAPer.
