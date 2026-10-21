@@ -194,7 +194,8 @@ def _persist_buffer(bm: BufferManager, buffer: Buffer) -> None:
         "created_at": buffer.created_at,
         "modified_at": buffer.modified_at,
     }
-    meta_path = dir / f".{buffer.name}.json"
+    buffer_path = dir / buffer.name
+    meta_path = buffer_path.with_name("." + buffer_path.name + ".json")
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2))
 
@@ -366,7 +367,7 @@ async def _restore_create_buffers(self: BufferManager) -> None:
         return
 
     # Find all hidden JSON manifest files, each representing a single persisted buffer.
-    manifest_files = sorted(dir.glob(".*.json"))
+    manifest_files = sorted(dir.glob("**/*.json"))
     valid_manifests: list[tuple[float, Path]] = []
 
     # Collect only valid buffer manifests and sort by creation time — oldest first.
