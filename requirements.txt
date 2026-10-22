@@ -1,6 +1,15 @@
 peteos
+paatch
 diff-match-patch
+jsonpatch
+mss
 pytest
 pytest-asyncio
-jsonpatch
+setuptools
+opencv-python>=4.8.0
+numpy>=1.24.0
+beautifulsoup4
+lxml
+imapclient
 croniter
+mcp

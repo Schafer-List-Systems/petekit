@@ -11,6 +11,7 @@ from typing import Any, Callable
 from mcp import Client
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters
+from mcp_types import TextContent
 
 from peteos.oap.agentic_object import AgenticObject
 
@@ -137,12 +138,52 @@ _logger = logging.getLogger("mcp_client")
 @dataclass
 class _ConnectionContext:
     """Holds the entered MCP Client and its session for the lifetime of a connection.
-    
+
     The client is entered once in _open_mcp_client and exited once in _close_mcp_client.
     Callers (e.g. the tool wrapper) use ctx.session to make calls without re-entering.
     """
     client: Client
     session: ClientSession
+
+
+async def _on_session_terminated(
+    mcp_client: MCPClient,
+    name: str,
+) -> None:
+    """Mark the connection as disconnected and inactive after a session error.
+
+    Writes "disconnected" to the status buffer and "active: false" to the config
+    buffer so the agent can inspect both and reconnect by setting active back to true.
+    """
+    # Write disconnected status to the status buffer.
+    status_name = _status_buffer_name(name)
+    status_buffer = mcp_client.get_buffer(status_name)
+    if status_buffer is not None:
+        try:
+            status = json.loads(status_buffer.get_text() or "{}")
+        except json.JSONDecodeError:
+            status = {}
+        status["status"] = "disconnected"
+        await mcp_client.create_buffer(
+            status_name,
+            text=json.dumps(status, indent=2, ensure_ascii=False),
+            overwrite=True,
+        )
+
+    # Write inactive flag to the config buffer.
+    config_name = _config_buffer_name(name)
+    config_buffer = mcp_client.get_buffer(config_name)
+    if config_buffer is not None:
+        try:
+            config = json.loads(config_buffer.get_text() or "{}")
+        except json.JSONDecodeError:
+            config = {}
+        config["active"] = False
+        await mcp_client.create_buffer(
+            config_name,
+            text=json.dumps(config, indent=2, ensure_ascii=False),
+            overwrite=True,
+        )
 
 
 def _config_buffer_name(name: str) -> str:
@@ -394,15 +435,38 @@ def _make_mcp_tool_callable(
     At call time it looks up the live connection context from
     mcp_client._connections[name] and forwards the call to ctx.session.call_tool.
     """
-    async def wrapper(**kwargs: Any) -> Any:
+    async def wrapper(kwargs: dict | None = None) -> Any:
         # Look up the live connection context for this connection at call time.
         ctx = mcp_client._connections.get(name)
         if ctx is None:
             raise RuntimeError(f"MCP connection '{name}' is not active")
 
-        # Forward the call to the client with the captured tool name.
-        result = await ctx.client.call_tool(tool_name, **kwargs)
-        return result
+        # Extract the arguments from the double-wrapped kwargs.
+        args = (kwargs or {})
+
+        # Call the tool on the server; on session termination, mark the
+        # connection as disconnected and inactive so the agent can observe
+        # and reconnect, then re-raise with instructions.
+        try:
+            result = await ctx.client.call_tool(tool_name, args)
+        except Exception:
+            await _on_session_terminated(mcp_client, name)
+            raise RuntimeError(
+                f"MCP session '{name}' terminated. "
+                f"Check status at mcp:{name}:status. "
+                f"Set 'active' to true in mcp:{name}:config to reconnect."
+            )
+
+        # If the tool itself reported an error, raise its content as text.
+        if result.is_error:
+            raise RuntimeError(
+                result.content[0].text if result.content else "MCP tool error"
+            )
+
+        # Extract plain text from content blocks and return a dict with
+        # both raw content and structured content for the caller.
+        text_parts = [block.text for block in result.content if isinstance(block, TextContent)]
+        return {"content": text_parts, "structured_content": result.structured_content}
 
     # Describe the signature buffer so the agent can read the tool's parameter schema.
     tool_buffer_name = _tool_buffer_name(name, tool_name)
