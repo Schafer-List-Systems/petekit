@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 
@@ -11,7 +12,7 @@ from typing import Any, Callable
 from mcp import Client
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters
-from mcp_types import TextContent
+from mcp_types import TextContent, Tool
 
 from peteos.oap.agentic_object import AgenticObject
 
@@ -286,7 +287,7 @@ async def _open_mcp_client(
         # Register the tool as a callable in the function manager.
         func_name = tool.name
         tool_buffer_name = _tool_buffer_name(name, func_name)
-        wrapper = _make_mcp_tool_callable(mcp_client, name, func_name)
+        wrapper = _make_mcp_tool_callable(mcp_client, name, func_name, tool)
         create_result = await mcp_client.create_function(
             tool_buffer_name,
             wrapper,
@@ -428,6 +429,7 @@ def _make_mcp_tool_callable(
     mcp_client: MCPClient,
     name: str,
     tool_name: str,
+    tool: Tool,
 ) -> Callable:
     """Factory producing a callable that forwards to session.call_tool at call time.
 
@@ -435,20 +437,17 @@ def _make_mcp_tool_callable(
     At call time it looks up the live connection context from
     mcp_client._connections[name] and forwards the call to ctx.session.call_tool.
     """
-    async def wrapper(kwargs: dict | None = None) -> Any:
+    async def wrapper(**kwargs: Any) -> Any:
         # Look up the live connection context for this connection at call time.
         ctx = mcp_client._connections.get(name)
         if ctx is None:
             raise RuntimeError(f"MCP connection '{name}' is not active")
 
-        # Extract the arguments from the double-wrapped kwargs.
-        args = (kwargs or {})
-
         # Call the tool on the server; on session termination, mark the
         # connection as disconnected and inactive so the agent can observe
         # and reconnect, then re-raise with instructions.
         try:
-            result = await ctx.client.call_tool(tool_name, args)
+            result = await ctx.client.call_tool(tool_name, kwargs)
         except Exception:
             await _on_session_terminated(mcp_client, name)
             raise RuntimeError(
@@ -474,6 +473,45 @@ def _make_mcp_tool_callable(
         f"Calls the MCP tool '{tool_name}' on connection '{name}'.\n"
         f"The tool's parameter signature is described in the buffer: {tool_buffer_name}"
     )
+
+    # Build the wrapper signature from the tool's input schema.
+    params = []
+    for pname, pinfo in tool.input_schema.get("properties", {}).items():
+        default = pinfo.get("default")
+        params.append(
+            inspect.Parameter(pname, inspect.Parameter.KEYWORD_ONLY, default=default)
+        )
+    wrapper.__signature__ = inspect.Signature(params)
+
+    # ------------------------------------------------------------------------ #
+    # TODO (future): wire __annotations__ for type-safe signature introspection   #
+    # ------------------------------------------------------------------------ #
+    # The wrapper carries only names and defaults in __signature__.
+    # The FunctionManager currently does no type validation on call.
+    # To enable it, derive __annotations__ from tool.inputSchema types:
+    #
+    #   JSON Schema type -> Python type:
+    #     "string"  -> str
+    #     "number"  -> float
+    #     "integer" -> int
+    #     "boolean" -> bool
+    #     "object"  -> dict
+    #     "array"   -> list
+    #     "null"    -> NoneType
+    #
+    # Build the mapping and assign it:
+    #
+    #   _TYPE_MAP = {"string": str, "number": float, "integer": int,
+    #                "boolean": bool, "object": dict, "array": list, "null": type(None)}
+    #   wrapper.__annotations__ = {
+    #       pname: _TYPE_MAP[pinfo.get("type", "string")]
+    #       for pname, pinfo in tool.input_schema.get("properties", {}).items()
+    #   }
+    #
+    # Once __annotations__ is set, inspect.signature(wrapper) carries
+    # per-parameter .annotation so the FunctionManager or any caller can
+    # validate types before forwarding kwargs to call_tool.
+    # See also: inspect.signature, __annotations__, Parameter.annotation.
 
     return wrapper
 

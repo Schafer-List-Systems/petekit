@@ -53,7 +53,7 @@ class FunctionCaller(FunctionManager, AgenticObject):
     async def call_function(
         self,
         name: str,
-        kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """Call a registered function by name with the given keyword arguments.
         If the result is larger than 8000 chars it is written to a tmp buffer instead.
@@ -65,7 +65,7 @@ class FunctionCaller(FunctionManager, AgenticObject):
             return resolve_result  # error dict
 
         func = resolve_result["callable"]
-        call_kwargs = kwargs if kwargs is not None else {}
+        call_kwargs = kwargs
 
         # Guard: reject unknown argument names.
         for k in call_kwargs:
@@ -78,7 +78,7 @@ class FunctionCaller(FunctionManager, AgenticObject):
                 return {"ok": False, "error": f"Missing required argument '{pname}' for '{name}'."}
 
         # Call and await — non-usage exceptions propagate.
-        result = func(**call_kwargs)
+        result = func(**kwargs)
         if inspect.iscoroutine(result):
             result = await result
 

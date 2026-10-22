@@ -194,7 +194,7 @@ async def _fire_action(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None
 
     else:
         # Call the custom function with the origin buffer name as the argument.
-        await croner.call_function(action, kwargs={"buffer_name": job.origin})
+        await croner.call_function(action, buffer_name=job.origin)
 
 
 async def _wait_for(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None:
