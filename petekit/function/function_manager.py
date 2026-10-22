@@ -167,8 +167,10 @@ class FunctionManager(BufferManager, AgenticObject):
                 "error": f"Function '{name}' already registered.",
             }
 
-        # Guard: reject names that are not valid Python identifiers.
-        if not name.isidentifier():
+        # Sanitize the name by replacing colons and slashes with underscores,
+        # then verify it is a valid Python identifier.
+        sanitized = name.replace(":", "_").replace("/", "_")
+        if not sanitized.isidentifier():
             return {
                 "ok": False,
                 "error": f"'{name}' is not a valid Python identifier.",
