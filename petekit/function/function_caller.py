@@ -35,7 +35,7 @@ def _spill_to_buffer(caller, value: Any) -> str:
     buf_name = _call_result_buffer_name(call_id)
 
     # Write to the buffer and validate the result.
-    create_result = AgenticObject.create_buffer(caller, buf_name, text=result_text)
+    create_result = caller.create_buffer(buf_name, text=result_text)
     if not isinstance(create_result, dict) or not create_result.get("ok"):
         raise RuntimeError(f"Failed to spill result to {buf_name}: {create_result.get('error')}")
     return buf_name
