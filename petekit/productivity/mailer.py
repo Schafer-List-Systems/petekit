@@ -37,11 +37,11 @@ the email.
 
 ```
 {_MAILER_DRAFT_SCOPE}/<draft-name>/
-  header        --  JSON with to, subject, cc, bcc, status
-  body          --  plain text body
-  html          --  optional HTML body (mutually exclusive with body)
-  attachments/1 --  first attachment
-  attachments/2 --  second attachment
+  header                    --  JSON with to, subject, cc, bcc, status, reviewed
+  body                      --  plain text body
+  html                      --  optional HTML body (mutually exclusive with body)
+  attachments/meeting.ics   --  first attachment (any filename)
+  attachments/notes.md      --  second attachment
   ...
 ```
 
@@ -53,7 +53,8 @@ the email.
   "subject": "Hello",
   "cc": "<cc@example.com>",
   "bcc": "<bcc@example.com>",
-  "status": "draft"
+  "status": "draft",
+  "attachments": ["meeting.ics", "notes.md"]
 }}
 ```
 
@@ -62,6 +63,8 @@ the email.
 - `cc`         --  optional; comma-separated CC recipients
 - `bcc`        --  optional; comma-separated BCC recipients
 - `status`     --  write `send` to dispatch the email
+- `attachments` --  list of attachment filenames; MIME type is guessed from each filename
+- `reviewed`   --  internal; tracks which parts have been read; do not write manually
 
 Setting `status` to `send` transmits the email and sets `status` to `sent`.
 Drafts remain in the OUTBOX folder after sending.
@@ -247,8 +250,8 @@ def _build_email_message(
         message.add_attachment(
             attach_bytes,
             filename=attachment_name,
-            maintype=maintype,
-            subtype=subtype,
+            maintype=maintype or "application",
+            subtype=subtype or "octet-stream",
         )
 
     return message
@@ -524,13 +527,15 @@ async def _after_read_draft_part(
     the agent can track which parts are already fresh.
     """
     # Derive the draft folder by stripping the part segment from the buffer name.
+    # Derive the draft prefix by checking the last path segment.
     # body and html are one segment; attachments/N strips two segments.
     buffer_name = buffer.name
-    if buffer_name.removesuffix("/body"):
-        draft_prefix = buffer_name.removesuffix("/body")
-    elif buffer_name.removesuffix("/html"):
-        draft_prefix = buffer_name.removesuffix("/html")
-    elif buffer_name.rsplit("/", 2)[1] == "attachments":
+    parts = buffer_name.rsplit("/", 2)
+    if parts[-1] in ("body", "html"):
+        # body and html are single-segment leaves; strip one from the right.
+        draft_prefix = buffer_name.rsplit("/", 1)[0]
+    elif len(parts) >= 2 and parts[1] == "attachments":
+        # attachments/N is two segments deep; strip two from the right.
         draft_prefix = buffer_name.rsplit("/", 2)[0]
     else:
         return True
@@ -646,14 +651,15 @@ async def _after_create_attachment(
     Adds the new attachment buffer name to the header's attachments list.
     """
     # Derive the draft folder from the new attachment buffer name.
+    # The path is: email:box/OUTBOX/<draft>/attachments/<filename>
+    # Split into 3 parts from the right: [draft_prefix, "attachments", name]
     buffer_name = buffer.name
-    rsplit_result = buffer_name.rsplit("/", 1)
-    # Bail out if the buffer name has no slash  --  an impossible case.
-    if len(rsplit_result) < 2:
-        _logger.error(f"[Mailer] buffer name '{buffer_name}' has no slash  --  impossible")
+    rsplit_result = buffer_name.rsplit("/", 2)
+    if len(rsplit_result) < 3:
+        _logger.error(f"[Mailer] buffer name '{buffer_name}' missing segments")
         return
     draft_prefix = rsplit_result[0]
-    attachment_name = rsplit_result[1]
+    attachment_name = rsplit_result[2]
 
     # Locate the header buffer for this draft; bail out if it does not exist.
     header_name = f"{draft_prefix}/header"
@@ -710,14 +716,15 @@ async def _after_drop_attachment(
     Removes the dropped attachment from the header's attachments list.
     """
     # Derive the draft folder from the updated buffer name.
+    # The path is: email:box/OUTBOX/<draft>/attachments/<filename>
+    # Split into 3 parts from the right: [draft_prefix, "attachments", name]
     buffer_name = buffer.name
-    rsplit_result = buffer_name.rsplit("/", 1)
-    # Bail out if the buffer name has no slash  --  an impossible case.
-    if len(rsplit_result) < 2:
-        _logger.error(f"[Mailer] buffer name '{buffer_name}' has no slash  --  impossible")
+    rsplit_result = buffer_name.rsplit("/", 2)
+    if len(rsplit_result) < 3:
+        _logger.error(f"[Mailer] buffer name '{buffer_name}' missing segments")
         return True
     draft_prefix = rsplit_result[0]
-    attachment_name = rsplit_result[1]
+    attachment_name = rsplit_result[2]
 
     # Locate the header buffer for this draft; bail out if it does not exist.
     header_name = f"{draft_prefix}/header"
@@ -838,7 +845,7 @@ class Mailer(BufferManager, AgenticObject):
             apply_to_existing=True,
         )
         self.register_buffer_pattern_hook(
-            HookPoint.AFTER_UPDATE_BUFFER,
+            HookPoint.AFTER_DROP_BUFFER,
             "mailer_drop_attachment",
             attachment_pattern,
             _after_drop_attachment,
