@@ -47,11 +47,13 @@ To configure the IMAP client, write to `{_IMAPER_CONFIG_BUFFER}` with a JSON obj
 
 ```json
 {{
-  "host": "imap.example.com",
-  "port": 993,
-  "username": "your-username",
-  "password": "your-password",
-  "timeout": 15
+  "imap": {{
+    "host": "imap.example.com",
+    "port": 993,
+    "username": "your-username",
+    "password": "your-password",
+    "timeout": 15
+  }}
 }}
 ```
 
@@ -137,21 +139,23 @@ Available IMAP flags:
 # -------------------------------------------------------------------------------------------------------------------- #
 
 def _get_imap_config(config_buffer: Buffer | None) -> dict:
-    """Read and parse the email:config buffer contents as JSON.
+    """Read the imap sub-dict from the email:config buffer.
 
-    Returns an empty dict if the buffer is None (e.g. on first creation).
-    Raises json.JSONDecodeError on invalid JSON.
+    The config JSON has a top-level "imap" key containing the connection
+    credentials.  Returns an empty dict if the buffer is None or the imap
+    sub-dict is absent.
     """
     if config_buffer is None:
         return {}
-    # Parse and return the config as a dict.
-    return json.loads(config_buffer.get_text())
+    # Parse the top-level config and return the imap sub-section.
+    top_level = json.loads(config_buffer.get_text())
+    return top_level.get("imap", {})
 
 
 def _imap_connection_changed(old_config: dict, new_config: dict) -> bool:
     """Return True if any IMAP connection credential has changed.
 
-    Compares host, port, username, and password fields between the two configs.
+    Compares host, port, username, and password fields under the imap key.
     A change in any of these fields signals that the IMAP connection must be
     re-established.
     """
@@ -275,7 +279,7 @@ def _fetch_mailbox_status(imap_connection: imapclient.IMAPClient, mailbox_name: 
     # Select the mailbox  --  imapclient returns a clean dict, not raw bytes.
     try:
         result = imap_connection.select_folder(mailbox_name)
-    except imapclient.Error as e:
+    except imapclient.IMAPClientError as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
@@ -338,7 +342,7 @@ def _list_mailbox_emails(
     # Select the mailbox  --  imapclient handles state management.
     try:
         imap_connection.select_folder(mailbox_name)
-    except imapclient.Error as e:
+    except imapclient.IMAPClientError as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
@@ -367,7 +371,7 @@ def _list_mailbox_emails(
             message_ids = imap_connection.search(imap_criteria)
         else:
             message_ids = imap_connection.search(["ALL"])
-    except imapclient.Error as e:
+    except imapclient.IMAPClientError as e:
         _logger.error(f"[IMAPer] SEARCH failed for {mailbox_name}: {e}")
         return None
 
@@ -386,7 +390,7 @@ def _list_mailbox_emails(
     # RFC822 is the full raw message bytes, parsed by the email library.
     try:
         result = imap_connection.fetch(message_ids, ["BODY.PEEK[]", "FLAGS"])
-    except imapclient.Error as e:
+    except imapclient.IMAPClientError as e:
         _logger.error(f"[IMAPer] FETCH failed for {mailbox_name}: {e}")
         return None
 
@@ -457,14 +461,14 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
     # Select the mailbox  --  required before fetching message data.
     try:
         imap_connection.select_folder(mailbox_name)
-    except imapclient.Error as e:
+    except imapclient.IMAPClientError as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
     # Fetch the full RFC 822 message  --  email library handles all parsing.
     try:
         result = imap_connection.fetch([uid], ["BODY.PEEK[]", "FLAGS"])
-    except imapclient.Error as e:
+    except imapclient.IMAPClientError as e:
         _logger.error(f"[IMAPer] FETCH failed for UID {uid} in {mailbox_name}: {e}")
         return None
 
@@ -1004,7 +1008,7 @@ async def _after_update_uid(
     # Select the mailbox first  --  required before store.
     try:
         imaper._imap_connection.select_folder(mailbox_name)
-    except imapclient.Error as e:
+    except imapclient.IMAPClientError as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name} in flag sync: {e}")
         return
 
@@ -1012,14 +1016,14 @@ async def _after_update_uid(
     if to_add:
         try:
             imaper._imap_connection.add_flags([uid], to_add)
-        except imapclient.Error as e:
+        except imapclient.IMAPClientError as e:
             _logger.error(f"[IMAPer] add_flags failed for UID {uid}: {e}")
 
     # Apply flags to remove  --  use IMAP literal flag names.
     if to_remove:
         try:
             imaper._imap_connection.remove_flags([uid], to_remove)
-        except imapclient.Error as e:
+        except imapclient.IMAPClientError as e:
             _logger.error(f"[IMAPer] remove_flags failed for UID {uid}: {e}")
 
 
@@ -1185,21 +1189,29 @@ class IMAPer(BufferManager, AgenticObject):
     ) -> dict:
         """Read the existing email:config, overlay the four credentials, write back if changed.
 
-        Returns the new merged config dict.
+        Returns the new merged config dict (top-level, with imap sub-dict updated).
         """
-        # Read the existing config to preserve all other fields.
-        old = _get_imap_config(self.get_buffer(_IMAPER_CONFIG_BUFFER))
-        merged = {**old}
-        merged["host"] = host
-        merged["port"] = port
-        merged["username"] = username
-        merged["password"] = password
+        # Read the full config to preserve all other top-level fields (e.g. smtp).
+        config_text = self.get_buffer(_IMAPER_CONFIG_BUFFER)
+        if config_text is None:
+            full_config: dict = {}
+        else:
+            full_config = json.loads(config_text.get_text())
 
-        # Only write to the buffer if at least one credential changed.
-        if _imap_connection_changed(old, merged):
-            await self.create_buffer(_IMAPER_CONFIG_BUFFER, text=json.dumps(merged, ensure_ascii=False), overwrite=True)
+        # Pull out the imap sub-dict for diffing; start with an empty one if absent.
+        old_imap = full_config.get("imap", {})
+        new_imap: dict = {**old_imap}
+        new_imap["host"] = host
+        new_imap["port"] = port
+        new_imap["username"] = username
+        new_imap["password"] = password
 
-        return merged
+        # Only write to the buffer if at least one IMAP credential changed.
+        if _imap_connection_changed(old_imap, new_imap):
+            full_config["imap"] = new_imap
+            await self.create_buffer(_IMAPER_CONFIG_BUFFER, text=json.dumps(full_config, ensure_ascii=False), overwrite=True)
+
+        return full_config
 
     async def _connect_imap(
         self,
@@ -1221,8 +1233,11 @@ class IMAPer(BufferManager, AgenticObject):
         if self._imap_connection is not None:
             await self._disconnect_imap()
 
+        # Pull the imap sub-dict out of the full config.
+        imap_cfg = config.get("imap", {})
+
         # Read the timeout from config or default to 15 seconds.
-        timeout = config.get("timeout", 15)
+        timeout = imap_cfg.get("timeout", 15)
         if timeout is not None:
             timeout = int(timeout)
 
@@ -1230,8 +1245,8 @@ class IMAPer(BufferManager, AgenticObject):
         # imapclient handles SSL, timeout, and connection management.
         try:
             self._imap_connection = imapclient.IMAPClient(
-                host=config.get("host"),
-                port=config.get("port", 993),
+                host=imap_cfg.get("host"),
+                port=imap_cfg.get("port", 993),
                 use_uid=True,
                 ssl=True,
                 timeout=timeout,
@@ -1243,13 +1258,13 @@ class IMAPer(BufferManager, AgenticObject):
 
         # Log in and confirm the connection is established.
         try:
-            self._imap_connection.login(config.get("username"), config.get("password"))
-        except imapclient.Error as e:
+            self._imap_connection.login(imap_cfg.get("username"), imap_cfg.get("password"))
+        except imapclient.IMAPClientError as e:
             _logger.error(f"[IMAPer] login failed: {e}")
             self._imap_connection = None
             return
 
-        _logger.info(f"[IMAPer] connected to {config.get('host')}:{config.get('port')}")
+        _logger.info(f"[IMAPer] connected to {imap_cfg.get('host')}:{imap_cfg.get('port')}")
 
         # Populate the mailbox list after a successful login.
         # The tree refresh triggers _after_update_imap_tree which creates empty
@@ -1290,7 +1305,7 @@ class IMAPer(BufferManager, AgenticObject):
         # List all folders recursively  --  imapclient returns already-parsed tuples.
         try:
             folders = self._imap_connection.list_folders()
-        except imapclient.Error as e:
+        except imapclient.IMAPClientError as e:
             # Server rejected the LIST command  --  log and return None.
             _logger.error(f"[IMAPer] LIST command error: {e}")
             return None
