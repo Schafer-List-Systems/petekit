@@ -750,6 +750,19 @@ class Buffer:
         """Return the number of lines in the buffer."""
         return len(self.lines)
 
+    def empty(self) -> bool:
+        """Return True when the buffer has no content, False otherwise."""
+        # Return True when the buffer has no lines at all.
+        if len(self.lines) == 0:
+            return True
+
+        # Return True when the buffer has exactly one line and it is empty.
+        if len(self.lines) == 1 and self.lines[0].data == "":
+            return True
+
+        # The buffer has content in all remaining cases.
+        return False
+
     def read(
         self,
         start: int = 0,

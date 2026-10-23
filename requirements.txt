@@ -13,3 +13,4 @@ lxml
 imapclient
 croniter
 mcp
+faiss-cpu
