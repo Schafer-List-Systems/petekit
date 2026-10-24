@@ -19,6 +19,78 @@ _logger = logging.getLogger("rager")
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
+# TODO                                                                                                                 #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+# Index Status
+# The status buffer holds runtime information about the index:
+# 
+# rag:<index_name>:status
+# {
+#   "buffers": 0,
+#   "chunks": 0,
+#   "characters": 0,
+#   "tokens": 0,
+#   "view_queries": 0,
+#   "last_update": 1234567890.0,
+#   "avg_query_time": 0.05,
+#   "queries_per_second": 0.0,
+#   "is_populated": false
+# }
+# buffers -- number of source buffers currently indexed
+# chunks -- total number of chunks across all buffers
+# characters -- total character count of indexed content
+# tokens -- approximate token count of indexed content
+# view_queries -- number of view query buffers registered on this index
+# last_update -- Unix timestamp of the last index update
+# avg_query_time -- average time in seconds to compute query results
+# queries_per_second -- average query frequency on this index
+# is_populated -- boolean: true if the index has at least one buffer indexed
+# Using Index Status for Debugging:
+# 
+# If buffers = 0, your buffer_pattern likely doesn't match any buffers
+# If last_update is very old, the index hasn't refreshed
+# If avg_query_time is high with eager view, you may want to consider snapshot mode
+# Query Status
+# The status buffer holds runtime information about the query:
+# 
+# rag:<index_name>:status
+# {
+#   "last_query_time": 1234567890.0,
+#   "queries_executed": 12,
+#   "avg_query_time": 0.1,
+#   "query_mode": "snapshot",
+#   "query_timing": "lazy",
+#   "is_active": true
+# }
+# last_query_time -- Unix timestamp of the last query execution (null if never queried)
+# queries_executed -- total number of queries executed
+# avg_query_time -- average time in seconds to compute results
+# query_mode -- the mode used (snapshot or view)
+# query_timing -- the timing used (eager or lazy)
+# is_active -- true if the query is currently being evaluated (view mode), false if frozen (snapshot mode)
+# Using Query Status for Debugging:
+# 
+# If last_query_time is null, the query hasn't been executed (lazy mode waiting for first read)
+# If queries_per_second is unexpectedly high with eager view, you may be paying unnecessary overhead
+# If is_active = false but you expected updates, check your query mode is view, not snapshot
+# Practical Examples
+# Example 1: Query returns zero results
+# 
+# Check index status: buffers = 0 → your pattern is wrong
+# Check index status: buffers > 0 → your search term may be too specific
+# Example 2: Query taking too long
+# 
+# Check query status: avg_query_time = 5.0 seconds
+# Consider switching to lazy snapshot if you don't need immediate results
+# Check index status: if buffers = 10000+, consider narrowing your buffer_pattern
+# Example 3: Eager view with high overhead
+# 
+# Check index status: queries_per_second = 100
+# With eager view, every source change triggers recomputation
+# Consider snapshot mode if updates aren't needed in real-time
+
+# -------------------------------------------------------------------------------------------------------------------- #
 # Constants                                                                                                          #
 # -------------------------------------------------------------------------------------------------------------------- #
 
@@ -143,6 +215,37 @@ The `timing` and `mode` options are orthogonal and combine into four modes:
 - **lazy snapshot**   --  minimal overhead when the result is not being read; recomputes only when the result buffer is actually read
 - **lazy view**       --  always returns fresh results on every read; no stale cache; highest read-time cost since it always re-embeds
 
+### When to Use Which Mode
+
+- **Snapshot** — Use this when you want stable, reproducible results. The result
+  is fixed once and not recomputed on source buffer changes.
+
+  - **Eager snapshot** — The result is computed when the query buffer is created
+    or updated. Choose this when the result should reflect the index state at the
+    time you wrote the query.
+
+  - **Lazy snapshot** — The result is computed on the first read of the result
+    buffer. Choose this when you want to delay the search until the result is
+    actually needed — for example when the query is expensive and you are not
+    sure it will be read at all.
+
+- **View** — Use this when you want the result buffer to always reflect the
+  current state of the index. The results update automatically when source buffers
+  change. This is useful for dashboards, watchers, or any agent that reacts to
+  result buffer changes.
+
+  - **Eager view** — The result is recomputed on every source buffer change but
+    never on read. Choose this when source buffers change rarely but you read
+    often. It also enables automatic reactions: because the result updates on
+    every index change, a separate process can watch the result buffer for
+    changes and act on them — something that is not possible with lazy view.
+
+  - **Lazy view** — The result is recomputed on every read. Choose this when
+    source buffers change often but you read rarely. Changes to source buffers
+    do not automatically update the result — the result is only refreshed when
+    you read it. Automatic reactions to index changes are not possible with
+    lazy view.
+
 When you create or update a query buffer, a companion result buffer is created or updated automatically:
 
 ```
@@ -152,7 +255,7 @@ When you create or update a query buffer, a companion result buffer is created o
 ### Results
 
 The result buffer holds a list of matching source buffers, sorted by
-relevance from nearest to furthest (lowest to highest distance):
+relevance (best matches first):
 
 ```json
 [
@@ -163,9 +266,7 @@ relevance from nearest to furthest (lowest to highest distance):
 ]
 ```
 
-Each entry is the name of the matching buffer and its L2 distance from the
-query vector. A lower distance means higher relevance. Chunk-level results
-with text, offset, and scores will follow in a later version.
+Each entry is the name of the matching buffer. A lower distance value means higher relevance.
 
 ### How Indexing Works
 
