@@ -279,7 +279,7 @@ def _fetch_mailbox_status(imap_connection: imapclient.IMAPClient, mailbox_name: 
     # Select the mailbox  --  imapclient returns a clean dict, not raw bytes.
     try:
         result = imap_connection.select_folder(mailbox_name)
-    except imapclient.IMAPClientError as e:
+    except imapclient.exceptions.IMAPClientError as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
@@ -342,7 +342,7 @@ def _list_mailbox_emails(
     # Select the mailbox  --  imapclient handles state management.
     try:
         imap_connection.select_folder(mailbox_name)
-    except imapclient.IMAPClientError as e:
+    except imapclient.exceptions.IMAPClientError as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
@@ -371,7 +371,7 @@ def _list_mailbox_emails(
             message_ids = imap_connection.search(imap_criteria)
         else:
             message_ids = imap_connection.search(["ALL"])
-    except imapclient.IMAPClientError as e:
+    except imapclient.exceptions.IMAPClientError as e:
         _logger.error(f"[IMAPer] SEARCH failed for {mailbox_name}: {e}")
         return None
 
@@ -390,7 +390,7 @@ def _list_mailbox_emails(
     # RFC822 is the full raw message bytes, parsed by the email library.
     try:
         result = imap_connection.fetch(message_ids, ["BODY.PEEK[]", "FLAGS"])
-    except imapclient.IMAPClientError as e:
+    except imapclient.exceptions.IMAPClientError as e:
         _logger.error(f"[IMAPer] FETCH failed for {mailbox_name}: {e}")
         return None
 
@@ -461,14 +461,14 @@ def _fetch_email_by_uid(imap_connection: imapclient.IMAPClient, mailbox_name: st
     # Select the mailbox  --  required before fetching message data.
     try:
         imap_connection.select_folder(mailbox_name)
-    except imapclient.IMAPClientError as e:
+    except imapclient.exceptions.IMAPClientError as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
         return None
 
     # Fetch the full RFC 822 message  --  email library handles all parsing.
     try:
         result = imap_connection.fetch([uid], ["BODY.PEEK[]", "FLAGS"])
-    except imapclient.IMAPClientError as e:
+    except imapclient.exceptions.IMAPClientError as e:
         _logger.error(f"[IMAPer] FETCH failed for UID {uid} in {mailbox_name}: {e}")
         return None
 
@@ -1008,7 +1008,7 @@ async def _after_update_uid(
     # Select the mailbox first  --  required before store.
     try:
         imaper._imap_connection.select_folder(mailbox_name)
-    except imapclient.IMAPClientError as e:
+    except imapclient.exceptions.IMAPClientError as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name} in flag sync: {e}")
         return
 
@@ -1016,14 +1016,14 @@ async def _after_update_uid(
     if to_add:
         try:
             imaper._imap_connection.add_flags([uid], to_add)
-        except imapclient.IMAPClientError as e:
+        except imapclient.exceptions.IMAPClientError as e:
             _logger.error(f"[IMAPer] add_flags failed for UID {uid}: {e}")
 
     # Apply flags to remove  --  use IMAP literal flag names.
     if to_remove:
         try:
             imaper._imap_connection.remove_flags([uid], to_remove)
-        except imapclient.IMAPClientError as e:
+        except imapclient.exceptions.IMAPClientError as e:
             _logger.error(f"[IMAPer] remove_flags failed for UID {uid}: {e}")
 
 
@@ -1259,7 +1259,7 @@ class IMAPer(BufferManager, AgenticObject):
         # Log in and confirm the connection is established.
         try:
             self._imap_connection.login(imap_cfg.get("username"), imap_cfg.get("password"))
-        except imapclient.IMAPClientError as e:
+        except imapclient.exceptions.IMAPClientError as e:
             _logger.error(f"[IMAPer] login failed: {e}")
             self._imap_connection = None
             return
@@ -1305,7 +1305,7 @@ class IMAPer(BufferManager, AgenticObject):
         # List all folders recursively  --  imapclient returns already-parsed tuples.
         try:
             folders = self._imap_connection.list_folders()
-        except imapclient.IMAPClientError as e:
+        except imapclient.exceptions.IMAPClientError as e:
             # Server rejected the LIST command  --  log and return None.
             _logger.error(f"[IMAPer] LIST command error: {e}")
             return None

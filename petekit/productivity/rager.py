@@ -27,10 +27,12 @@ _RAGER_DOC_BUFFER = "doc:rager"
 
 # Side-index files: map FAISS integer IDs to domain string labels and back.
 _RAGER_IDS_TO_LABELS_FILE = "ids_to_labels.json"
+_RAGER_IDS_TO_VECTORS_FILE = "ids_to_vectors.json"
 _RAGER_LABELS_TO_IDS_FILE = "labels_to_ids.json"
 _RAGER_INDEX_FILE = "index.faiss"
 _RAGER_INDEX_CONFIG_FILE = "index.json"
 _RAGER_DEFAULT_QUERY_MODE = "one-shot"
+_RAGER_DEFAULT_K = 10
 _RAGER_EMBED_TIMEOUT = 15
 
 _RAGER_DOC = f"""\
@@ -91,17 +93,17 @@ The status buffer holds runtime information about the index:
   "chunks": 0,
   "characters": 0,
   "tokens": 0,
-  "dynamic_queries": 0,
+  "view_queries": 0,
   "last_update": 1234567890.0
 }}
 ```
 
-- `buffers`         --  number of source buffers currently indexed
-- `chunks`          --  total number of chunks across all buffers
-- `characters`     --  total character count of all indexed content
-- `tokens`         --  approximate token count of indexed content
-- `dynamic_queries` --  number of dynamic query buffers registered on this index
-- `last_update`    --  Unix timestamp of the last index update
+- `buffers`      --  number of source buffers currently indexed
+- `chunks`       --  total number of chunks across all buffers
+- `characters`  --  total character count of all indexed content
+- `tokens`      --  approximate token count of indexed content
+- `view_queries` --  number of `view` kind query buffers registered on this index
+- `last_update` --  Unix timestamp of the last index update
 
 ### Queries
 
@@ -115,15 +117,31 @@ Create a query buffer to define what to search for:
 {{
   "search": "<search string>",
   "limit": 10,
-  "mode": "one-shot",
+  "timing": "lazy",
+  "kind": "one-shot",
   "query_args": {{}}
 }}
 ```
 
-- `search`       --  the search string
-- `limit`        --  optional; cap the number of results (default from config)
-- `mode`         --  `eager`, `one-shot`, or `dynamic` (default `one-shot`)
-- `query_args`   --  optional; override default query_args from the index config
+- `search`  --  the search string
+- `limit`   --  optional; cap the number of results (default from config)
+- `timing`  --  `eager` or `lazy` (default `lazy`); when the search is executed
+- `kind`    --  `one-shot` or `view` (default `one-shot`); whether the result is permanent or ongoing
+- `query_args`  --  optional; override default query_args from the index config
+
+### Query Modes
+
+The `timing` and `kind` options are orthogonal and combine into four modes:
+
+| | One-shot | View |
+|---|---|---|
+| **Eager** | Computed immediately when the query buffer is created. Cached in the result buffer. Recomputed on every matching buffer change within the index pattern. | Computed immediately on query creation. Cached in the result buffer. Recomputed on **every** buffer change within the index's `buffer_pattern` -- the result buffer stays current at all times. |
+| **Lazy** | Computed on the first read of the result buffer. Cached. Subsequent reads return the cached result. | Computed fresh on **every** read of the result buffer. No result accumulation -- the buffer is left empty after each read. |
+
+- **eager one-shot**  --  low read-time cost; recomputes on buffer changes within the pattern; good for expensive embeddings where freshness at read time matters
+- **eager view**      --  result buffer is always current without reading it; a change log can react to each refresh; highest compute overhead if many buffers change frequently
+- **lazy one-shot**   --  minimal overhead when the result is not being read; recomputes only when the result buffer is actually read
+- **lazy view**       --  always returns fresh results on every read; no stale cache; highest read-time cost since it always re-embeds
 
 When you create a query buffer, a companion result buffer is created
 automatically:
@@ -131,19 +149,6 @@ automatically:
 ```
 {_RAGER_SCOPE}:<index_name>:result:<query_name>
 ```
-
-When you read the result buffer, the search is executed:
-
-- **eager mode**    --  the result is computed immediately when the query buffer
-                      is created and stored in the result buffer.  Rewriting
-                      or updating the query buffer clears the cached result.
-- **one-shot mode**  --  the result is computed on the first read and cached.
-                      Subsequent reads return the cached result.
-                      Rewriting or updating the query buffer clears the cached
-                      result so the next read re-runs the search.
-- **dynamic mode**   --  the result is computed fresh on every single read.
-                      The result buffer returns the current results and is
-                      left empty afterward so no stale results accumulate.
 
 ### Results
 
@@ -184,7 +189,9 @@ class RAGIndex:
     config: dict[str, Any]
     index: faiss.Index
     ids_to_labels: dict[int, str]
+    ids_to_vectors: dict[int, list[float]]
     labels_to_ids: dict[str, int]
+    eager_views: list[str]
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -309,7 +316,8 @@ def _get_query_dict(
         return None
 
     # Build the final query dict from config defaults, overridden by the buffer.
-    default_args = config.get("query_args", {})
+    # Copy the config's query_args to avoid mutating the shared config object.
+    default_args = config.get("query_args", {}).copy()
     default_args.update(query_data)
     return default_args
 
@@ -354,7 +362,7 @@ def _get_results_for_query(
         return {"ok": False, "error": "query buffer has no 'search' field"}
 
     # Extract the result limit from the query data with config as fallback.
-    k = query_data.get("k", config.get("query_args", {}).get("k", 10))
+    k = query_data.get("k", config.get("query_args", {}).get("k", _RAGER_DEFAULT_K))
 
     # Embed the search string into a query vector.
     embed_result = _embed(rager, rag_index, search)
@@ -364,6 +372,65 @@ def _get_results_for_query(
 
     # Query the index with the query vector.
     return _query_index(rager, rag_index, query_vector, k)
+
+
+def _refresh_result(
+    rager: RAGer,
+    rag_index: RAGIndex,
+    query_buffer: Buffer,
+    result_buffer: Buffer,
+) -> str | None:
+    """Run the query and write its results into the result buffer.
+
+    Uses the query buffer name to drive the search and the result buffer
+    object to hold the rendered output.
+    """
+    # Derive the query buffer name from the buffer object itself.
+    query_buffer_name = query_buffer.name
+
+    # Execute the search and hold the results.
+    query_result = _get_results_for_query(rager, rag_index, query_buffer_name)
+    if not query_result["ok"]:
+        _logger.error(
+            f"[RAGer] query execution failed for '{query_buffer_name}': "
+            f"{query_result.get('error', 'unknown')}"
+        )
+        return query_result.get("error")
+
+    # Render the results as JSON and write them into the result buffer.
+    results = query_result.get("results", [])
+    result_json = json.dumps(results, indent=2, ensure_ascii=False)
+    result_buffer.set_text(result_json)
+
+
+def _read_results_for_query(
+    rager: RAGer,
+    query_buffer_name: str,
+) -> list[dict[str, Any]] | None:
+    """Read the cached result buffer for the given query and return its results list.
+
+    Parses the result buffer as JSON. Returns the list on success, None on failure.
+    """
+    # Derive the result buffer name from the query buffer name.
+    result_buffer_name = _result_buffer_name_from_query(query_buffer_name)
+
+    # Locate and read the result buffer.
+    result_buffer = rager.get_buffer(result_buffer_name)
+    if result_buffer is None:
+        _logger.error(f"[RAGer] result buffer '{result_buffer_name}' not found")
+        return None
+
+    # Parse the result buffer as JSON.
+    result_text = result_buffer.get_text()
+    if not result_text:
+        return None
+
+    # Deserialise the JSON results list; log the error and return None if malformed.
+    try:
+        return json.loads(result_text)
+    except json.JSONDecodeError:
+        _logger.error(f"[RAGer] result buffer '{result_buffer_name}' is not valid JSON")
+        return None
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -416,6 +483,15 @@ def _load_index(
         with open(labels_to_ids_file) as f:
             labels_to_ids = json.load(f)
 
+    # Load the integer-ID to embedding-vector side-index.
+    ids_to_vectors: dict[int, list[float]] = {}
+    ids_to_vectors_file = index_path / _RAGER_IDS_TO_VECTORS_FILE
+    if ids_to_vectors_file.exists():
+        # Parse the integer-keyed JSON back to a typed dict.
+        with open(ids_to_vectors_file) as f:
+            raw_vectors = json.load(f)
+            ids_to_vectors = {int(k): v for k, v in raw_vectors.items()}
+
     # Validate against the provided config when one is passed.
     if config is not None:
         # Extract the create_on_gpu flag and the expected dimension.
@@ -455,7 +531,9 @@ def _load_index(
         config=on_disk_config,
         index=index,
         ids_to_labels=ids_to_labels,
+        ids_to_vectors=ids_to_vectors,
         labels_to_ids=labels_to_ids,
+        eager_views=[],
     )
 
 
@@ -512,6 +590,16 @@ def _create_index(
         _logger.error(f"[RAGer] failed to persist ids_to_labels for '{index_name}'")
         raise
 
+    # Initialise and persist the empty integer-ID to embedding-vector side-index.
+    ids_to_vectors: dict[int, list[float]] = {}
+    ids_to_vectors_file = index_path / _RAGER_IDS_TO_VECTORS_FILE
+    try:
+        with open(ids_to_vectors_file, "w") as f:
+            json.dump(ids_to_vectors, f)
+    except Exception:
+        _logger.error(f"[RAGer] failed to persist ids_to_vectors for '{index_name}'")
+        raise
+
     # Initialise and persist the empty label-to-integer side-index.
     labels_to_ids: dict[str, int] = {}
     labels_to_ids_file = index_path / _RAGER_LABELS_TO_IDS_FILE
@@ -527,7 +615,9 @@ def _create_index(
         config=config,
         index=index,
         ids_to_labels=ids_to_labels,
+        ids_to_vectors=ids_to_vectors,
         labels_to_ids=labels_to_ids,
+        eager_views=[],
     )
 
 
@@ -590,6 +680,11 @@ def _destroy_index(rager: RAGer, rag_index: RAGIndex) -> dict[str, Any]:
     if labels_to_ids_file.exists():
         labels_to_ids_file.unlink()
 
+    # Delete the integer-ID to embedding-vector side-index if it exists.
+    ids_to_vectors_file = index_path / _RAGER_IDS_TO_VECTORS_FILE
+    if ids_to_vectors_file.exists():
+        ids_to_vectors_file.unlink()
+
     # Remove the now-empty index directory.
     if index_path.is_dir() and not any(index_path.iterdir()):
         index_path.rmdir()
@@ -621,20 +716,20 @@ def _upsert_vector(
     rag_index: RAGIndex,
     vector: list[float],
     label: str,
-) -> str | None:
+) -> dict[str, Any] | str:
     """Insert a vector with a domain label into the index.
 
     If the label already exists in the index, the old vector is removed
     and the new one takes its place.
 
-    Returns None on success.
+    Returns {{"ok": True, "vector": [...], "faiss_id": ...}} on success.
     Returns an error string on insert failure.
     """
     # Check whether this label is already in the index.
     if label in rag_index.labels_to_ids:
         # Remove the stale vector first so the index stays consistent.
         remove_err = _remove_vector(rager, rag_index, label)
-        if remove_err is not None:
+        if isinstance(remove_err, str):
             return remove_err
 
     # Allocate a free integer ID for the new vector.
@@ -658,17 +753,20 @@ def _upsert_vector(
     # Update the label-to-integer side-index with the new mapping.
     rag_index.labels_to_ids[label] = faiss_id
 
-    return None
+    # Populate the integer-ID to embedding-vector side-index with the raw vector.
+    rag_index.ids_to_vectors[faiss_id] = vector
+
+    return {"ok": True, "faiss_id": faiss_id, "vector": vector}
 
 
 def _remove_vector(
     rager: RAGer,
     rag_index: RAGIndex,
     label: str,
-) -> str | None:
+) -> dict[str, Any] | str:
     """Remove the vector identified by label from the index.
 
-    Returns None on success.
+    Returns {{"ok": True, "faiss_id": ..., "vector": [...]}} on success.
     Returns an error string if the label was not found.
     """
     # Look up the FAISS integer ID for this label.
@@ -676,12 +774,20 @@ def _remove_vector(
     if faiss_id is None:
         return f"label '{label}' not found in index"
 
+    # Capture the vector before removing it so it can be returned.
+    removed_vector = rag_index.ids_to_vectors.get(faiss_id)
+
     # Remove the FAISS ID from the index and the integer-to-label side-index.
     rag_index.index.remove_id(faiss_id)
     rag_index.ids_to_labels.pop(faiss_id, None)
 
+    # Drop the vector from the integer-ID to embedding-vector side-index.
+    rag_index.ids_to_vectors.pop(faiss_id, None)
+
     # Drop the label entry from the label-to-integer side-index.
     rag_index.labels_to_ids.pop(label, None)
+
+    return {"ok": True, "faiss_id": faiss_id, "vector": removed_vector}
 
 
 def _query_index(
@@ -755,6 +861,15 @@ def _flush_index(rager: RAGer, rag_index: RAGIndex) -> dict[str, Any]:
             json.dump(rag_index.labels_to_ids, f)
     except Exception as e:
         _logger.error(f"[RAGer] failed to persist labels_to_ids for '{rag_index.name}': {e}")
+        return {"ok": False, "error": str(e)}
+
+    # Persist the integer-ID to embedding-vector side-index as JSON.
+    ids_to_vectors_file = index_dir / _RAGER_IDS_TO_VECTORS_FILE
+    try:
+        with open(ids_to_vectors_file, "w") as f:
+            json.dump(rag_index.ids_to_vectors, f)
+    except Exception as e:
+        _logger.error(f"[RAGer] failed to persist ids_to_vectors for '{rag_index.name}': {e}")
         return {"ok": False, "error": str(e)}
 
     return {"ok": True}
@@ -863,7 +978,9 @@ def _discover_embedding_dimension(
         config=config,
         index=None,  # type: ignore[arg-type]
         ids_to_labels={},
+        ids_to_vectors={},
         labels_to_ids={},
+        eager_views=[],
     )
 
     # Probe the embedder with a short, innocuous test string.
@@ -882,6 +999,17 @@ def _discover_embedding_dimension(
     return len(vector)
 
 
+def _l2_squared(a: list[float], b: list[float]) -> float:
+    """Return the squared L2 distance between two vectors.
+
+    Matches what IndexFlatL2.search returns so the same values can be compared
+    directly without a sqrt. Uses faiss.fvec_L2sqr -- a pure C loop with no
+    index needed and no Python overhead.
+    """
+    # Compute the squared L2 distance; no sqrt applied to stay consistent with FAISS.
+    return faiss.fvec_L2sqr(a, b)
+
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # RAGer Utils                                                                                                   #
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -891,12 +1019,13 @@ def _upsert_buffer(
     rager: RAGer,
     rag_index: RAGIndex,
     buffer_name: str,
-) -> str | None:
+) -> dict[str, Any] | str:
     """Read the buffer, embed its content, and upsert the vector into the index.
 
     If the buffer was already indexed, the old vector is replaced.
 
-    Returns an error string on failure, None on success.
+    Returns {{"ok": True, "vector": [...]}} on success.
+    Returns an error string on failure.
     """
     # Locate the buffer by name; abort if it does not exist.
     buffer = rager.get_buffer(buffer_name)
@@ -915,23 +1044,26 @@ def _upsert_buffer(
 
     # Upsert the vector with the buffer name as the label.
     upsert_result = _upsert_vector(rager, rag_index, embed_result["vector"], buffer_name)
-    if upsert_result is not None:
+    if isinstance(upsert_result, str):
         return upsert_result
+
+    return upsert_result
 
 
 def _remove_buffer(
     rager: RAGer,
     rag_index: RAGIndex,
     buffer_name: str,
-) -> str | None:
+) -> dict[str, Any] | str:
     """Remove the buffer's vector from the index.
 
     The buffer name is used as the label to look up the vector in the index.
 
-    Returns an error string on failure, None on success.
+    Returns {{"ok": True, "faiss_id": ..., "vector": [...]}} on success.
+    Returns an error string on failure.
     """
     # The buffer name is the label; delegate directly to the vector removal helper.
-    _remove_vector(rager, rag_index, buffer_name)
+    return _remove_vector(rager, rag_index, buffer_name)
 
 
 async def _sync_index(
@@ -998,13 +1130,13 @@ async def _sync_index(
     # Remove each stale label from the index.
     for label in removed_labels:
         remove_err = _remove_buffer(rager, rag_index, label)
-        if remove_err is not None:
+        if isinstance(remove_err, str):
             _logger.warning(f"[RAGer] failed to remove '{label}' from index: {remove_err}")
 
     # Add each new label to the index.
     for label in added_labels:
         upsert_err = _upsert_buffer(rager, rag_index, label)
-        if upsert_err is not None:
+        if isinstance(upsert_err, str):
             _logger.warning(f"[RAGer] failed to add '{label}' to index: {upsert_err}")
 
     _logger.debug(f"[RAGer] rescan complete for index '{index_name}'")
@@ -1063,6 +1195,31 @@ async def _before_update_config(
     embed_model = embedding.get("model")
     if not isinstance(embed_model, str) or not embed_model:
         return f"config 'embedding.model' must be a non-empty string, got {embed_model!r}"
+
+    # Validate that the required 'buffer_pattern' field is present.
+    if "buffer_pattern" not in config:
+        return (
+            f"config is missing required field 'buffer_pattern': "
+            f"{_RAGER_SCOPE}:{new_buffer.name}"
+        )
+
+    # Reject any change to buffer_pattern after index creation; a resync cannot safely refresh result buffers.
+    if old_buffer is not None:
+        # Read the old config to extract its buffer_pattern.
+        old_text = old_buffer.get_text() or ""
+        try:
+            old_config = json.loads(old_text)
+        except json.JSONDecodeError:
+            old_config = {}
+
+        # Compare the old pattern against the new one; allow if they are the same.
+        old_pattern = old_config.get("buffer_pattern")
+        new_pattern = config["buffer_pattern"]
+        if old_pattern is not None and old_pattern != new_pattern:
+            return (
+                f"changing 'buffer_pattern' after index creation is not allowed: "
+                f"old={old_pattern!r}, new={new_pattern!r}"
+            )
 
     return None
 
@@ -1264,29 +1421,57 @@ async def _after_update_query(
     # Load the query dictionary from the query buffer and config.
     query_dict = _get_query_dict(rager, query_buffer_name)
     if query_dict is None:
-        return f"failed to load query for '{query_buffer_name}'"
+        _logger.error(f"[RAGer] failed to load query for '{query_buffer_name}'")
+        return
+
+    # Get the RAGIndex object from the RAGer.
+    index_name = _index_name_from_query(query_buffer_name)
+    rag_index = rager._rag_indexes.get(index_name)
+    if not rag_index:
+        _logger.error(f"[RAGer] RAGIndex '{index_name}' is not active")
+        return
+
+    # Only pre-populate results if timing is eager.
+    timing = query_dict.get("timing", "lazy")
+    kind = query_dict.get("kind", "one-shot")
+    if timing != "eager":
+        # Ensure, the query buffer is not in the eager view list.
+        rag_index.eager_views.discard(query_buffer_name)
+
+        # Refresh the result buffer.
+        create_result = await rager.create_buffer(result_buffer_name, "", overwrite=True)
+        if not create_result.get("ok", False):
+            _logger.error(
+                f"[RAGer] failed to create result buffer '{result_buffer_name}': "
+                f"{create_result.get('error', 'unknown')}"
+            )
+
+        return
+
+    # If the eager query is a view, it belongs into the eager view list.
+    if kind == "view" and query_buffer_name not in rag_index.eager_views:
+        rag_index.eager_views.append(query_buffer_name)
+
+    # An update of an eager query forces to create fresh results.
+    query_result = _get_results_for_query(rager, rag_index, query_buffer_name)
+    if not query_result.get("ok"):
+        _logger.error(
+            f"[RAGer] query execution failed for '{query_buffer_name}': "
+            f"{query_result.get('error', 'unknown')}"
+        )
+        return
+
+    # Render the results as JSON and write them into the result buffer.
+    results = query_result.get("results", [])
+    results_str = json.dumps(results, indent=2, ensure_ascii=False)
 
     # Refresh the result buffer
-    create_result = await rager.create_buffer(result_buffer_name, "", overwrite=True)
+    create_result = await rager.create_buffer(result_buffer_name, results_str, overwrite=True)
     if not create_result.get("ok", False):
-        return create_result
-
-    # Only pre-populate results if the mode is eager.
-    mode = query_dict.get("mode", _RAGER_DEFAULT_QUERY_MODE)
-    if mode != "eager":
-        return None
-
-    # Work with that empty result buffer.
-    result_buffer = rager.get_buffer(result_buffer_name)
-    if not result_buffer:
         _logger.error(
-            f"[RAGer] result buffer missing after creation: '{result_buffer_name}' "
-            f"for query '{query_buffer_name}'"
+            f"[RAGer] failed to create result buffer '{result_buffer_name}': "
+            f"{create_result.get('error', 'unknown')}"
         )
-        return None
-
-    # Do the query and populate the results.
-    return _after_read_result(rager, result_buffer, args)
 
 
 async def _after_drop_query(
@@ -1301,6 +1486,11 @@ async def _after_drop_query(
     # Derive the result buffer name from the dropped query buffer name.
     query_buffer_name = buffer.name
     result_buffer_name = _result_buffer_name_from_query(query_buffer_name)
+
+    # Remove the query buffer from the eager view list of its index.
+    index_name = _index_name_from_query(query_buffer_name)
+    if index_name is not None and index_name in rager._rag_indexes:
+        rager._rag_indexes[index_name].eager_views.discard(query_buffer_name)
 
     # Drop the result buffer if it exists.
     drop_result = await rager.drop_buffer(result_buffer_name)
@@ -1330,12 +1520,69 @@ def _make_after_update_buffer(
         Upserts the new buffer content into the RAGIndex captured by the factory.
         """
         # The new buffer is already in the buffer manager; upsert it into the index.
-        upsert_err = _upsert_buffer(rager, rag_index, new_buffer.name)
-        if upsert_err is not None:
-            _logger.warning(
+        upsert_result = _upsert_buffer(rager, rag_index, new_buffer.name)
+        if isinstance(upsert_result, str):
+            _logger.error(
                 f"[RAGer] failed to upsert buffer '{new_buffer.name}' "
-                f"into index '{rag_index.name}': {upsert_err}"
+                f"into index '{rag_index.name}': {upsert_result}"
             )
+            return
+
+        # Loop over all eager view queries
+        for query_buffer_name in rag_index.eager_views:
+            # Get current results from result buffer.
+            current_results = _read_results_for_query(rager, query_buffer_name)
+            if current_results is None:
+                _logger.warning(f"[RAGer] could not read eager view results for '{query_buffer_name}'")
+                continue
+
+            # Get the query's embedding.
+            query_dict = _get_query_dict(rager, query_buffer_name)
+            if query_dict is None:
+                _logger.warning(f"[RAGer] could not load query dict for '{query_buffer_name}'")
+                continue
+
+            # Embed the search string into a query vector for distance computation.
+            embed_result = _embed(rager, rag_index, query_dict.get("search", ""))
+            if not embed_result["ok"]:
+                _logger.warning(
+                    f"[RAGer] could not embed query for '{query_buffer_name}': "
+                    f"{embed_result.get('error', 'unknown')}"
+                )
+                continue
+            query_vector = embed_result["vector"]
+
+            # Compute the distance between the new element's and the querie's embedding.
+            new_distance = _l2_squared(upsert_result["vector"], query_vector)
+
+            # Compare the new distance with results to find out, if it is a new candidate.
+            # Results are sorted ascending by distance; the last entry is the worst.
+            # Skip if the result list is full and the new distance does not beat the current worst result.
+            k = query_dict.get("k", _RAGER_DEFAULT_K)
+            if current_results and len(current_results) >= k and new_distance > current_results[-1]["distance"]:
+                continue
+
+            # Insert the new element in sorted order and drop the last (worst) entry.
+            # Append the new candidate and re-sort to maintain ascending distance order.
+            current_results.append({"buffer": new_buffer.name, "distance": new_distance})
+            current_results.sort(key=lambda r: r["distance"])
+
+            # Drop the last (worst) entry only if the list exceeds k results.
+            if len(current_results) > k:
+                current_results.pop()
+
+            # Persist the updated results back into the result buffer.
+            result_buffer_name = _result_buffer_name_from_query(query_buffer_name)
+            create_result = await rager.create_buffer(
+                result_buffer_name,
+                text=json.dumps(current_results, indent=2, ensure_ascii=False),
+                overwrite=True,
+            )
+            if not create_result.get("ok", False):
+                _logger.error(
+                    f"[RAGer] failed to update result buffer '{result_buffer_name}': "
+                    f"{create_result.get('error', 'unknown')}"
+                )
 
     return _after_update_buffer
 
@@ -1358,12 +1605,50 @@ def _make_after_drop_buffer(
         Removes the dropped buffer from the RAGIndex captured by the factory.
         """
         # Remove the buffer from the index using the buffer name as the label.
-        remove_err = _remove_buffer(rager, rag_index, buffer.name)
-        if remove_err is not None:
+        remove_result = _remove_buffer(rager, rag_index, buffer.name)
+        if isinstance(remove_result, str):
             _logger.warning(
                 f"[RAGer] failed to remove buffer '{buffer.name}' "
-                f"from index '{rag_index.name}': {remove_err}"
+                f"from index '{rag_index.name}': {remove_result}"
             )
+            return
+
+        # Loop over all eager view queries
+        for query_buffer_name in rag_index.eager_views:
+            # Get current results from result buffer.
+            current_results = _read_results_for_query(rager, query_buffer_name)
+            if current_results is None:
+                _logger.warning(f"[RAGer] could not read eager view results for '{query_buffer_name}'")
+                continue
+
+            # If the buffer that we remove is not in the current results, no change is necessary.
+            buffer_names = [r["buffer"] for r in current_results]
+            if buffer.name not in buffer_names:
+                continue
+
+            # The removed buffer was in the result set; a full re-search fills the vacated slot.
+            query_result = _get_results_for_query(rager, rag_index, query_buffer_name)
+            if not query_result.get("ok"):
+                _logger.error(
+                    f"[RAGer] query execution failed for '{query_buffer_name}': "
+                    f"{query_result.get('error', 'unknown')}"
+                )
+                return
+
+            # Render the results as JSON and write them into the result buffer.
+            results = query_result.get("results", [])
+            results_str = json.dumps(results, indent=2, ensure_ascii=False)
+
+            # Derive the result buffer name from the query buffer name.
+            result_buffer_name = _result_buffer_name_from_query(query_buffer_name)
+
+            # Refresh the result buffer
+            create_result = await rager.create_buffer(result_buffer_name, results_str, overwrite=True)
+            if not create_result.get("ok", False):
+                _logger.error(
+                    f"[RAGer] failed to create result buffer '{result_buffer_name}': "
+                    f"{create_result.get('error', 'unknown')}"
+                )
 
     return _after_drop_buffer
 
@@ -1380,10 +1665,6 @@ async def _before_read_result(
 
     Returns an error string on failure, None to allow the read.
     """
-    # Check whether the result buffer already has content.
-    if not buffer.empty():
-        return None
-
     # Derive the query buffer name from the result buffer name.
     result_buffer_name = buffer.name
     query_buffer_name = _query_buffer_name_from_result(result_buffer_name)
@@ -1393,36 +1674,21 @@ async def _before_read_result(
     if query_dict is None:
         return f"failed to load query for '{query_buffer_name}'"
 
-    # For dynamic mode, return None and let the after-read hook freshen results.
-    mode = query_dict.get("mode", _RAGER_DEFAULT_QUERY_MODE)
-    if mode == "dynamic":
-        return None
+    # For lazy view, return None and let the after-read hook freshen results.
+    timing = query_dict.get("timing", "lazy")
+    kind = query_dict.get("kind", "one-shot")
 
-    await _after_read_result(rager, buffer, args)
+    # The result is never updated lazyily, when the query is in eager mode.
+    if timing == "eager":
+        return
 
-
-async def _after_read_result(
-    rager: RAGer,
-    buffer: Buffer,
-    args: dict[str, Any],
-) -> bool | None:
-    """Called after the result buffer of an index is read.
-
-    Returns True to allow the read, False to reject it.
-    """
-    # Check whether the result buffer already has content.
-    if not buffer.empty():
-        return None
+    # In lazy one-shot mode, we only update, when the buffer is empty.
+    if not buffer.empty() and kind == "one-shot":
+        return
 
     # Derive the query buffer name from the result buffer name.
     result_buffer_name = buffer.name
     query_buffer_name = _query_buffer_name_from_result(result_buffer_name)
-
-    # Load the query dictionary from the query buffer and config.
-    query_dict = _get_query_dict(rager, query_buffer_name)
-    if query_dict is None:
-        _logger.error(f"[RAGer] failed to load query for '{query_buffer_name}'")
-        return None
 
     # Execute the query and write the results to the result buffer.
     # Extract the index name from the query buffer name.
@@ -1576,14 +1842,5 @@ class RAGer(BufferManager, AgenticObject):
             "rager_before_read_result",
             result_pattern,
             _before_read_result,
-            apply_to_existing=True,
-        )
-
-        # Register the AFTER_READ hook on result buffers to post-process results.
-        self.register_buffer_pattern_hook(
-            HookPoint.AFTER_READ_BUFFER,
-            "rager_after_read_result",
-            result_pattern,
-            _after_read_result,
             apply_to_existing=True,
         )
