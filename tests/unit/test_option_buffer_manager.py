@@ -11,8 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from petekit.text.option_buffer_manager import (
-    _origin_name_from_option,
-    _option_name_from_option,
+    _origin_name_from_option_buffer_name,
+    _option_type_from_option_buffer_name,
     _reject_creation_if_origin_missing,
     _register_origin_cascade_drop,
 )
@@ -20,46 +20,46 @@ from petekit.text.option_buffer_manager import (
 
 class TestOriginNameFromOption:
     def test_returns_origin_for_valid_option_buffer(self):
-        result = _origin_name_from_option("STREAM[notifications]")
+        result = _origin_name_from_option_buffer_name("STREAM[notifications]")
         assert result == "STREAM"
 
     def test_returns_origin_with_special_characters(self):
-        result = _origin_name_from_option("system:log[notes]")
+        result = _origin_name_from_option_buffer_name("system:log[notes]")
         assert result == "system:log"
 
     def test_returns_origin_with_nested_brackets(self):
-        result = _origin_name_from_option("STREAM[notifications][more]")
+        result = _origin_name_from_option_buffer_name("STREAM[notifications][more]")
         assert result == "STREAM[notifications]"
 
     def test_returns_none_for_plain_buffer(self):
-        result = _origin_name_from_option("STREAM")
+        result = _origin_name_from_option_buffer_name("STREAM")
         assert result is None
 
     def test_returns_none_for_empty_brackets(self):
-        result = _origin_name_from_option("STREAM[]")
+        result = _origin_name_from_option_buffer_name("STREAM[]")
         # Empty brackets [] do not match the option buffer pattern (requires 1+ chars inside brackets).
         assert result is None
 
 
 class TestOptionNameFromOption:
     def test_returns_option_name_for_valid_option_buffer(self):
-        result = _option_name_from_option("STREAM[notifications]")
+        result = _option_type_from_option_buffer_name("STREAM[notifications]")
         assert result == "notifications"
 
     def test_returns_option_name_with_special_characters(self):
-        result = _option_name_from_option("system:log[notes]")
+        result = _option_type_from_option_buffer_name("system:log[notes]")
         assert result == "notes"
 
     def test_returns_option_name_with_nested_brackets(self):
-        result = _option_name_from_option("STREAM[notifications][more]")
+        result = _option_type_from_option_buffer_name("STREAM[notifications][more]")
         assert result == "more"
 
     def test_returns_none_for_plain_buffer(self):
-        result = _option_name_from_option("STREAM")
+        result = _option_type_from_option_buffer_name("STREAM")
         assert result is None
 
     def test_returns_none_for_empty_brackets(self):
-        result = _option_name_from_option("STREAM[]")
+        result = _option_type_from_option_buffer_name("STREAM[]")
         # Empty brackets [] do not match the option buffer pattern — returns None.
         assert result is None
 

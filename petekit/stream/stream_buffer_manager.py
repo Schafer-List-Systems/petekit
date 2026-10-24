@@ -20,8 +20,8 @@ from ..text.buffer_manager import (
 )
 from ..text.option_buffer_manager import (
     OptionBufferManager,
-    _origin_name_from_option,
-    _option_name_from_option,
+    _origin_name_from_option_buffer_name,
+    _option_type_from_option_buffer_name,
 )
 from peteos.oap.agentic_object import AgenticObject
 
@@ -157,7 +157,7 @@ def _enforce_append_only(
 def _is_stream_option(name: str) -> bool:
     """Return True if name is a valid stream option buffer (has the [stream] suffix)."""
     # Extract the option type from the bracketed suffix and compare to "stream".
-    return _option_name_from_option(name) == _STREAM_SUFFIX
+    return _option_type_from_option_buffer_name(name) == _STREAM_SUFFIX
 
 
 def _stream_option_name(origin_name: str) -> str:
@@ -184,7 +184,7 @@ def on_create_stream_option_guard(
         return f"internal error: hook fired for non-stream buffer '{buffer.name}'"
 
     # Derive the origin name from the option buffer name.
-    origin_name = _origin_name_from_option(buffer.name)
+    origin_name = _origin_name_from_option_buffer_name(buffer.name)
     if origin_name is None:
         return f"Cannot derive origin from '{buffer.name}'."
 
@@ -212,7 +212,7 @@ def on_stream_option_created(
         return
 
     # Derive the origin name and resolve the origin buffer.
-    origin_name = _origin_name_from_option(option_buffer.name)
+    origin_name = _origin_name_from_option_buffer_name(option_buffer.name)
 
     # Guard: a valid stream option always has a derivable origin name.
     if origin_name is None:
@@ -251,7 +251,7 @@ def on_stream_option_dropped(
         return
 
     # Derive the origin name from the (now orphaned) option buffer name.
-    origin_name = _origin_name_from_option(option_buffer.name)
+    origin_name = _origin_name_from_option_buffer_name(option_buffer.name)
     if origin_name is None:
         _logger.error(f"[on_stream_option_dropped] cannot derive origin from '{option_buffer.name}'")
         return

@@ -32,7 +32,7 @@ system:status:buffers  — live listing of all buffers (including option buffers
 """
 
 
-def _origin_name_from_option(name: str) -> str | None:
+def _origin_name_from_option_buffer_name(name: str) -> str | None:
     """Return the origin buffer name if name is an option buffer (has [...]), else None."""
     match = _OPTION_BUFFER_PATTERN.fullmatch(name)
     if not match:
@@ -40,7 +40,7 @@ def _origin_name_from_option(name: str) -> str | None:
     return match.group(1)
 
 
-def _option_name_from_option(name: str) -> str | None:
+def _option_type_from_option_buffer_name(name: str) -> str | None:
     """Return the option type (the content inside [...]) if name is an option buffer, else None."""
     match = _OPTION_BUFFER_PATTERN.fullmatch(name)
     if not match:
@@ -54,7 +54,7 @@ def _reject_creation_if_origin_missing(
     args: dict[str, Any],
 ) -> str | None:
     """Pre-create guard: reject option buffer creation if the origin does not exist."""
-    origin_name = _origin_name_from_option(buffer.name)
+    origin_name = _origin_name_from_option_buffer_name(buffer.name)
     if origin_name is None:
         return None  # Not an option buffer — allow creation to proceed.
 
@@ -73,7 +73,7 @@ def _register_origin_cascade_drop(
     args: dict[str, Any],
 ) -> None:
     """Post-create hook: register a cascade-drop hook on the origin buffer so the option is dropped when the origin is dropped."""
-    origin_name = _origin_name_from_option(buffer.name)
+    origin_name = _origin_name_from_option_buffer_name(buffer.name)
     if origin_name is None:
         _logger.error(f"[_register_origin_cascade_drop] buffer '{buffer.name}' does not match the option buffer pattern — hook should not have been invoked")
         return None  # Not an option buffer — nothing to register.
