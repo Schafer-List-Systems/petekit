@@ -31,7 +31,7 @@ _RAGER_IDS_TO_VECTORS_FILE = "ids_to_vectors.json"
 _RAGER_LABELS_TO_IDS_FILE = "labels_to_ids.json"
 _RAGER_INDEX_FILE = "index.faiss"
 _RAGER_INDEX_CONFIG_FILE = "index.json"
-_RAGER_DEFAULT_QUERY_MODE = "one-shot"
+_RAGER_DEFAULT_QUERY_MODE = "snapshot"
 _RAGER_DEFAULT_K = 10
 _RAGER_EMBED_TIMEOUT = 15
 
@@ -102,7 +102,7 @@ The status buffer holds runtime information about the index:
 - `chunks`       --  total number of chunks across all buffers
 - `characters`  --  total character count of all indexed content
 - `tokens`      --  approximate token count of indexed content
-- `view_queries` --  number of `view` kind query buffers registered on this index
+- `view_queries` --  number of `view` query buffers registered on this index
 - `last_update` --  Unix timestamp of the last index update
 
 ### Queries
@@ -118,7 +118,7 @@ Create a query buffer to define what to search for:
   "search": "<search string>",
   "limit": 10,
   "timing": "lazy",
-  "kind": "one-shot",
+  "mode": "snapshot",
   "query_args": {{}}
 }}
 ```
@@ -126,25 +126,24 @@ Create a query buffer to define what to search for:
 - `search`  --  the search string
 - `limit`   --  optional; cap the number of results (default from config)
 - `timing`  --  `eager` or `lazy` (default `lazy`); when the search is executed
-- `kind`    --  `one-shot` or `view` (default `one-shot`); whether the result is permanent or ongoing
+- `mode`    --  `snapshot` or `view` (default `snapshot`); whether the result is permanent or ongoing
 - `query_args`  --  optional; override default query_args from the index config
 
 ### Query Modes
 
-The `timing` and `kind` options are orthogonal and combine into four modes:
+The `timing` and `mode` options are orthogonal and combine into four modes:
 
-| | One-shot | View |
+| | Snapshot | View |
 |---|---|---|
-| **Eager** | Computed immediately when the query buffer is created. Cached in the result buffer. Recomputed on every matching buffer change within the index pattern. | Computed immediately on query creation. Cached in the result buffer. Recomputed on **every** buffer change within the index's `buffer_pattern` -- the result buffer stays current at all times. |
+| **Eager** | Computed when the query buffer is created or updated. Cached in the result buffer. Source buffer changes within the index do not trigger recompute. | Computed immediately on query creation. Cached in the result buffer. Recomputed on **every** buffer change within the index's `buffer_pattern` -- the result buffer stays current at all times. |
 | **Lazy** | Computed on the first read of the result buffer. Cached. Subsequent reads return the cached result. | Computed fresh on **every** read of the result buffer. No result accumulation -- the buffer is left empty after each read. |
 
-- **eager one-shot**  --  low read-time cost; recomputes on buffer changes within the pattern; good for expensive embeddings where freshness at read time matters
+- **eager snapshot**  --  low read-time cost; recomputes when the query buffer is created or updated; source buffer changes within the index do not trigger recompute; good for expensive embeddings where freshness at read time matters
 - **eager view**      --  result buffer is always current without reading it; a change log can react to each refresh; highest compute overhead if many buffers change frequently
-- **lazy one-shot**   --  minimal overhead when the result is not being read; recomputes only when the result buffer is actually read
+- **lazy snapshot**   --  minimal overhead when the result is not being read; recomputes only when the result buffer is actually read
 - **lazy view**       --  always returns fresh results on every read; no stale cache; highest read-time cost since it always re-embeds
 
-When you create a query buffer, a companion result buffer is created
-automatically:
+When you create or update a query buffer, a companion result buffer is created or updated automatically:
 
 ```
 {_RAGER_SCOPE}:<index_name>:result:<query_name>
@@ -191,7 +190,7 @@ class RAGIndex:
     ids_to_labels: dict[int, str]
     ids_to_vectors: dict[int, list[float]]
     labels_to_ids: dict[str, int]
-    eager_views: list[str]
+    eager_views: set[str]
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -533,7 +532,7 @@ def _load_index(
         ids_to_labels=ids_to_labels,
         ids_to_vectors=ids_to_vectors,
         labels_to_ids=labels_to_ids,
-        eager_views=[],
+        eager_views=set(),
     )
 
 
@@ -617,7 +616,7 @@ def _create_index(
         ids_to_labels=ids_to_labels,
         ids_to_vectors=ids_to_vectors,
         labels_to_ids=labels_to_ids,
-        eager_views=[],
+        eager_views=set(),
     )
 
 
@@ -778,7 +777,7 @@ def _remove_vector(
     removed_vector = rag_index.ids_to_vectors.get(faiss_id)
 
     # Remove the FAISS ID from the index and the integer-to-label side-index.
-    rag_index.index.remove_id(faiss_id)
+    rag_index.index.remove_ids(np.array([faiss_id], dtype=np.int64))
     rag_index.ids_to_labels.pop(faiss_id, None)
 
     # Drop the vector from the integer-ID to embedding-vector side-index.
@@ -788,6 +787,11 @@ def _remove_vector(
     rag_index.labels_to_ids.pop(label, None)
 
     return {"ok": True, "faiss_id": faiss_id, "vector": removed_vector}
+
+
+def _format_distance(distance: float) -> float:
+    """Round a distance value to 6 decimal places for stable result comparisons."""
+    return round(float(distance), 6)
 
 
 def _query_index(
@@ -817,6 +821,10 @@ def _query_index(
     # Translate each FAISS result into a label and distance for the caller.
     results = []
     for faiss_id, distance in zip(faiss_ids, distances):
+        # FAISS pads with -1 when fewer than k results exist; stop here.
+        if faiss_id == -1:
+            break
+
         # Look up the domain label for this FAISS integer ID.
         label = rag_index.ids_to_labels.get(faiss_id)
         if label is None:
@@ -826,7 +834,7 @@ def _query_index(
             continue
 
         # Append the labelled result to the output list.
-        results.append({"buffer": label, "distance": float(distance)})
+        results.append({"buffer": label, "distance": _format_distance(distance)})
 
     return {"ok": True, "results": results}
 
@@ -980,7 +988,7 @@ def _discover_embedding_dimension(
         ids_to_labels={},
         ids_to_vectors={},
         labels_to_ids={},
-        eager_views=[],
+        eager_views=set(),
     )
 
     # Probe the embedder with a short, innocuous test string.
@@ -1003,11 +1011,11 @@ def _l2_squared(a: list[float], b: list[float]) -> float:
     """Return the squared L2 distance between two vectors.
 
     Matches what IndexFlatL2.search returns so the same values can be compared
-    directly without a sqrt. Uses faiss.fvec_L2sqr -- a pure C loop with no
-    index needed and no Python overhead.
+    directly without a sqrt.
     """
-    # Compute the squared L2 distance; no sqrt applied to stay consistent with FAISS.
-    return faiss.fvec_L2sqr(a, b)
+    # Compute the squared L2 distance; no sqrt applied.
+    diff = np.array(a, dtype=np.float32) - np.array(b, dtype=np.float32)
+    return float(np.dot(diff, diff))
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -1221,6 +1229,36 @@ async def _before_update_config(
                 f"old={old_pattern!r}, new={new_pattern!r}"
             )
 
+        # Reject any change to embedding.model after index creation; existing vectors were
+        # built with the old model and cannot safely be replaced without a full re-embed.
+        old_model = old_config.get("embedding", {}).get("model")
+        new_model = config.get("embedding", {}).get("model")
+        if old_model is not None and old_model != new_model:
+            return (
+                f"changing 'embedding.model' after index creation is not allowed: "
+                f"old={old_model!r}, new={new_model!r}"
+            )
+
+        # Reject any change to embedding.url after index creation; the endpoint may serve
+        # a different model and produce incompatible vectors.
+        old_url = old_config.get("embedding", {}).get("url")
+        new_url = config.get("embedding", {}).get("url")
+        if old_url is not None and old_url != new_url:
+            return (
+                f"changing 'embedding.url' after index creation is not allowed: "
+                f"old={old_url!r}, new={new_url!r}"
+            )
+
+        # Reject any change to embedding.via after index creation; switching the backend
+        # changes how vectors are built and invalidates all existing index content.
+        old_via = old_config.get("embedding", {}).get("via")
+        new_via = config.get("embedding", {}).get("via")
+        if old_via is not None and old_via != new_via:
+            return (
+                f"changing 'embedding.via' after index creation is not allowed: "
+                f"old={old_via!r}, new={new_via!r}"
+            )
+
     return None
 
 
@@ -1299,6 +1337,15 @@ async def _after_update_config(
             apply_to_existing=True,
         )
 
+        # Also register for AFTER_CREATE_BUFFER so brand-new source buffers are indexed immediately.
+        rager.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            f"rager_after_create_buffer_{index_name}",
+            new_config["buffer_pattern"],
+            lambda bm, new_buffer, args: update_hook(bm, None, new_buffer, args),
+            apply_to_existing=True,
+        )
+
         drop_hook = _make_after_drop_buffer(rag_index)
         rager.register_buffer_pattern_hook(
             HookPoint.AFTER_DROP_BUFFER,
@@ -1308,14 +1355,21 @@ async def _after_update_config(
             apply_to_existing=True,
         )
 
-    # If the buffer_pattern changed (including a freshly created index),
-    # rescan to backfill existing buffers into the new index.
-    old_pattern = old_config.get("buffer_pattern")
-    new_pattern = new_config.get("buffer_pattern")
-    if old_pattern != new_pattern:
-        rescan_err = await _sync_index(rager, index_name)
-        if rescan_err is not None:
-            _logger.warning(f"[RAGer] rescan after config update failed: {rescan_err}")
+    # On index creation, scan all existing buffers and backfill them into the new index.
+    rescan_err = await _sync_index(rager, index_name)
+    if rescan_err is not None:
+        _logger.warning(f"[RAGer] rescan after config update failed: {rescan_err}")
+
+    # Retrieve the live index from memory for the flush.
+    index = rager._rag_indexes.get(index_name)
+    if index is None:
+        _logger.error(f"[RAGer] RAGIndex '{index_name}' is not active")
+        return
+
+    # Persist the live index to disk; a no-op config touch safely triggers a flush.
+    flush_result = _flush_index(rager, index)
+    if not flush_result.get("ok"):
+        _logger.warning(f"[RAGer] index flush failed: {flush_result.get('error')}")
 
 
 async def _after_drop_config(
@@ -1347,16 +1401,26 @@ async def _after_drop_config(
     buffer_pattern = rag_index.config.get("buffer_pattern", "")
 
     # Deregister the hooks registered for this index's buffer_pattern.
+    # remove_from_existing=True is required to also remove the hooks from all
+    # buffers that already have them attached (not just prevent new registrations).
     if buffer_pattern:
         rager.unregister_buffer_pattern_hook(
             HookPoint.AFTER_UPDATE_BUFFER,
             f"rager_after_update_buffer_{index_name}",
             buffer_pattern,
+            remove_from_existing=True,
+        )
+        rager.unregister_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            f"rager_after_create_buffer_{index_name}",
+            buffer_pattern,
+            remove_from_existing=True,
         )
         rager.unregister_buffer_pattern_hook(
             HookPoint.AFTER_DROP_BUFFER,
             f"rager_after_drop_buffer_{index_name}",
             buffer_pattern,
+            remove_from_existing=True,
         )
 
     # Destroy the index files and side-indexes, then remove from live memory.
@@ -1433,7 +1497,7 @@ async def _after_update_query(
 
     # Only pre-populate results if timing is eager.
     timing = query_dict.get("timing", "lazy")
-    kind = query_dict.get("kind", "one-shot")
+    mode = query_dict.get("mode", "snapshot")
     if timing != "eager":
         # Ensure, the query buffer is not in the eager view list.
         rag_index.eager_views.discard(query_buffer_name)
@@ -1448,9 +1512,10 @@ async def _after_update_query(
 
         return
 
-    # If the eager query is a view, it belongs into the eager view list.
-    if kind == "view" and query_buffer_name not in rag_index.eager_views:
-        rag_index.eager_views.append(query_buffer_name)
+    # If the eager query is a view, add it to the eager view set.
+    # set.add is idempotent -- no need to guard for duplicates.
+    if mode == "view":
+        rag_index.eager_views.add(query_buffer_name)
 
     # An update of an eager query forces to create fresh results.
     query_result = _get_results_for_query(rager, rag_index, query_buffer_name)
@@ -1562,9 +1627,11 @@ def _make_after_update_buffer(
             if current_results and len(current_results) >= k and new_distance > current_results[-1]["distance"]:
                 continue
 
+            # Remove any stale entry for this buffer first so it is replaced, not duplicated.
+            current_results = [r for r in current_results if r["buffer"] != new_buffer.name]
+
             # Insert the new element in sorted order and drop the last (worst) entry.
-            # Append the new candidate and re-sort to maintain ascending distance order.
-            current_results.append({"buffer": new_buffer.name, "distance": new_distance})
+            current_results.append({"buffer": new_buffer.name, "distance": _format_distance(new_distance)})
             current_results.sort(key=lambda r: r["distance"])
 
             # Drop the last (worst) entry only if the list exceeds k results.
@@ -1676,14 +1743,14 @@ async def _before_read_result(
 
     # For lazy view, return None and let the after-read hook freshen results.
     timing = query_dict.get("timing", "lazy")
-    kind = query_dict.get("kind", "one-shot")
+    mode = query_dict.get("mode", "snapshot")
 
     # The result is never updated lazyily, when the query is in eager mode.
     if timing == "eager":
         return
 
-    # In lazy one-shot mode, we only update, when the buffer is empty.
-    if not buffer.empty() and kind == "one-shot":
+    # In lazy snapshot mode, we only update, when the buffer is empty.
+    if not buffer.empty() and mode == "snapshot":
         return
 
     # Derive the query buffer name from the result buffer name.
