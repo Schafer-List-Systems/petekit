@@ -74,7 +74,8 @@ This is useful for system-wide context that should always be present.
   }},
   "fire_on_empty_input": false,
   "max_chars": 1000,
-  "action": "<rag:memory:result:recent>"
+  "action": "<rag:memory:result:recent>",
+  "action_config": {{}}
 }}
 ```
 
@@ -86,6 +87,9 @@ This is useful for system-wide context that should always be present.
   matched. Default is false (skip silently).
 - `max_chars` -- maximum characters to inject. If omitted, defaults to 1000.
 - `action` -- what to inject. See below.
+- `action_config` -- arbitrary dict passed to the action or custom function.
+  Use it to provide action-specific parameters (e.g. query constraints,
+  target identifiers, or any domain-specific context). Defaults to `{{}}`.
 
 ### How to Write the Action
 
@@ -107,13 +111,15 @@ buffer. The buffer is read fresh at every message.
 ```
 
 Example: `!memory_recent` injects the three most recent memory entries.
-Ask the system what built-in actions are available.
+Built-in actions receive `(message_dict, action_config)` -- the same
+interface as custom functions. Ask the system what built-in actions are
+available.
 
 **Custom function** -- the bare function name as the action string.
-The function is looked up in the function manager. It receives a copy
-of the message as a dict. It must return a string, which is injected as
-a new content part. You cannot alter existing content parts -- you can
-only add to the message.
+The function is looked up in the function manager. It receives two
+arguments: a copy of the message as a dict, and the `action_config`
+dict from the config buffer. It must return a string, which is injected
+directly into the message.
 
 ### Enable or Disable a Whisperer at Runtime
 
@@ -240,53 +246,6 @@ def _augment_message(
         last_relevant._json_dict["text"] += f"\n\n{overflow_hint}"
 
 
-def _get_function_whisperer_hook(
-    agent_whisperer: AgentWhisperer,
-    config: dict[str, Any],
-) -> WhispererHook | str:
-    """Build a WhispererHook from a custom function in the config.
-
-    The action string is the bare function name.
-    The function receives a copy of the message dict and returns a string.
-    """
-    # The action string is the bare function name.
-    action_str: str = config["action"]
-
-    # Look up the registered function.
-    result = agent_whisperer.get_function(action_str)
-    if not result["ok"]:
-        return f"function '{action_str}' is not registered"
-
-    func = result["callable"]
-
-    async def _function_hook(
-        agt: AgentWhisperer,
-        session: Session,
-        message: Message,
-    ) -> None:
-        # Build a copy of the message dict for the function to safely inspect.
-        msg_dict = dict(message.raw_dict)
-
-        # Call the function with the message copy -- it returns a string.
-        fn_result = func(msg_dict)
-        if asyncio.iscoroutine(fn_result):
-            fn_result = await fn_result
-
-        # The function must return a string; None means skip silently.
-        if not isinstance(fn_result, str) or not fn_result:
-            return
-        txt = fn_result
-
-        _augment_message(
-            message,
-            txt,
-            f"whisper function {action_str}",
-            config
-        )
-
-    return _function_hook
-
-
 def _get_buffer_whisperer_hook(
     agent_whisperer: AgentWhisperer,
     config: dict[str, Any],
@@ -327,6 +286,56 @@ def _get_buffer_whisperer_hook(
     return _buffer_hook
 
 
+def _get_function_whisperer_hook(
+    agent_whisperer: AgentWhisperer,
+    config: dict[str, Any],
+) -> WhispererHook | str:
+    """Build a WhispererHook from a custom function in the config.
+
+    The action string is the bare function name.
+    The function receives a copy of the message dict and returns a string.
+    """
+    # The action string is the bare function name.
+    action_str: str = config["action"]
+
+    # Look up the registered function.
+    result = agent_whisperer.get_function(action_str)
+    if not result["ok"]:
+        return f"function '{action_str}' is not registered"
+
+    func = result["callable"]
+
+    async def _function_hook(
+        agt: AgentWhisperer,
+        session: Session,
+        message: Message,
+    ) -> None:
+        # Build a copy of the message dict for the function to safely inspect.
+        msg_dict = dict(message.raw_dict)
+
+        # Read the action_config from the config; default to empty dict.
+        action_config = config.get("action_config", {})
+
+        # Call the function with the message copy and action_config -- it returns a string.
+        fn_result = func(msg_dict, action_config)
+        if asyncio.iscoroutine(fn_result):
+            fn_result = await fn_result
+
+        # The function must return a string; None means skip silently.
+        if not isinstance(fn_result, str) or not fn_result:
+            return
+        txt = fn_result
+
+        _augment_message(
+            message,
+            txt,
+            f"whisper function {action_str}",
+            config
+        )
+
+    return _function_hook
+
+
 def _get_built_in_whisperer_hook(
     agent_whisperer: AgentWhisperer,
     config: dict[str, Any],
@@ -354,8 +363,11 @@ def _get_built_in_whisperer_hook(
         # Build a copy of the message dict for the built-in to safely inspect.
         msg_dict = dict(message.raw_dict)
 
-        # Call the built-in action with the message dict -- it returns a string.
-        bn_result = action_fn(msg_dict)
+        # Read the action_config from the config; default to empty dict.
+        action_config = config.get("action_config", {})
+
+        # Call the built-in action with the message dict and action_config -- it returns a string.
+        bn_result = action_fn(msg_dict, action_config)
         if asyncio.iscoroutine(bn_result):
             bn_result = await bn_result
 
@@ -413,6 +425,7 @@ async def _handle_matching_whisperer(
     if allowed_roles and message.role not in allowed_roles:
         return
 
+    # Resolve the action name to a callable that injects a hint into the message.
     action = _get_whisperer_hook(agent_whisperer, config)
 
     # Resolve the WhispererHook from the config -- returns a hook or an error string.
