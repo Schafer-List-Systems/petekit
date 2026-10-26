@@ -25,7 +25,7 @@ from petekit.image import (
 )
 from petekit.reflection import SelfReflector
 from petekit.function import FunctionCaller, FunctionCompiler, FunctionManager, MCPClient
-from petekit.productivity import AgentWhisperer, IMAPer, Mailer, RAGer
+from petekit.productivity import AgentWhisperer, IMAPer, Mailer, RAGer, WhisperRAGer
 
 __all__ = [
     "AgentWhisperer",
@@ -56,4 +56,5 @@ __all__ = [
     "Mailer",
     "RAGer",
     "MCPClient",
+    "WhisperRAGer",
 ]
