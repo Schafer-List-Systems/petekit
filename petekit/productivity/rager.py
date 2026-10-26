@@ -144,7 +144,7 @@ configuration buffer is:
 - `embedding.via`   --  required; `"api"` for HTTP or `"mcp"` for MCP server
 - `embedding.url`   --  required when `via` is `"api"`; the HTTP endpoint URL
 - `embedding.model` --  required; the model name for the embedder
-- `query_args`      --  optional; default parameters for every query
+- `query_args`      --  optional; default parameters for every query (see the Queries section)
 
 ### Index Registration
 
@@ -188,18 +188,27 @@ Create a query buffer to define what to search for:
 ```json
 {{
   "search": "<search string>",
-  "limit": 10,
-  "timing": "lazy",
-  "mode": "snapshot",
-  "query_args": {{}}
+  "query_args": {{
+    "limit": 10,
+    "threshold": null,
+    "timing": "lazy",
+    "mode": "snapshot"
+  }}
 }}
 ```
 
 - `search`  --  the search string
-- `limit`   --  optional; cap the number of results (default from config)
-- `timing`  --  `eager` or `lazy` (default `lazy`); when the search is executed
-- `mode`    --  `snapshot` or `view` (default `snapshot`); whether the result is permanent or ongoing
-- `query_args`  --  optional; override default query_args from the index config
+- `query_args`  --  optional; override index config defaults for this query
+
+### Query Arguments
+
+The `query_args` block holds overridable defaults. If omitted in a specific query buffer,
+the values from the index config's `query_args` are used instead.
+
+- `limit`     --  optional; cap the number of results (default from config)
+- `threshold` --  optional; maximum distance to include a result (default Infinity)
+- `timing`   --  optional; `eager` or `lazy` (default `lazy`)
+- `mode`     --  optional; `snapshot` or `view` (default `snapshot`)
 
 ### Query Modes
 
@@ -462,7 +471,7 @@ def _get_results_for_query(
         return {"ok": False, "error": "query buffer has no 'search' field"}
 
     # Extract the result limit from the query data with config as fallback.
-    k = query_data.get("k", config.get("query_args", {}).get("k", _RAGER_DEFAULT_K))
+    limit = query_data.get("limit", config.get("query_args", {}).get("limit", _RAGER_DEFAULT_K))
 
     # Embed the search string into a query vector.
     embed_result = _embed(rager, rag_index, search)
@@ -470,8 +479,18 @@ def _get_results_for_query(
         return {"ok": False, "error": embed_result["error"]}
     query_vector = embed_result["vector"]
 
-    # Query the index with the query vector.
-    return _query_index(rager, rag_index, query_vector, k)
+    # Query the index with the query vector and keep the result.
+    query_result = _query_index(rager, rag_index, query_vector, limit)
+    if not query_result["ok"]:
+        return query_result
+
+    # Filter out results whose distance exceeds the threshold.
+    threshold = query_data.get("threshold", float("inf"))
+    if threshold < float("inf"):
+        results = [r for r in query_result["results"] if r["distance"] <= threshold]
+        query_result["results"] = results
+
+    return query_result
 
 
 def _refresh_result(
@@ -899,9 +918,9 @@ def _query_index(
     rager: RAGer,
     rag_index: RAGIndex,
     query_vector: list[float],
-    k: int,
+    limit: int,
 ) -> dict[str, Any]:
-    """Search the index for the k nearest neighbours of the query vector.
+    """Search the index for the limit nearest neighbours of the query vector.
 
     Returns {"ok": True, "results": [...]} sorted by distance.
     Returns {"ok": False, "error": ...} on query failure.
@@ -910,7 +929,7 @@ def _query_index(
     # Re-raise on search failure -- caller decides how to handle it.
     try:
         vec = np.array([query_vector], dtype=np.float32)
-        distances, faiss_ids = rag_index.index.search(vec, k)
+        distances, faiss_ids = rag_index.index.search(vec, limit)
     except Exception as e:
         _logger.error(f"[RAGer] failed to search index '{rag_index.name}': {e}")
         raise
@@ -1568,6 +1587,13 @@ async def _before_update_query(
             f"{_RAGER_SCOPE}:{new_buffer.name}"
         )
 
+    # Validate that 'search' is a string.
+    if not isinstance(query_data["search"], str):
+        return (
+            f"'search' must be a string, got {type(query_data['search']).__name__}: "
+            f"{_RAGER_SCOPE}:{new_buffer.name}"
+        )
+
     return None
 
 
@@ -1724,8 +1750,11 @@ def _make_after_update_buffer(
             # Compare the new distance with results to find out, if it is a new candidate.
             # Results are sorted ascending by distance; the last entry is the worst.
             # Skip if the result list is full and the new distance does not beat the current worst result.
-            k = query_dict.get("k", _RAGER_DEFAULT_K)
-            if current_results and len(current_results) >= k and new_distance > current_results[-1]["distance"]:
+            threshold = query_dict.get("threshold", float("inf"))
+            if threshold < float("inf") and new_distance > threshold:
+                continue
+            limit = query_dict.get("limit", _RAGER_DEFAULT_K)
+            if current_results and len(current_results) >= limit and new_distance > current_results[-1]["distance"]:
                 continue
 
             # Remove any stale entry for this buffer first so it is replaced, not duplicated.
@@ -1735,8 +1764,8 @@ def _make_after_update_buffer(
             current_results.append({"buffer": new_buffer.name, "distance": _format_distance(new_distance)})
             current_results.sort(key=lambda r: r["distance"])
 
-            # Drop the last (worst) entry only if the list exceeds k results.
-            if len(current_results) > k:
+            # Drop the last (worst) entry only if the list exceeds limit results.
+            if len(current_results) > limit:
                 current_results.pop()
 
             # Persist the updated results back into the result buffer.
