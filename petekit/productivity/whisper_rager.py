@@ -17,8 +17,8 @@ _logger = logging.getLogger("whisperer_rager")
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
-_WHISPERER_RAGER_SCOPE = "whisperer_rager"
-_WHISPERER_RAGER_DOC_BUFFER = "doc:whisperer_rager"
+_WHISPERER_RAGER_SCOPE = "whisper_rager"
+_WHISPERER_RAGER_DOC_BUFFER = "doc:whisper_rager"
 _QUERY_RAG_NAME = "query_rag"
 
 _WHISPERER_RAGER_DOC = f"""\
