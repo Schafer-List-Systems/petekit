@@ -105,6 +105,8 @@ _RAGER_INDEX_FILE = "index.faiss"
 _RAGER_INDEX_CONFIG_FILE = "index.json"
 _RAGER_DEFAULT_QUERY_MODE = "snapshot"
 _RAGER_DEFAULT_K = 10
+_RAGER_DEFAULT_TIMING = "eager"
+_RAGER_DEFAULT_THRESHOLD = float("inf")
 _RAGER_EMBED_TIMEOUT = 15
 
 _RAGER_DOC = f"""\
@@ -424,11 +426,22 @@ def _get_query_dict(
         _logger.error(f"[RAGer] config for index '{index_name}' not found")
         return None
 
-    # Build the final query dict from config defaults, overridden by the buffer.
-    # Copy the config's query_args to avoid mutating the shared config object.
-    default_args = config.get("query_args", {}).copy()
-    default_args.update(query_data)
-    return default_args
+    # Get the config's query_args as the base defaults.
+    config_args = config.get("query_args", {}).copy()
+
+    # Override with the query buffer's own query_args.
+    config_args.update(query_data.get("query_args", {}))
+
+    # Splice the merged query_args back into the query buffer's full dict.
+    query_data["query_args"] = config_args
+
+    # Consolidate defaults centrally -- ensure all four fields are always present.
+    config_args.setdefault("limit", _RAGER_DEFAULT_K)
+    config_args.setdefault("threshold", _RAGER_DEFAULT_THRESHOLD)
+    config_args.setdefault("timing", _RAGER_DEFAULT_TIMING)
+    config_args.setdefault("mode", _RAGER_DEFAULT_QUERY_MODE)
+
+    return query_data
 
 
 def _get_results_for_query(
@@ -438,40 +451,23 @@ def _get_results_for_query(
 ) -> dict[str, Any]:
     """Read a query buffer and return the search results without storing them.
 
-    Parses the query buffer as JSON if possible, otherwise uses the raw text.
-    Falls back to config for missing arguments like k.
-
+    Uses _get_query_dict to parse the buffer and fill defaults.
     Returns {"ok": True, "results": [...]} on success.
     Returns {"ok": False, "error": ...} on failure.
     """
-    # Load the index config from the config buffer.
-    index_name = rag_index.name
-    config = _get_index_config(rager, index_name)
-    if config is None:
-        return {"ok": False, "error": f"config buffer for '{index_name}' not found"}
+    # Delegate parsing and default filling to the dedicated helper.
+    query_dict = _get_query_dict(rager, query_buffer_name)
+    if query_dict is None:
+        return {"ok": False, "error": f"query buffer '{query_buffer_name}' not found or index config absent"}
 
-    # Locate and read the query buffer.
-    query_buffer = rager.get_buffer(query_buffer_name)
-    if query_buffer is None:
-        return {"ok": False, "error": f"query buffer '{query_buffer_name}' not found"}
-
-    query_text = query_buffer.get_text() or ""
-    if not query_text:
-        return {"ok": False, "error": "query buffer is empty"}
-
-    # Attempt to parse the query buffer as JSON; fall back to raw text.
-    try:
-        query_data = json.loads(query_text)
-    except json.JSONDecodeError:
-        query_data = {"search": query_text}
-
-    # Extract the search string from the query data.
-    search = query_data.get("search", query_text)
+    # Extract the search string; it must be present.
+    search = query_dict.get("search", "")
     if not search:
         return {"ok": False, "error": "query buffer has no 'search' field"}
 
-    # Extract the result limit from the query data with config as fallback.
-    limit = query_data.get("limit", config.get("query_args", {}).get("limit", _RAGER_DEFAULT_K))
+    # Read limit and threshold from the pre-filled query_args.
+    limit = query_dict["query_args"]["limit"]
+    threshold = query_dict["query_args"]["threshold"]
 
     # Embed the search string into a query vector.
     embed_result = _embed(rager, rag_index, search)
@@ -485,7 +481,6 @@ def _get_results_for_query(
         return query_result
 
     # Filter out results whose distance exceeds the threshold.
-    threshold = query_data.get("threshold", float("inf"))
     if threshold < float("inf"):
         results = [r for r in query_result["results"] if r["distance"] <= threshold]
         query_result["results"] = results
@@ -1623,8 +1618,8 @@ async def _after_update_query(
         return
 
     # Only pre-populate results if timing is eager.
-    timing = query_dict.get("timing", "lazy")
-    mode = query_dict.get("mode", "snapshot")
+    timing = query_dict["query_args"]["timing"]
+    mode = query_dict["query_args"]["mode"]
     if timing != "eager":
         # Ensure, the query buffer is not in the eager view list.
         rag_index.eager_views.discard(query_buffer_name)
@@ -1750,10 +1745,10 @@ def _make_after_update_buffer(
             # Compare the new distance with results to find out, if it is a new candidate.
             # Results are sorted ascending by distance; the last entry is the worst.
             # Skip if the result list is full and the new distance does not beat the current worst result.
-            threshold = query_dict.get("threshold", float("inf"))
+            threshold = query_dict["query_args"]["hreshold"]
             if threshold < float("inf") and new_distance > threshold:
                 continue
-            limit = query_dict.get("limit", _RAGER_DEFAULT_K)
+            limit = query_dict["query_args"]["limit"]
             if current_results and len(current_results) >= limit and new_distance > current_results[-1]["distance"]:
                 continue
 
@@ -1872,8 +1867,8 @@ async def _before_read_result(
         return f"failed to load query for '{query_buffer_name}'"
 
     # For lazy view, return None and let the after-read hook freshen results.
-    timing = query_dict.get("timing", "lazy")
-    mode = query_dict.get("mode", "snapshot")
+    timing = query_dict["query_args"]["timing"]
+    mode = query_dict["query_args"]["mode"]
 
     # The result is never updated lazyily, when the query is in eager mode.
     if timing == "eager":
