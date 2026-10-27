@@ -4,6 +4,7 @@ import functools
 import inspect
 import json
 import logging
+import datetime
 import time
 from typing import Any
 from typing import Callable
@@ -195,21 +196,17 @@ def _make_notify_hook_for_update(
             return
 
         # Extract the `!notify` reaction config from the parsed JSON.
-        reaction_config = config.get("!notify")
-        if reaction_config is None:
-            _logger.error(f"[notify_hook_for_update] '!notify' key not found in option buffer '{option_buffer.name}'")
-            return
-
-        # Reject if `!notify` is present but not a dictionary.
+        reaction_config = config.get("!notify", {})
         if not isinstance(reaction_config, dict):
             _logger.error(f"[notify_hook_for_update] '!notify' in '{option_buffer.name}' must be a dict -- got {type(reaction_config).__name__}")
             return
 
-        # Extract the prompt -- this is required.
+        # Extract the prompt -- use a default hint if absent.
         prompt = reaction_config.get("prompt")
         if not prompt:
-            _logger.error(f"[notify_hook_for_update] 'prompt' not found in '!notify' config of '{option_buffer.name}'")
-            return
+            origin = _origin_name_from_option_buffer_name(option_buffer.name)
+            now = datetime.datetime.now()
+            prompt = f"buffer hook fired for [{origin}] at {now.strftime('%Y-%m-%d %H:%M:%S')}"
 
         # Use the configured persistent_thread_id, or None if absent.
         persistent_thread_id = reaction_config.get("persistent_thread_id")
@@ -243,21 +240,17 @@ def _make_notify_hook_for_create_or_drop(
             return
 
         # Extract the `!notify` reaction config from the parsed JSON.
-        reaction_config = config.get("!notify")
-        if reaction_config is None:
-            _logger.error(f"[notify_hook_for_create_or_drop] '!notify' key not found in option buffer '{option_buffer.name}'")
-            return
-
-        # Reject if `!notify` is present but not a dictionary.
+        reaction_config = config.get("!notify", {})
         if not isinstance(reaction_config, dict):
             _logger.error(f"[notify_hook_for_create_or_drop] '!notify' in '{option_buffer.name}' must be a dict -- got {type(reaction_config).__name__}")
             return
 
-        # Extract the prompt -- this is required.
+        # Extract the prompt -- use a default hint if absent.
         prompt = reaction_config.get("prompt")
         if not prompt:
-            _logger.error(f"[notify_hook_for_create_or_drop] 'prompt' not found in '!notify' config of '{option_buffer.name}'")
-            return
+            origin = _origin_name_from_option_buffer_name(option_buffer.name)
+            now = datetime.datetime.now()
+            prompt = f"buffer hook fired for [{origin}] at {now.strftime('%Y-%m-%d %H:%M:%S')}"
 
         # Use the configured persistent_thread_id, or None if absent.
         persistent_thread_id = reaction_config.get("persistent_thread_id")
