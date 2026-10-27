@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 from dataclasses import dataclass
 from typing import Any
+
+from croniter.croniter import croniter
 
 from peteos.oap.agentic_object import AgenticObject
 
@@ -62,12 +65,22 @@ fires daily at that time:
 ```
 
 `schedule`  --  Crontab-style field matching. Fire when the current datetime matches
-all specified fields. Use `*` as wildcard for "any". Fields: `second`, `minute`,
-`hour`, `day`, `month`, `weekday`:
+all specified fields. **All six fields are required**: `second`, `minute`, `hour`,
+`day`, `month`, `weekday`. Each supports: a plain value, `*` (any), `1,3,5` (list),
+`1-5` (range), `*/5` (step). `weekday 0 = Sunday`.
 
 ```json
-{{"action": "!read", "second": 0, "minute": 0, "hour": 9, "weekday": 1}}
+{{"action": "!read", "second": 0, "minute": 0, "hour": 9, "day": "*", "month": "*", "weekday": 1}}
 ```
+
+Examples:
+- `second: 0, minute: 5`  --  every hour at minute 5, second 0
+- `minute: "*/5"`  --  every 5 minutes
+- `minute: "1,3,5"`  --  at minute 1, 3, and 5
+- `hour: "1-5"`  --  between hours 1 and 5 (inclusive)
+- `weekday: 0`  --  Sunday only
+- `weekday: 1`  --  Monday only
+- `minute: 0, hour: "9-17", weekday: "1-5"`  --  weekdays 9am-5pm, on the hour
 
 ### Built-In Actions
 
@@ -127,6 +140,92 @@ class _Schedule:
 # -------------------------------------------------------------------------------------------------------------------- #
 # Utils                                                                                                             #
 # -------------------------------------------------------------------------------------------------------------------- #
+
+
+def _get_timer_timeout(
+    config: dict[str, Any],
+) -> float | str:
+    """Extract the timer interval from the config.
+
+    Returns the interval in seconds on success, or an error string if
+    the value is absent or not a positive number.
+    """
+    # Read the interval from the config.
+    interval = config.get("timer", None)
+
+    # Guard against a missing interval.
+    if interval is None:
+        return "[Croner] timer interval is missing from config"
+
+    # Guard against a non-numeric or non-positive value.
+    if not isinstance(interval, (int, float)) or interval <= 0:
+        return f"[Croner] timer interval must be a positive number, got {interval!r}"
+
+    # Return the interval as a float.
+    return float(interval)
+
+
+def _get_alarm_timeout(
+    config: dict[str, Any],
+    origin: str,
+) -> float | str:
+    """Compute the timeout in seconds until the next alarm fires.
+
+    Reads the time field from the config, combines it with today's date,
+    and returns the positive difference in seconds. Returns an error
+    string on failure.
+    """
+    # Parse the wall-clock time from the alarm config.
+    time_str = config.get("time", "")
+    try:
+        fire_time = datetime.datetime.strptime(time_str, "%H:%M:%S").time()
+    except ValueError:
+        return f"[Croner] invalid time format in [alarm] for {origin}"
+
+    # Compute the target datetime by combining today with the fire time.
+    now = datetime.datetime.now()
+    target = datetime.datetime.combine(now.date(), fire_time)
+
+    # Compute the timeout as the difference from now to the target.
+    timeout = (target - now).total_seconds()
+    if timeout < 0:
+        timeout += 86400
+
+    return timeout
+
+
+def _get_schedule_timeout(
+    config: dict[str, Any],
+    origin: str,
+) -> float | str:
+    """Compute the timeout in seconds until the next scheduled fire.
+
+    Assembles the crontab fields into an expression, runs it through croniter,
+    and returns the interval in seconds until the next match. Returns an
+    error string on failure.
+    """
+    # Assemble the six crontab fields into a cron expression string for croniter.
+    # Each field is required -- a missing field is a config error, not a silent default.
+    fields = (
+        config.get("second"),
+        config.get("minute"),
+        config.get("hour"),
+        config.get("day"),
+        config.get("month"),
+        config.get("weekday"),
+    )
+    if None in fields:
+        return f"[Croner] schedule config for {origin} is missing one or more required fields (second, minute, hour, day, month, weekday)"
+    cron_expr = " ".join(str(f) for f in fields)
+
+    # Use croniter to find the next occurrence from now and compute the timeout.
+    try:
+        cron = croniter(cron_expr, start_time=datetime.datetime.now(), second_at_beginning=True)
+        next_fire = cron.get_next(datetime.datetime)
+    except Exception as e:
+        return f"[Croner] cannot parse or resolve schedule for {origin}  --  {e}"
+
+    return (next_fire - datetime.datetime.now()).total_seconds()
 
 
 def _read_option_buffer_config(croner: Croner, option_buffer_name: str) -> dict[str, Any] | None:
@@ -232,116 +331,94 @@ async def _wait_for(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None:
             job.task = None
 
 
-def _rearm_timer(croner: Croner, job: _Timer) -> None:
+def _rearm_timer(
+    croner: Croner,
+    job: _Timer,
+) -> str | None:
     """Rearm the timer task from the job object.
 
     Reads the [timer] config, sets the timeout on the job, and starts a new task.
+    Returns an error string on failure, None on success.
     """
     # Read and parse the [timer] config, then abort if unavailable.
     config = _read_option_buffer_config(croner, f"{job.origin}[timer]")
     if config is None:
-        return
+        return "[Croner] timer config not found"
+
+    # Delegate the interval extraction to the dedicated helper.
+    interval_or_error = _get_timer_timeout(config)
+    if not isinstance(interval_or_error, float):
+        return interval_or_error
 
     # Assign the interval timeout and schedule the event loop as a new task.
-    job.timeout = config.get("timer", 0)
+    job.timeout = interval_or_error
     job.task = asyncio.create_task(_wait_for(croner, job))
 
 
-def _rearm_alarm(croner: Croner, job: _Alarm) -> None:
+def _rearm_alarm(
+    croner: Croner,
+    job: _Alarm,
+) -> str | None:
     """Rearm the alarm task from the job object.
 
     Reads the [alarm] config, computes the timeout until the next fire time, and
-    starts a new asyncio task.
+    starts a new asyncio task. Returns an error string on failure, None on success.
     """
     # Read and parse the [alarm] config, then abort if unavailable.
     config = _read_option_buffer_config(croner, f"{job.origin}[alarm]")
     if config is None:
-        return
+        return "[Croner] alarm config not found"
 
-    # Parse the wall-clock time from the alarm config.
-    time_str = config.get("time", "")
-    try:
-        import datetime
-        fire_time = datetime.datetime.strptime(time_str, "%H:%M:%S").time()
-    except ValueError:
-        _logger.error(f"[Croner] invalid time format in [alarm] for {job.origin}  --  discarding rearm")
-        return
-
-    # Compute the target datetime by combining today with the fire time.
-    now = datetime.datetime.now()
-    target = datetime.datetime.combine(now.date(), fire_time)
-
-    # Compute the timeout as the difference from now to the target.
-    timeout = (target - now).total_seconds()
-    if timeout < 0:
-        timeout += 86400
+    # Delegate the timeout computation to the dedicated helper.
+    timeout_or_error = _get_alarm_timeout(config, job.origin)
+    if not isinstance(timeout_or_error, float):
+        return timeout_or_error
 
     # Assign the timeout and schedule the event loop as a new task.
-    job.timeout = timeout
+    job.timeout = timeout_or_error
     job.task = asyncio.create_task(_wait_for(croner, job))
 
 
-def _rearm_schedule(croner: Croner, job: _Schedule) -> None:
+def _rearm_schedule(
+    croner: Croner,
+    job: _Schedule,
+) -> str | None:
     """Rearm the schedule task from the job object.
 
     Reads the [schedule] config, computes the timeout until the next fire time, and
-    starts a new asyncio task.
+    starts a new asyncio task. Returns an error string on failure, None on success.
     """
     # Read and parse the [schedule] config, then abort if unavailable.
     config = _read_option_buffer_config(croner, f"{job.origin}[schedule]")
     if config is None:
-        return
+        return "[Croner] schedule config not found"
 
-    # Assemble the six crontab fields into a cron expression string for croniter.
-    fields = (
-        config.get("second", "*"),
-        config.get("minute", "*"),
-        config.get("hour", "*"),
-        config.get("day", "*"),
-        config.get("month", "*"),
-        config.get("weekday", "*"),
-    )
-    cron_expr = " ".join(str(f) for f in fields)
-
-    # Use croniter to find the next occurrence from now and compute the timeout.
-    import datetime
-    from croniter import Croniter
-    try:
-        cron = Croniter(cron_expr, date=datetime.datetime.now())
-        next_fire = cron.get_next(datetime.datetime)
-    except Exception:
-        _logger.error(f"[Croner] cannot parse or resolve schedule for {job.origin}  --  discarding rearm")
-        return
+    # Delegate the timeout computation to the dedicated helper.
+    timeout_or_error = _get_schedule_timeout(config, job.origin)
+    if not isinstance(timeout_or_error, float):
+        return timeout_or_error
 
     # Assign the timeout and schedule the event loop as a new task.
-    job.timeout = (next_fire - datetime.datetime.now()).total_seconds()
+    job.timeout = timeout_or_error
     job.task = asyncio.create_task(_wait_for(croner, job))
 
 
-def _dispatch_rearm(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None:
+def _dispatch_rearm(
+    croner: Croner,
+    job: _Timer | _Alarm | _Schedule,
+) -> str | None:
     """Dispatch to the correct rearm function based on the job type.
 
     Cancels any already-running task and replaces it with a fresh one.
+    Returns an error string if the rearm failed, None on success.
     """
-    # Determine the event type string for the log message.
+    # Route to the correct rearm function and return any error.
     if isinstance(job, _Timer):
-        event_type = "timer"
-    elif isinstance(job, _Alarm):
-        event_type = "alarm"
+        return _rearm_timer(croner, job)
+    if isinstance(job, _Alarm):
+        return _rearm_alarm(croner, job)
     else:
-        event_type = "schedule"
-
-    # Cancel any already-running task so a reconfiguration can take over.
-    if job.task is not None:
-        job.task.cancel()
-
-    # Route to the correct rearm function with the job object.
-    if isinstance(job, _Timer):
-        _rearm_timer(croner, job)
-    elif isinstance(job, _Alarm):
-        _rearm_alarm(croner, job)
-    else:
-        _rearm_schedule(croner, job)
+        return _rearm_schedule(croner, job)
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -379,9 +456,10 @@ def _before_update_timer(
     if not isinstance(job.get("action"), str) or not job["action"]:
         return "action is required and must be a non-empty string"
 
-    # Reject non-positive or non-integer timer value.
-    if not isinstance(job.get("timer"), int) or job["timer"] <= 0:
-        return "timer must be a positive integer"
+    # Validate the timer interval using the dedicated helper.
+    interval_or_error = _get_timer_timeout(job)
+    if not isinstance(interval_or_error, float):
+        return interval_or_error
 
     # Reject non-boolean repeat value.
     if job.get("repeat") is not None and not isinstance(job["repeat"], bool):
@@ -420,9 +498,11 @@ def _before_update_alarm(
     if not isinstance(job.get("action"), str) or not job["action"]:
         return "action is required and must be a non-empty string"
 
-    # Reject missing or non-string time field.
-    if not isinstance(job.get("time"), str):
-        return "alarm requires a time field (HH:MM:SS)"
+    # Validate the alarm time using the dedicated helper.
+    origin = new_buffer.name.removesuffix("[alarm]")
+    timeout_or_error = _get_alarm_timeout(job, origin)
+    if not isinstance(timeout_or_error, float):
+        return timeout_or_error
 
     # Reject non-string date field.
     if job.get("date") is not None and not isinstance(job["date"], str):
@@ -461,19 +541,14 @@ def _before_update_schedule(
     if not isinstance(job.get("action"), str) or not job["action"]:
         return "action is required and must be a non-empty string"
 
-    # Validate each crontab field is '*' or a non-negative integer.
-    valid_fields = {"second", "minute", "hour", "day", "month", "weekday"}
-    for fk, fv in job.items():
-        if fk not in valid_fields:
-            continue
-        if not (isinstance(fv, str) or isinstance(fv, int)):
-            return f"schedule.{fk} must be a string or int"
-        if isinstance(fv, str) and fv != "*":
-            return f"schedule.{fk} must be '*' or an integer"
-        if isinstance(fv, int) and fv < 0:
-            return f"schedule.{fk} must be non-negative"
+    # Validate the crontab fields using the dedicated helper.
+    origin = new_buffer.name.removesuffix("[schedule]")
+    timeout_or_error = _get_schedule_timeout(job, origin)
+    if not isinstance(timeout_or_error, float):
+        return timeout_or_error
 
     # Reject any unknown top-level key.
+    valid_fields = {"second", "minute", "hour", "day", "month", "weekday"}
     unknown = {k for k in job if k not in {"action"} and k not in valid_fields}
     if unknown:
         return f"schedule has unknown fields: {', '.join(sorted(unknown))}"
@@ -510,7 +585,9 @@ async def _after_update_timer(
     timer_job.repeat = timer_config.get("repeat", False)
 
     # Rearm the timer job.
-    _dispatch_rearm(croner, timer_job)
+    error = _dispatch_rearm(croner, timer_job)
+    if error:
+        _logger.error(error)
 
 
 async def _after_update_alarm(
@@ -531,7 +608,9 @@ async def _after_update_alarm(
         croner._cron_alarms[origin] = _Alarm(origin=origin)
 
     # Rearm the alarm job.
-    _dispatch_rearm(croner, croner._cron_alarms[origin])
+    error = _dispatch_rearm(croner, croner._cron_alarms[origin])
+    if error:
+        _logger.error(error)
 
 
 async def _after_update_schedule(
@@ -552,7 +631,9 @@ async def _after_update_schedule(
         croner._cron_schedules[origin] = _Schedule(origin=origin)
 
     # Rearm the schedule job.
-    _dispatch_rearm(croner, croner._cron_schedules[origin])
+    error = _dispatch_rearm(croner, croner._cron_schedules[origin])
+    if error:
+        _logger.error(error)
 
 
 async def _after_drop_cron(
