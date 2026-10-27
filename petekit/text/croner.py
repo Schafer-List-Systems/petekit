@@ -6,6 +6,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Any
+from typing import Callable
 
 from croniter.croniter import croniter
 
@@ -57,6 +58,10 @@ to make it a recurring timer:
 {{"action": "!read", "timer": 60, "repeat": true}}
 ```
 
+**Warning** -- timers are not persisted across system restarts. When the system
+restarts, the timer starts fresh from its original duration -- the intended fire
+time is lost. If the exact fire time matters, use `alarm` or `schedule` instead.
+
 `alarm`  --  Wall-clock alarm. The `time` is in 24h format (HH:MM:SS). The alarm
 fires daily at that time:
 
@@ -85,10 +90,40 @@ Examples:
 ### Built-In Actions
 
 The `action` can be the name of a custom function from the FunctionManager,
-or one of the two built-in actions:
+or one of the built-in actions:
 
 - `!read`  --  reads the origin buffer, discarding the result but triggering the read hooks
 - `!touch`  --  writes an empty string to the origin buffer, triggering the update hooks
+- `!notify`  --  delivers a notification to you -- see `!notify` below
+
+#### Built-In Action: !notify
+
+Set `action` to `!notify` and provide the notification text via `action_config`:
+
+```json
+{{
+  "action": "!notify",
+  "action_config": {{
+    "prompt": "the timer has fired",
+    "description": "alerts me when the timer fires"
+  }}
+}}
+```
+
+**What it does** -- delivers the prompt text to you when the trigger fires.
+If `prompt` was not configured, a default hint naming the buffer and the
+current date and time is used instead.
+
+**Configure it** -- `action_config` holds:
+
+- `prompt` -- optional. The notification text delivered to you.
+  If omitted, a default hint is used instead, naming the buffer and the
+  current date and time.
+- `description` -- optional. A hint explaining why this trigger exists.
+- `persistent_thread_id` -- optional. If omitted, the current conversation
+  thread is inferred automatically. Set this only if you know what you
+  are doing -- a thread ID string redirects the notification to that
+  specific conversation instead.
 
 ### Custom Action Signature
 
@@ -106,7 +141,7 @@ Drop the option buffer (`[timer]`, `[alarm]`, or `[schedule]`) to remove the tri
 - The target buffer must exist before the [timer], [alarm], or [schedule] option buffer can be created.
 - Dropping the target buffer automatically drops its option buffers.
 - Exactly one trigger key (`timer`, `alarm`, or `schedule`) is required in the JSON.
-- The `action` must be a function known to the FunctionManager.
+- The `action` must be a function known to the FunctionManager or a built-in action (!notify, !read, !touch).
 """
 
 
@@ -228,6 +263,116 @@ def _get_schedule_timeout(
     return (next_fire - datetime.datetime.now()).total_seconds()
 
 
+def _validate_and_prepare_action_config(
+    config_buffer: Buffer,
+    croner: Croner,
+) -> str | None:
+    """Validate and prepare the action_config from the config buffer.
+
+    Reads the buffer content, parses it as JSON, and for the !notify
+    action injects the current thread ID if persistent_thread_id is absent.
+    For any other action, validates that action_config is a dict if present.
+    Returns None on success or an error string on failure.
+    """
+    # Read the config buffer content fresh.
+    text = config_buffer.get_text()
+    if not text or not text.strip():
+        _logger.error(f"[_validate_and_prepare_action_config] '{config_buffer.name}' is empty")
+        return "config buffer is empty"
+
+    # Parse the JSON content.
+    try:
+        config = json.loads(text)
+    except json.JSONDecodeError as e:
+        _logger.error(f"[_validate_and_prepare_action_config] '{config_buffer.name}' contains malformed JSON: {e}")
+        return f"config buffer is not valid JSON: {e}"
+
+    # Guard against non-dict content.
+    if not isinstance(config, dict):
+        _logger.error(f"[_validate_and_prepare_action_config] '{config_buffer.name}' must be a JSON object")
+        return "config buffer must be a JSON object"
+
+    # Extract the action name to decide how to validate action_config.
+    action = config.get("action")
+
+    # For !notify, inject the current thread ID if absent.
+    if action == "!notify":
+        # Validate that action_config exists and is a dict.
+        action_config = config.get("action_config", {})
+        if not isinstance(action_config, dict):
+            return f"[!notify] action_config must be a dictionary -- got {type(action_config).__name__}"
+
+        # Nothing to do if persistent_thread_id is already set.
+        if "persistent_thread_id" in action_config:
+            return None
+
+        # Resolve the current conversation thread.
+        current_thread_id = croner.get_current_thread_id()
+        if current_thread_id is None:
+            return f"[!notify] cannot determine current thread ID -- update rejected (not inside a running session?)"
+
+        # Inject the resolved thread ID so the notification goes to the current conversation.
+        action_config["persistent_thread_id"] = current_thread_id
+
+        # Patch the buffer text in place before the update commits.
+        patched_text = json.dumps(config, indent=2) + "\n"
+        config_buffer.set_text(patched_text)
+        return None
+
+    # For any other action, validate action_config is a dict if present.
+    action_config = config.get("action_config")
+    if action_config is not None and not isinstance(action_config, dict):
+        return f"[{action}] action_config must be a dictionary -- got {type(action_config).__name__}"
+
+    return None
+
+
+async def _do_notify(
+    croner: Croner,
+    job: _Timer | _Alarm | _Schedule,
+) -> str | None:
+    """Fire the !notify action for the given job.
+
+    Reads the action_config from the job's option buffer, extracts the prompt,
+    resolves the persistent_thread_id, and delivers the notification via
+    the croner. Returns an error string on failure, None on success.
+    """
+    # Determine the config buffer name from the job type.
+    if isinstance(job, _Timer):
+        config_name = f"{job.origin}[timer]"
+    elif isinstance(job, _Alarm):
+        config_name = f"{job.origin}[alarm]"
+    else:
+        config_name = f"{job.origin}[schedule]"
+
+    # Read the config from the option buffer.
+    config = _read_option_buffer_config(croner, config_name)
+    if config is None:
+        return f"[!notify] cannot read config from {config_name}"
+
+    # Extract the action_config.
+    action_config = config.get("action_config")
+    if not isinstance(action_config, dict):
+        return f"[!notify] action_config must be a dictionary -- got {type(action_config).__name__}"
+
+    # Extract the prompt -- use a default hint if absent.
+    prompt = action_config.get("prompt")
+    if not prompt:
+        now = datetime.datetime.now()
+        prompt = f"[{job.origin}] fired at {now.strftime('%Y-%m-%d %H:%M:%S')}"
+
+    # Extract the persistent_thread_id -- may be absent (already injected by the validation helper).
+    persistent_thread_id = action_config.get("persistent_thread_id")
+
+    # Deliver the notification via the croner.
+    try:
+        await croner.notify_agent(prompt, persistent_thread_id=persistent_thread_id)
+    except Exception as e:
+        return f"[!notify] failed to deliver notification: {e}"
+
+    return None
+
+
 def _read_option_buffer_config(croner: Croner, option_buffer_name: str) -> dict[str, Any] | None:
     """Read and parse the JSON config from an option buffer.
 
@@ -291,10 +436,20 @@ async def _fire_action(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None
         # Write an empty string to the origin buffer, triggering update hooks.
         await croner.write_buffer(job.origin, text="")
 
+    elif action == "!notify":
+        # Deliver the notification using the dedicated helper.
+        error = await _do_notify(croner, job)
+        if error:
+            _logger.error(f"[_fire_action] !notify failed for {job.origin}: {error}")
+
     else:
         # Call the custom function with the origin buffer name as the argument.
         await croner.call_function(action, buffer_name=job.origin)
 
+    # Drop one-shot event buffers.
+    if isinstance(job, _Timer) and not job.repeat:
+        await croner.drop_buffer(f"{job.origin}[timer]")
+        
 
 async def _wait_for(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None:
     """The event loop for a timer, alarm, or schedule task.
@@ -316,12 +471,8 @@ async def _wait_for(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None:
         job.timeout = None
         job.task = None
 
-        # Drop one-shot event buffers.
-        if isinstance(job, _Timer) and not job.repeat:
-            await croner.drop_buffer(f"{job.origin}[timer]")
-        
         # Rearm recurring events.
-        else:
+        if not isinstance(job, _Timer) or job.repeat:
             _dispatch_rearm(croner, job)
 
     except asyncio.CancelledError:
@@ -456,6 +607,11 @@ def _before_update_timer(
     if not isinstance(job.get("action"), str) or not job["action"]:
         return "action is required and must be a non-empty string"
 
+    # Validate and prepare the action_config from the buffer.
+    prepare_error = _validate_and_prepare_action_config(new_buffer, croner)
+    if prepare_error:
+        return prepare_error
+
     # Validate the timer interval using the dedicated helper.
     interval_or_error = _get_timer_timeout(job)
     if not isinstance(interval_or_error, float):
@@ -497,6 +653,11 @@ def _before_update_alarm(
     # Reject missing or empty action.
     if not isinstance(job.get("action"), str) or not job["action"]:
         return "action is required and must be a non-empty string"
+
+    # Validate and prepare the action_config from the buffer.
+    prepare_error = _validate_and_prepare_action_config(new_buffer, croner)
+    if prepare_error:
+        return prepare_error
 
     # Validate the alarm time using the dedicated helper.
     origin = new_buffer.name.removesuffix("[alarm]")
@@ -541,6 +702,11 @@ def _before_update_schedule(
     if not isinstance(job.get("action"), str) or not job["action"]:
         return "action is required and must be a non-empty string"
 
+    # Validate and prepare the action_config from the buffer.
+    prepare_error = _validate_and_prepare_action_config(new_buffer, croner)
+    if prepare_error:
+        return prepare_error
+
     # Validate the crontab fields using the dedicated helper.
     origin = new_buffer.name.removesuffix("[schedule]")
     timeout_or_error = _get_schedule_timeout(job, origin)
@@ -548,7 +714,7 @@ def _before_update_schedule(
         return timeout_or_error
 
     # Reject any unknown top-level key.
-    valid_fields = {"second", "minute", "hour", "day", "month", "weekday"}
+    valid_fields = {"second", "minute", "hour", "day", "month", "weekday", "action_config"}
     unknown = {k for k in job if k not in {"action"} and k not in valid_fields}
     if unknown:
         return f"schedule has unknown fields: {', '.join(sorted(unknown))}"
