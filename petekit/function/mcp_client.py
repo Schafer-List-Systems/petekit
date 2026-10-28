@@ -448,7 +448,8 @@ def _make_mcp_tool_callable(
         # and reconnect, then re-raise with instructions.
         try:
             result = await ctx.client.call_tool(tool_name, kwargs)
-        except Exception:
+        except Exception as e:
+            _logger.error(f"[MCP] call_tool '{tool_name}' failed in session '{name}': {e}")
             await _on_session_terminated(mcp_client, name)
             raise RuntimeError(
                 f"MCP session '{name}' terminated. "

@@ -26,7 +26,7 @@ def _call_result_buffer_name(call_id: int) -> str:
     return f"{_CALL_RESULT_BUFFER_NAME_BASE}{call_id}"
 
 
-def _spill_to_buffer(caller, value: Any) -> str:
+async def _spill_to_buffer(caller, value: Any) -> str:
     # Serialize the value to a string for buffering.
     result_text = str(value)
 
@@ -35,7 +35,7 @@ def _spill_to_buffer(caller, value: Any) -> str:
     buf_name = _call_result_buffer_name(call_id)
 
     # Write to the buffer and validate the result.
-    create_result = caller.create_buffer(buf_name, text=result_text)
+    create_result = await caller.create_buffer(buf_name, text=result_text)
     if not isinstance(create_result, dict) or not create_result.get("ok"):
         raise RuntimeError(f"Failed to spill result to {buf_name}: {create_result.get('error')}")
     return buf_name
@@ -85,6 +85,6 @@ class FunctionCaller(FunctionManager, AgenticObject):
         # Spill to a buffer if the serialized result is too large; otherwise return inline.
         result_str = str(result)
         if len(result_str) > BufferManager._MAX_CHUNK_CHARS:
-            buf_name = _spill_to_buffer(self, result)
+            buf_name = await _spill_to_buffer(self, result)
             return {"ok": True, "result_buffer": buf_name}
         return {"ok": True, "result": result}
