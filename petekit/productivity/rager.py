@@ -1589,6 +1589,21 @@ async def _before_update_query(
             f"{_RAGER_SCOPE}:{new_buffer.name}"
         )
 
+    # Validate that 'threshold' in query_args is a non-negative number if present.
+    # Null (JSON null -> Python None) is not a valid value for threshold.
+    if "query_args" in query_data and "threshold" in query_data["query_args"]:
+        threshold = query_data["query_args"]["threshold"]
+        if threshold is not None and not isinstance(threshold, (int, float)):
+            return (
+                f"'threshold' must be a non-negative number, got {type(threshold).__name__}: "
+                f"{_RAGER_SCOPE}:{new_buffer.name}"
+            )
+        if isinstance(threshold, (int, float)) and threshold < 0:
+            return (
+                f"'threshold' must be non-negative, got {threshold}: "
+                f"{_RAGER_SCOPE}:{new_buffer.name}"
+            )
+
     return None
 
 
