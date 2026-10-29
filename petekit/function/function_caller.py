@@ -82,7 +82,7 @@ class FunctionCaller(FunctionManager, AgenticObject):
                 return {"ok": False, "error": f"Missing required argument '{pname}' for '{name}'."}
 
         # Call and await — non-usage exceptions propagate.
-        result = func(**kwargs)
+        result = func(**call_kwargs)
         if inspect.iscoroutine(result):
             result = await result
 
