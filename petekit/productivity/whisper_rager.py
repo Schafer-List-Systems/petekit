@@ -117,7 +117,11 @@ def _make_rag_query_action(
             _logger.error(f"[WhisperRAGer] !{_QUERY_RAG_NAME} failed to read result buffer: {result.get('error', 'unknown')}")
             return None
 
-        return result if isinstance(result, str) else None
+        # Guard against an empty result -- nothing to inject.
+        if not result:
+            return None
+
+        return f"The following buffers could be relevant: {result}"
 
     return _query_rag
 
