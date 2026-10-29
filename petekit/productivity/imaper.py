@@ -305,7 +305,7 @@ def _list_mailbox_emails(
     imap_connection: imapclient.IMAPClient,
     mailbox_name: str,
     filter: dict | None = None,
-) -> dict | None:
+) -> dict | str:
     """Return the list of all emails in a mailbox with ENVELOPE and FLAGS metadata.
 
     If a filter dict is provided, the search is narrowed to match the criteria
@@ -342,9 +342,9 @@ def _list_mailbox_emails(
     # Select the mailbox  --  imapclient handles state management.
     try:
         imap_connection.select_folder(mailbox_name)
-    except imapclient.exceptions.IMAPClientError as e:
+    except Exception as e:
         _logger.error(f"[IMAPer] SELECT failed for {mailbox_name}: {e}")
-        return None
+        return f"[IMAPer] SELECT failed for {mailbox_name}: {e}"
 
     # Build the IMAP search criteria from the filter dict.
     # Each criterion is {"key": "UNSEEN"} or {"key": "FROM", "value": "alice"}.
@@ -371,9 +371,9 @@ def _list_mailbox_emails(
             message_ids = imap_connection.search(imap_criteria)
         else:
             message_ids = imap_connection.search(["ALL"])
-    except imapclient.exceptions.IMAPClientError as e:
+    except Exception as e:
         _logger.error(f"[IMAPer] SEARCH failed for {mailbox_name}: {e}")
-        return None
+        return f"[IMAPer] SEARCH failed for {mailbox_name}: {e}"
 
     # Record the total count of matching emails before pagination slicing.
     total = len(message_ids)
@@ -390,9 +390,9 @@ def _list_mailbox_emails(
     # RFC822 is the full raw message bytes, parsed by the email library.
     try:
         result = imap_connection.fetch(message_ids, ["BODY.PEEK[]", "FLAGS"])
-    except imapclient.exceptions.IMAPClientError as e:
+    except Exception as e:
         _logger.error(f"[IMAPer] FETCH failed for {mailbox_name}: {e}")
-        return None
+        return f"[IMAPer] FETCH failed for {mailbox_name}: {e}"
 
     # Parse each email header with the email library  --  all decoding is automatic.
     emails: list = []
@@ -1219,12 +1219,13 @@ class IMAPer(BufferManager, AgenticObject):
         port: int,
         username: str,
         password: str,
-    ) -> None:
+    ) -> str | None:
         """Establish a new IMAP connection with the given credentials.
 
         Reads the current email:config buffer, overlays the four credential arguments,
         writes the merged result back to email:config as authoritative state.
         Uses imapclient for the IMAP connection with SSL and UID support.
+        Returns None on success, or an error string on failure.
         """
         # Update the config and get the merged result.
         config = await self._update_imap_connection(host, port, username, password)
@@ -1254,7 +1255,7 @@ class IMAPer(BufferManager, AgenticObject):
         except Exception as e:
             _logger.error(f"[IMAPer] connection failed: {e}")
             self._imap_connection = None
-            return
+            return f"[IMAPer] connection failed: {e}"
 
         # Log in and confirm the connection is established.
         try:
@@ -1262,7 +1263,7 @@ class IMAPer(BufferManager, AgenticObject):
         except imapclient.exceptions.IMAPClientError as e:
             _logger.error(f"[IMAPer] login failed: {e}")
             self._imap_connection = None
-            return
+            return f"[IMAPer] login failed: {e}"
 
         _logger.info(f"[IMAPer] connected to {imap_cfg.get('host')}:{imap_cfg.get('port')}")
 
@@ -1272,21 +1273,68 @@ class IMAPer(BufferManager, AgenticObject):
         # fetched lazily on first read via the BEFORE_READ_BUFFER hook.
         await self._refresh_imap_mailbox_list()
 
-    async def _disconnect_imap(self) -> None:
+        return None
+
+    async def _disconnect_imap(self) -> str | None:
         """Close the current IMAP connection if one exists.
 
-        Logs out and sets _imap_connection to None.
+        Logs out and sets _imap_connection to None. Returns None on success
+        or an error string if the logout itself encountered a problem.
         """
         # Bail out early if there is no active connection.
-        if self._imap_connection is not None:
-            try:
-                self._imap_connection.logout()
-            except Exception:
-                # Swallow logout errors  --  the connection may already be dead.
-                pass
-            # Clear the reference to the connection.
+        if self._imap_connection is None:
+            return None
+
+        # Attempt to log out gracefully.
+        try:
+            self._imap_connection.logout()
+        except Exception as e:
+            _logger.error(f"[_disconnect_imap] logout failed: {e}")
             self._imap_connection = None
-            _logger.info("[IMAPer] disconnected")
+            return f"[_disconnect_imap] logout failed: {e}"
+
+        # Clear the reference to the connection.
+        self._imap_connection = None
+        _logger.info("[IMAPer] disconnected")
+        return None
+
+    async def _reconnect_imap(self) -> str | None:
+        """Reconnect using the current config from the email:config buffer.
+
+        Calls disconnect first, then reads the imap config and re-establishes
+        the connection with the stored credentials. Returns None on success
+        or an error string if the connection could not be established.
+        """
+        # Tear down any existing connection.
+        disconnect_error = await self._disconnect_imap()
+        if isinstance(disconnect_error, str):
+            _logger.warning(f"[_reconnect_imap] disconnect had an error but continuing: {disconnect_error}")
+
+        # Read the current config from the buffer.
+        config_buffer = self.get_buffer(_IMAPER_CONFIG_BUFFER)
+        if config_buffer is None:
+            error = f"[_reconnect_imap] '{_IMAPER_CONFIG_BUFFER}' not found"
+            _logger.error(error)
+            return error
+
+        # Extract the imap sub-dict with host, port, username, password.
+        imap_cfg = _get_imap_config(config_buffer)
+        if not imap_cfg:
+            error = f"[_reconnect_imap] no imap config found in '{_IMAPER_CONFIG_BUFFER}'"
+            _logger.error(error)
+            return error
+
+        # Establish a fresh connection with the stored credentials.
+        connect_error = await self._connect_imap(
+            host=imap_cfg.get("host", ""),
+            port=int(imap_cfg.get("port", 993)),
+            username=imap_cfg.get("username", ""),
+            password=imap_cfg.get("password", ""),
+        )
+        if isinstance(connect_error, str):
+            return connect_error
+
+        return None
 
     def _list_imap_mailboxes(self) -> dict[str, str | list[list[str]]] | None:
         """List all IMAP mailbox names in the account.
@@ -1327,18 +1375,36 @@ class IMAPer(BufferManager, AgenticObject):
         if self._imap_connection is None:
             raise RuntimeError("no active IMAP connection")
 
-        # Fetch the current mailbox list from the server.
+        # Fetch the current mailbox list from the server -- retry with reconnect on failure.
         mailboxes = self._list_imap_mailboxes()
-        if mailboxes is None:
+        if isinstance(mailboxes, str):
+            # First failure -- warn and attempt a reconnect before giving up.
+            _logger.warning(f"[_refresh_imap_mailbox_list] could not list mailboxes, reconnecting: {mailboxes}")
+            reconnect_error = await self._reconnect_imap()
+            if isinstance(reconnect_error, str):
+                _logger.error(f"[_refresh_imap_mailbox_list] reconnect failed: {reconnect_error}")
+                return
+
+            # Retry the listing now that we have reconnected.
+            mailboxes = self._list_imap_mailboxes()
+            if isinstance(mailboxes, str):
+                # Second failure after reconnect -- give up and log as error.
+                _logger.error(f"[_refresh_imap_mailbox_list] could not list mailboxes after reconnect: {mailboxes}")
+                return
+
+        # Guard against an empty or malformed response.
+        if not isinstance(mailboxes, dict):
             return
 
         # Build a nested tree from the flat path lists and write it to the box buffer.
         tree = _build_mailbox_tree(mailboxes.get("mailboxes", []))
-        await self.create_buffer(
+        create_result = await self.create_buffer(
             _IMAPER_TREE_BUFFER,
             text=json.dumps(tree, ensure_ascii=False, indent=2),
             overwrite=True
         )
+        if isinstance(create_result, dict) and not create_result.get("ok", False):
+            _logger.error(f"[_refresh_imap_mailbox_list] failed to write tree buffer: {create_result.get('error', 'unknown')}")
 
         # Update email:status with the current folder count, delimiter, and refresh time.
         status = {
@@ -1346,7 +1412,9 @@ class IMAPer(BufferManager, AgenticObject):
             "delimiter": mailboxes.get("delimiter", "/"),
             "last_refreshed_at": time.time(),
         }
-        await self.create_buffer(_IMAPER_STATUS_BUFFER, text=json.dumps(status, ensure_ascii=False), overwrite=True)
+        create_result = await self.create_buffer(_IMAPER_STATUS_BUFFER, text=json.dumps(status, ensure_ascii=False), overwrite=True)
+        if isinstance(create_result, dict) and not create_result.get("ok", False):
+            _logger.error(f"[_refresh_imap_mailbox_list] failed to write status buffer: {create_result.get('error', 'unknown')}")
 
     async def _refresh_imap_box(self, mailbox_name: str) -> None:
         """Reconcile UID buffers for a mailbox with the server and refresh the summary.
@@ -1369,10 +1437,23 @@ class IMAPer(BufferManager, AgenticObject):
             except json.JSONDecodeError:
                 filter_dict = None
 
-        # Fetch the current UID list from the server.
+        # Fetch the current UID list from the server -- retry with reconnect on failure.
         result = _list_mailbox_emails(self._imap_connection, mailbox_name, filter=filter_dict)
-        if result is None:
-            return
+        if isinstance(result, str):
+            # First failure -- warn and attempt a reconnect before giving up.
+            _logger.warning(f"[_refresh_imap_box] could not list the mailboxes, reconnecting: {result}")
+            reconnect_error = await self._reconnect_imap()
+            if isinstance(reconnect_error, str):
+                _logger.error(f"[_refresh_imap_box] reconnect failed: {reconnect_error}")
+                return
+
+            # Retry the listing now that we have reconnected.
+            result = _list_mailbox_emails(self._imap_connection, mailbox_name, filter=filter_dict)
+            if isinstance(result, str):
+                # Second failure after reconnect -- give up and log as error.
+                _logger.error(f"[_refresh_imap_box] could not list the mailboxes after reconnect: {result}")
+                return
+
         server_uids = set(result.get("uids", []))
 
         # Compute the prefix for this mailbox's UID buffers.
@@ -1406,4 +1487,6 @@ class IMAPer(BufferManager, AgenticObject):
 
         # Write the summary buffer with the full email list.
         buffer_name = _mailbox_to_envelopes_buffer_name(mailbox_name)
-        await self.create_buffer(buffer_name, text=json.dumps(result, indent=2, ensure_ascii=False), overwrite=True)
+        create_result = await self.create_buffer(buffer_name, text=json.dumps(result, indent=2, ensure_ascii=False), overwrite=True)
+        if isinstance(create_result, dict) and not create_result.get("ok", False):
+            _logger.error(f"[_refresh_imap_box] failed to write envelope buffer '{buffer_name}': {create_result.get('error', 'unknown')}")
