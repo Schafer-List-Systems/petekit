@@ -35,7 +35,7 @@ async def _spill_to_buffer(caller, value: Any) -> str:
     buf_name = _call_result_buffer_name(call_id)
 
     # Write to the buffer and validate the result.
-    create_result = await caller.create_buffer(buf_name, text=result_text)
+    create_result = await caller.create_buffer(buf_name, text=result_text, overwrite=True)
     if not isinstance(create_result, dict) or not create_result.get("ok"):
         raise RuntimeError(f"Failed to spill result to {buf_name}: {create_result.get('error')}")
     return buf_name
@@ -53,19 +53,23 @@ class FunctionCaller(FunctionManager, AgenticObject):
     async def call_function(
         self,
         name: str,
-        **kwargs: Any,
+        kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Call a registered function by name with the given keyword arguments.
-        If the result is larger than 8000 chars it is written to a tmp buffer instead.
+
+        The `kwargs` dict holds the function arguments. If the result is larger
+        than 8000 chars it is written to a tmp buffer instead.
+
         Returns a dict with ok/error, plus either result=... or result_buffer=tmp:call:<id>.
-        Awaitable results are automatically awaited."""
+        Awaitable results are automatically awaited.
+        """
         # Resolve the callable — get_function is inherited from FunctionManager.
         resolve_result = self.get_function(name)
         if not isinstance(resolve_result, dict) or not resolve_result.get("ok"):
             return resolve_result  # error dict
 
         func = resolve_result["callable"]
-        call_kwargs = kwargs
+        call_kwargs = kwargs if kwargs is not None else {}
 
         # Guard: reject unknown argument names.
         for k in call_kwargs:
