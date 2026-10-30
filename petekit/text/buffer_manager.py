@@ -576,13 +576,19 @@ async def _handle_watchdog_modified(bm: BufferManager, event: FileSystemEvent) -
 
     # Build a unified diff from the current (old) text to the disk (new) text.
     # The diff format is understood by patch_buffer so it can be applied reliably.
+    # Ensure both texts end with a newline so that splitlines(keepends=True) gives
+    # a well-formed diff with proper line terminators on every hunk line.
+    if not current_text.endswith("\n"):
+        current_text += "\n"
+    if not disk_text.endswith("\n"):
+        disk_text += "\n"
     import difflib
-    diff = difflib.unified_diff(
+    diff = list(difflib.unified_diff(
         current_text.splitlines(keepends=True),
         disk_text.splitlines(keepends=True),
         fromfile=buffer_name,
         tofile=buffer_name,
-    )
+    ))
     patch_text = "".join(diff)
 
     # Apply the patch to the buffer -- the BEFORE_UPDATE_BUFFER hooks run as normal.
