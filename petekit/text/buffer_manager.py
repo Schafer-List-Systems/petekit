@@ -435,7 +435,7 @@ def _persist_buffer(bm: BufferManager, buffer: Buffer) -> None:
 
     # Build the paths for content and metadata files.
     buffer_path = dir / buffer.name
-    meta_path = buffer_path.with_name("." + buffer_path.name + ".json")
+    meta_path = _manifest_path_from_buffer_path(buffer_path)
     meta_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Write metadata first — a watchdog seeing only the content file is a
@@ -468,7 +468,8 @@ def _drop_persisted_buffer(bm: BufferManager, buffer_name: str) -> None:
 
     # Delete meta first — a watchdog seeing only the content file deleted is
     # a no-op since the meta (the authoritative state marker) is not present.
-    (dir / f".{buffer_name}.json").unlink(missing_ok=True)
+    manifest_path = _manifest_path_from_buffer_path(dir / buffer_name)
+    manifest_path.unlink(missing_ok=True)
 
     # Delete content second — the meta is already gone, so this delete event
     # is ignored by the watchdog.
