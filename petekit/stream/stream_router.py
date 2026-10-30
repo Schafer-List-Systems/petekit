@@ -24,65 +24,8 @@ CONDITION_FN = Callable[[FunctionManager, str, str, dict], bool]
 _LOG_BUFFER = "system:log:stream_router"
 
 
-def _is_condition_fn(callable_fn: Any) -> bool:
-    """Return True if callable_fn has the condition function signature.
-
-    Condition functions take (self/factory, str, str, dict) and return bool.
-    The first argument (self) is ignored — it is always the buffer manager.
-    The second and third arguments must be str. The fourth must be dict.
-    The return annotation must be bool.
-    """
-    sig = inspect.signature(callable_fn)
-    params = list(sig.parameters.values())
-    if len(params) != 4:
-        return False
-    if params[1].annotation not in (str, "str"):
-        return False
-    if params[2].annotation not in (str, "str"):
-        return False
-    if params[3].annotation not in (dict, "dict", Dict, "Dict"):
-        return False
-    if sig.return_annotation not in (bool, "bool"):
-        return False
-    return True
-
-
 # Group 1 = origin buffer name, group 2 = routing table name.
 _ROUTING_TABLE_PATTERN = r"^(.+)\[routing_table:([^[]+)\]$"
-
-
-# -------------------------------------------------------------------------------------------------------------------- #
-# Utility                                                                       #
-# -------------------------------------------------------------------------------------------------------------------- #
-
-def _is_routing_table_option(name: str) -> bool:
-    """Return True if name is a valid routing_table option buffer (has the [routing_table:NAME] suffix)."""
-    return re.compile(_ROUTING_TABLE_PATTERN).fullmatch(name) is not None
-
-
-def _routing_table_option_name(origin_name: str, table_name: str) -> str:
-    """Return the routing_table option buffer name for a given origin and table."""
-    return f"{origin_name}[routing_table:{table_name}]"
-
-
-def _routing_table_hook_name(table_name: str) -> str:
-    """Return the hook name for a routing table."""
-    return f"routing_table:{table_name}"
-
-
-def _fallthrough_name(origin_name: str, table_name: str) -> str:
-    """Return the default fallthrough stream buffer name for a routing table."""
-    return f"{origin_name}[routing_table:{table_name}]:fallthrough"
-
-
-async def _safe_log(processor: Any, message: str) -> bool:
-    """Write to the log buffer; escalate to _logger.error if the in-app log write fails."""
-    result = await processor.write_buffer(_LOG_BUFFER, message)
-    if not result.get("ok"):
-        _logger.error(f"{message}  [log write failed: {result.get('error')}]")
-        return False
-    return True
-
 
 _STREAM_ROUTER_DOC_BUFFER = "doc:stream_router"
 _STREAM_ROUTER_DOC = f"""\
@@ -144,6 +87,61 @@ option buffer: `my_stream[routing_table:NAME]:fallthrough[notifications] = {{...
 
 The feedback stream `{_LOG_BUFFER}` records all routing events and errors.
 """
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Utility                                                                       #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+def _is_condition_fn(callable_fn: Any) -> bool:
+    """Return True if callable_fn has the condition function signature.
+
+    Condition functions take (self/factory, str, str, dict) and return bool.
+    The first argument (self) is ignored — it is always the buffer manager.
+    The second and third arguments must be str. The fourth must be dict.
+    The return annotation must be bool.
+    """
+    sig = inspect.signature(callable_fn)
+    params = list(sig.parameters.values())
+    if len(params) != 4:
+        return False
+    if params[1].annotation not in (str, "str"):
+        return False
+    if params[2].annotation not in (str, "str"):
+        return False
+    if params[3].annotation not in (dict, "dict", Dict, "Dict"):
+        return False
+    if sig.return_annotation not in (bool, "bool"):
+        return False
+    return True
+
+
+def _is_routing_table_option(name: str) -> bool:
+    """Return True if name is a valid routing_table option buffer (has the [routing_table:NAME] suffix)."""
+    return re.compile(_ROUTING_TABLE_PATTERN).fullmatch(name) is not None
+
+
+def _routing_table_option_name(origin_name: str, table_name: str) -> str:
+    """Return the routing_table option buffer name for a given origin and table."""
+    return f"{origin_name}[routing_table:{table_name}]"
+
+
+def _routing_table_hook_name(table_name: str) -> str:
+    """Return the hook name for a routing table."""
+    return f"routing_table:{table_name}"
+
+
+def _fallthrough_name(origin_name: str, table_name: str) -> str:
+    """Return the default fallthrough stream buffer name for a routing table."""
+    return f"{origin_name}[routing_table:{table_name}]:fallthrough"
+
+
+async def _safe_log(processor: Any, message: str) -> bool:
+    """Write to the log buffer; escalate to _logger.error if the in-app log write fails."""
+    result = await processor.write_buffer(_LOG_BUFFER, message)
+    if not result.get("ok"):
+        _logger.error(f"{message}  [log write failed: {result.get('error')}]")
+        return False
+    return True
 
 
 def _parse_routing_table_option(name: str) -> tuple[str, str] | None:
@@ -419,7 +417,7 @@ async def route_dispatch(
     # Write to the fallthrough stream.
     result = await processor.write_buffer(fallthrough_stream, text)
     if not result.get("ok"):
-        _safe_log(
+        await _safe_log(
             processor,
             f"FALLTHROUGH ERROR: failed to write to '{fallthrough_stream}': {result.get('error')}",
         )
@@ -456,9 +454,9 @@ async def route_dispatch_batch(
     # Decide between per-line or batch dispatch based on the route_lines config.
     if config.get("route_lines", True):
         # Dispatch each new buffer entry through the routing table individually.
-        for entry in new_buffer.lines[len(old_buffer.lines):]:
+        for entry in new_buffer.lines[len(old_buffer.lines)-1:]:
             if entry.data:
-                await route_dispatch(processor, config, new_buffer.name, table_name, entry.data)
+                await route_dispatch(processor, config, new_buffer.name, table_name, f"{entry.data}\n")
     else:
         # Collect the full appended text as one batch and dispatch it.
         appended_text = new_buffer.get_text(start=len(old_buffer)-1)
@@ -535,7 +533,7 @@ class StreamRouter(FunctionManager, StreamBufferManager, AgenticObject):
         # Seed the documentation buffer so agents can discover routing tables without consulting the source.
         self._create_buffer(_STREAM_ROUTER_DOC_BUFFER, text=_STREAM_ROUTER_DOC)
 
-        # Register the routing_table pattern hooks.
+        # Validate routing table config before the buffer is created or updated -- calls before_update_routing_table.
         self.register_buffer_pattern_hook(
             HookPoint.BEFORE_CREATE_BUFFER,
             "routing_table_validated",
@@ -543,17 +541,21 @@ class StreamRouter(FunctionManager, StreamBufferManager, AgenticObject):
             lambda bm, buf, args: before_update_routing_table(bm, None, buf, args),
         )
         self.register_buffer_pattern_hook(
-            HookPoint.AFTER_CREATE_BUFFER,
-            "routing_table_created",
-            _ROUTING_TABLE_PATTERN,
-            after_create_routing_table,
-        )
-        self.register_buffer_pattern_hook(
             HookPoint.BEFORE_UPDATE_BUFFER,
             "routing_table_updated",
             _ROUTING_TABLE_PATTERN,
             before_update_routing_table,
         )
+
+        # Activate the routing once the buffer exists -- calls after_create_routing_table on the origin.
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            "routing_table_created",
+            _ROUTING_TABLE_PATTERN,
+            after_create_routing_table,
+        )
+
+        # Clean up the routing state when the buffer is dropped -- calls after_drop_routing_table on the origin.
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_DROP_BUFFER,
             "routing_table_dropped",
