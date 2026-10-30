@@ -28,11 +28,53 @@ from .buffer import (
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos import tool, sandbox
+from peteos.utils import get_logger
+from peteos.utils.watchdog import Watchdog
+from peteos.utils.watchdog import FileSystemEvent
+
+_logger = get_logger(__name__)
+
+
+# --------------------------------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------------------------------
 
 
 # Managed buffer names — system:status: namespace and diff namespace
 _STATUS_BUFFER = "system:status:buffers"
 _DIFF_BUFFER_PREFIX = "diff:"
+
+_NO_BUFFER_ = object()
+
+
+# --------------------------------------------------------------------------------------------------
+# Data classes
+# --------------------------------------------------------------------------------------------------
+
+
+@dataclass
+class ReadBufferResult:
+    """Result of _read_buffer. Signals which branch was taken and carries data for hint construction."""
+    kind: Literal["content", "skip", "bucket", "error"]
+    content: str | None = None
+    start: int | None = None
+    end: int | None = None
+    total_chars: int = 0
+    line_count: int = 0
+    skip_lines: list[tuple[int, int]] | None = None  # (0-based line index, char count)
+    bucket_info: list[tuple[int, int, int]] | None = None  # (start, end, chars)
+    error: str | None = None
+
+
+@dataclass
+class GrepResult:
+    """Result of Buffer.grep and _grep_buffer. Carries raw match data for downstream processing."""
+    ok: bool
+    matches: list[int] | None = None
+    start: int | None = None
+    end: int | None = None
+    count: int = 0
+    error: str | None = None
 
 
 @dataclass
@@ -166,26 +208,238 @@ def _sanitize_buffer_name(name: str) -> str:
     return "".join(c for c in name if c not in " \t\n\r")
 
 
+# --------------------------------------------------------------------------------------------------
+# Utils
+# --------------------------------------------------------------------------------------------------
+
+def _manifest_path_from_buffer_path(buffer_path: Path) -> Path:
+    """Given a buffer file path, return the path to its corresponding manifest (.json) file.
+
+    The manifest uses a dot-prefix naming convention so it appears as a hidden file
+    alongside the named buffer file on disk.
+    """
+    return buffer_path.with_name("." + buffer_path.name + ".json")
+
+
+def _is_hidden_file(buffer_path: Path) -> bool:
+    """Return True when the file name is hidden on Unix (starts with a dot).
+
+    This is the naming convention for buffer manifest files on disk.
+    """
+    return buffer_path.name.startswith(".")
+
+
+def _buffer_name_from_event_path(event_src_path: str, persist_dir: Path) -> str:
+    """Return the buffer name extracted from a watchdog event src_path.
+
+    Strips the persistence directory prefix from the full file path and returns
+    the relative remainder as the buffer name. For example:
+        event_src_path = '/persist_dir/foo'  -> 'foo'
+        event_src_path = '/persist_dir/sub/bar' -> 'sub/bar'
+    """
+    return str(Path(event_src_path).relative_to(persist_dir))
+
+
+def _try_read_manifest(buffer_path: Path) -> dict | None:
+    """Return the manifest dict when the file is a valid buffer manifest, or None.
+
+    A valid manifest has a name starting with dot and ending with .json and
+    contains both created_at and modified_at.
+    """
+    # Build the manifest path from the buffer path and check it exists.
+    manifest_path = _manifest_path_from_buffer_path(buffer_path)
+    if not manifest_path.exists():
+        return None
+
+    # Validate the naming convention -- must start with dot and end with .json.
+    manifest_name = manifest_path.name
+    if not (manifest_name.startswith(".") and manifest_name.endswith(".json")):
+        return None
+
+    # Parse the manifest JSON -- return None when the file is not valid JSON.
+    import json
+    try:
+        content = json.loads(manifest_path.read_text())
+    except Exception:
+        return None
+
+    # Confirm the manifest carries the required timestamp fields.
+    if not isinstance(content, dict):
+        return None
+    if "created_at" not in content or "modified_at" not in content:
+        return None
+
+    return content
+
+
+def _buffer_timestamps_from_disk(buffer_path: Path) -> dict[str, float]:
+    """Return the buffer timestamps read from a file on disk.
+
+    On Linux, st_ctime is the inode change time which is set to now on file creation,
+    so it serves as the creation time proxy. On macOS, st_birth is the true creation time.
+    """
+    import os
+    stat = buffer_path.stat()
+    return {
+        "created_at": getattr(stat, "st_birth", None) or stat.st_ctime,
+        "modified_at": stat.st_mtime,
+    }
+
+
+# --------------------------------------------------------------------------------------------------
+# Buffer persistence
+# --------------------------------------------------------------------------------------------------
+
 def _get_persistence_dir(bm: BufferManager) -> Path:
     """Return the BufferManager persistence directory inside the buffer manager's instance dir."""
     return bm.instance_dir / "buffer_manager"
+
+
+async def _restore_create_buffers(self: BufferManager) -> None:
+    """Restore hook: re-creates buffers from persisted state after instance restoration.
+
+    Lists the buffer manager's persistence directory for buffer JSON manifests,
+    validates each, and re-creates the buffer with its original timestamps.
+    """
+    # Ensure the persistence directory exists — nothing to restore if it was never persisted.
+    dir = _get_persistence_dir(self)
+    if not dir.exists():
+        return
+
+    # Find all hidden JSON manifest files, each representing a single persisted buffer.
+    manifest_files = sorted(dir.glob("**/*.json"))
+    valid_manifests: list[tuple[float, Path]] = []
+
+    # Collect only valid buffer manifests and sort by creation time — oldest first.
+    for manifest_path in manifest_files:
+        # Parse the JSON manifest; skip on any read/parse error.
+        import json
+        try:
+            meta = json.loads(manifest_path.read_text())
+        except Exception:
+            continue
+
+        # Guard: skip files that do not carry the buffer kind marker.
+        if not isinstance(meta, dict) or meta.get("kind") != "buffer":
+            continue
+
+        # Extract buffer identity and timestamps from the manifest.
+        name = meta.get("name")
+        created_at = meta.get("created_at")
+        if not name or not created_at:
+            continue
+
+        # Record this manifest as valid for the restore pass.
+        valid_manifests.append((created_at, manifest_path))
+
+    # Restore in creation-time order — oldest buffers first.
+    valid_manifests.sort(key=lambda x: x[0])
+
+    # Restore each buffer from its manifest — oldest first.
+    for _, manifest_path in valid_manifests:
+        # Re-parse the manifest and extract all required fields for restoration.
+        import json
+        try:
+            meta = json.loads(manifest_path.read_text())
+        except Exception:
+            continue
+        name = meta.get("name")
+        created_at = meta.get("created_at")
+        modified_at = meta.get("modified_at")
+
+        # Guard: skip if the content file is absent — nothing to restore.
+        content_path = dir / name
+        if not content_path.exists():
+            continue
+
+        # Load the raw buffer content from the corresponding content file.
+        text = content_path.read_text()
+
+        # Re-create the buffer with its original timestamps.
+        metadata = {"created_at": created_at, "modified_at": modified_at or created_at}
+        try:
+            await _create_buffer_implementation(self, name, text, False, metadata)
+        except Exception as e:
+            # Best-effort: non-critical restore — log and continue.
+            import logging
+            logging.warning(f"[_restore_create_buffers] failed to restore buffer '{name}': {e}")
+
+        # Reconcile: the status buffer was created with an empty listing. Populate it now
+        # with an entry for every buffer currently in the manager, including itself.
+        # This is not recursive — we write directly via create_buffer, not through a hook.
+        records = [{"name": name, "lines": len(buffer)} for name, buffer in self._buffers.items()]
+        status_text = json.dumps(records, indent=2)
+        result = self._create_buffer(_STATUS_BUFFER, text=status_text)
+        if not result.get("ok"):
+            raise RuntimeError(
+                f"failed to seed status buffer: {result.get('error', 'unknown')}"
+            )
+
+    # Register a watch for created events so disk file creation syncs to a memory buffer.
+    async def _dispatch_created(event: FileSystemEvent) -> None:
+        if event.is_directory:
+            return
+        await _handle_watchdog_created(self, event)
+
+    # Set up a recursive watch on the persistence directory for created file events.
+    await self._watchdog.watch(
+        name="buffer_file_created",
+        path=_get_persistence_dir(self),
+        callback=_dispatch_created,
+        events={"created"},
+        recursive=True,
+    )
+
+    # Register a watch for modified events so disk file changes sync to the memory buffer.
+    async def _dispatch_modified(event: FileSystemEvent) -> None:
+        if event.is_directory:
+            return
+        await _handle_watchdog_modified(self, event)
+
+    # Set up a recursive watch on the persistence directory for modified file events.
+    await self._watchdog.watch(
+        name="buffer_file_modified",
+        path=_get_persistence_dir(self),
+        callback=_dispatch_modified,
+        events={"modified"},
+        recursive=True,
+    )
+
+    # Register a watch for deleted events so disk file removal drops the memory buffer.
+    async def _dispatch_deleted(event: FileSystemEvent) -> None:
+        if event.is_directory:
+            return
+        await _handle_watchdog_deleted(self, event)
+
+    # Set up a recursive watch on the persistence directory for deleted file events.
+    await self._watchdog.watch(
+        name="buffer_file_deleted",
+        path=_get_persistence_dir(self),
+        callback=_dispatch_deleted,
+        events={"deleted"},
+        recursive=True,
+    )
 
 
 def _persist_buffer(bm: BufferManager, buffer: Buffer) -> None:
     """Write buffer content and metadata to disk for persistence.
 
     Stores the raw line data in a file and structural metadata in a .json file.
+    The meta file is written first so that a watchdog watching the content file
+    sees a complete pair on disk — not a half-written state that could cause a
+    false create event.
     """
     # Ensure the persistence directory for this buffer manager exists.
     dir = _get_persistence_dir(bm)
     dir.mkdir(parents=True, exist_ok=True)
 
-    # Raw content file — one line per line, preserving exact buffer text.
-    buff_path = dir / f"{buffer.name}"
-    buff_path.parent.mkdir(parents=True, exist_ok=True)
-    buff_path.write_text(buffer.get_text())
+    # Build the paths for content and metadata files.
+    buffer_path = dir / buffer.name
+    meta_path = buffer_path.with_name("." + buffer_path.name + ".json")
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Metadata JSON — name, line count, timestamps.
+    # Write metadata first — a watchdog seeing only the content file is a
+    # no-op since the meta (the authoritative state marker) is not yet present.
     import json
     meta = {
         "kind": "buffer",
@@ -194,19 +448,31 @@ def _persist_buffer(bm: BufferManager, buffer: Buffer) -> None:
         "created_at": buffer.created_at,
         "modified_at": buffer.modified_at,
     }
-    buffer_path = dir / buffer.name
-    meta_path = buffer_path.with_name("." + buffer_path.name + ".json")
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2))
+
+    # Write content second — the meta file already exists, so a watchdog
+    # create event for this file is ignored.
+    buff_path = dir / f"{buffer.name}"
+    buff_path.parent.mkdir(parents=True, exist_ok=True)
+    buff_path.write_text(buffer.get_text())
 
 
 def _drop_persisted_buffer(bm: BufferManager, buffer_name: str) -> None:
-    """Remove persisted content and metadata for the named buffer."""
+    """Remove persisted content and metadata for the named buffer.
+
+    The meta file is deleted first so that a watchdog watching the content file
+    sees the meta gone first — a delete event for the content file alone is
+    ignored since the authoritative state marker is already gone.
+    """
     dir = _get_persistence_dir(bm)
 
-    # Remove content and metadata files; missing_ok=True handles the already-gone case.
-    (dir / f"{buffer_name}").unlink(missing_ok=True)
+    # Delete meta first — a watchdog seeing only the content file deleted is
+    # a no-op since the meta (the authoritative state marker) is not present.
     (dir / f".{buffer_name}.json").unlink(missing_ok=True)
+
+    # Delete content second — the meta is already gone, so this delete event
+    # is ignored by the watchdog.
+    (dir / f"{buffer_name}").unlink(missing_ok=True)
 
 
 def _make_persist_buffer_hook(bm: BufferManager) -> AfterUpdateBuffer:
@@ -223,6 +489,155 @@ def _make_persist_buffer_hook(bm: BufferManager) -> AfterUpdateBuffer:
         # Persist the buffer to disk — called after every successful mutation.
         _persist_buffer(buffer_manager, new_buffer)
     return _persist_buffer_update_hook
+
+
+# Disk-originated buffer events -- handlers are filled in during later steps.
+async def _handle_watchdog_created(bm: BufferManager, event: FileSystemEvent) -> None:
+    """Recreate a buffer in memory when a new file appears on disk."""
+    # Extract the file path from the event -- this is the buffer file that appeared.
+    buffer_path = Path(event.src_path)
+
+    # Skip manifest files -- they are a side-effect of persist_buffer, not a
+    # separate buffer event to act on.
+    if _is_hidden_file(buffer_path):
+        return
+
+    # Extract the buffer name from the file path -- the file name is the buffer name.
+    buffer_name = _buffer_name_from_event_path(event.src_path, _get_persistence_dir(bm))
+
+    # Skip when the buffer already exists in memory -- no need to recreate it.
+    if buffer_name in bm._buffers:
+        return
+
+    # Skip when a manifest already exists -- this file was likely recreated after
+    # a failed create and is not a fresh disk-originated event.
+    manifest = _try_read_manifest(buffer_path)
+    if manifest is not None:
+        return
+
+    # Read the file content and timestamps from disk -- the file content becomes
+    # the buffer text, the stat timestamps become the buffer created_at/modified_at.
+    file_text = buffer_path.read_text()
+    metadata = _buffer_timestamps_from_disk(buffer_path)
+
+    # Create the buffer in memory, passing the disk timestamps through.
+    result = await _create_buffer_implementation(
+        bm,
+        buffer_name,
+        file_text,
+        False,
+        metadata,
+    )
+
+    # Report the error when the create was rejected -- the manifest must not be
+    # written so that a future fix to the file can succeed.
+    if isinstance(result, dict) and not result.get("ok", False):
+        _logger.error(
+            f"[_handle_watchdog_created] failed to create buffer '{buffer_name}': "
+            f"{result.get('error', 'unknown')}"
+        )
+        return
+
+
+async def _handle_watchdog_modified(bm: BufferManager, event: FileSystemEvent) -> None:
+    """Update a buffer in memory when its file changes on disk."""
+    # Extract the file path from the event -- this is the buffer file that changed.
+    buffer_path = Path(event.src_path)
+
+    # Skip manifest files -- they are a side-effect of persist_buffer, not a
+    # separate buffer event to act on.
+    if _is_hidden_file(buffer_path):
+        return
+
+    # Extract the buffer name from the file path -- use the path relative to the
+    # persistence directory so that subdirectory paths become part of the buffer name.
+    buffer_name = _buffer_name_from_event_path(event.src_path, _get_persistence_dir(bm))
+
+    # Route to the create handler when no manifest exists -- a prior create may
+    # have been rejected, leaving the file on disk but no buffer in memory.
+    manifest = _try_read_manifest(buffer_path)
+    if manifest is None:
+        await _handle_watchdog_created(bm, event)
+        return
+
+    # Read the new content from the disk file -- this is what the buffer will be
+    # updated to.
+    disk_text = buffer_path.read_text()
+
+    # Get the current buffer text from memory -- this is the original state that
+    # the patch will be applied to.
+    current_buffer = bm.get_buffer(buffer_name)
+    current_text = current_buffer.get_text() if current_buffer else ""
+
+    # Skip when the buffer in memory already matches the file on disk -- the disk
+    # event was likely triggered by our own persist write, not an external change.
+    if current_text == disk_text:
+        return
+
+    # Build a unified diff from the current (old) text to the disk (new) text.
+    # The diff format is understood by patch_buffer so it can be applied reliably.
+    import difflib
+    diff = difflib.unified_diff(
+        current_text.splitlines(keepends=True),
+        disk_text.splitlines(keepends=True),
+        fromfile=buffer_name,
+        tofile=buffer_name,
+    )
+    patch_text = "".join(diff)
+
+    # Apply the patch to the buffer -- the BEFORE_UPDATE_BUFFER hooks run as normal.
+    # A rejection means the buffer state is protected and the disk content is stale.
+    patch_result = await bm.patch_buffer(buffer_name, patch_text)
+
+    # Report the error when the patch was rejected -- the disk file is now out of
+    # sync with memory. No further action is taken; the file must be corrected on
+    # disk and the event will fire again.
+    if isinstance(patch_result, dict) and not patch_result.get("ok", False):
+        _logger.error(
+            f"[_handle_watchdog_modified] patch rejected for '{buffer_name}': "
+            f"{patch_result.get('error', 'unknown')}"
+        )
+
+
+async def _handle_watchdog_deleted(bm: BufferManager, event: FileSystemEvent) -> None:
+    """Drop a buffer from memory when its file is removed from disk."""
+    # Extract the file path from the event -- this is the buffer file that disappeared.
+    buffer_path = Path(event.src_path)
+
+    # Skip manifest files -- they are a side-effect of persist_buffer, not a
+    # separate buffer event to act on.
+    if _is_hidden_file(buffer_path):
+        return
+
+    # Extract the buffer name from the file path -- use the path relative to the
+    # persistence directory so that subdirectory paths become part of the buffer name.
+    buffer_name = _buffer_name_from_event_path(event.src_path, _get_persistence_dir(bm))
+
+    # Skip when no manifest exists -- the buffer may have already been dropped or
+    # this is not a buffer file at all.
+    manifest = _try_read_manifest(buffer_path)
+    if manifest is None:
+        return
+
+    # Attempt to drop the buffer from memory -- the disk sync flag in metadata tells
+    # any pre-drop hooks that this is a disk-originated drop.
+    drop_args = {"_op": "drop_buffer", "name": buffer_name}
+    drop_result = await bm.drop_buffer(buffer_name)
+
+    # When the drop was rejected, restore the buffer file so the buffer on disk and
+    # in memory stay in sync. Re-create the file with the content from the manifest.
+    if isinstance(drop_result, dict) and not drop_result.get("ok", False):
+        _logger.error(
+            f"[_handle_watchdog_deleted] pre-drop hook rejected '{buffer_name}': "
+            f"{drop_result.get('error', 'unknown')} -- restoring file on disk"
+        )
+        restored_text = buffer_path.read_text()
+        buffer_path.write_text(restored_text)
+
+
+# --------------------------------------------------------------------------------------------------
+# Buffer hooks
+# --------------------------------------------------------------------------------------------------
 
 
 def _initialize_buffer_hooks(
@@ -281,7 +696,13 @@ async def _create_buffer_implementation(
     modified_at = metadata.get("modified_at", created_at) if metadata else created_at
 
     # Gate the creation or overwrite through pre-creation hooks; a rejection blocks the operation.
-    create_args = {"_op": "create_buffer", "name": name, "text": text, "overwrite": overwrite}
+    create_args = {
+        "_op": "create_buffer",
+        "name": name,
+        "text": text,
+        "overwrite": overwrite,
+        "metadata": metadata,
+    }
 
     # Compute the proposed new lines from the provided text.
     new_lines = [
@@ -355,86 +776,6 @@ async def _create_buffer_implementation(
     return {"ok": True, "created": not existed, "overwritten": existed, "lines": create_result.get("lines", 0)}
 
 
-async def _restore_create_buffers(self: BufferManager) -> None:
-    """Restore hook: re-creates buffers from persisted state after instance restoration.
-
-    Lists the buffer manager's persistence directory for buffer JSON manifests,
-    validates each, and re-creates the buffer with its original timestamps.
-    """
-    # Ensure the persistence directory exists — nothing to restore if it was never persisted.
-    dir = _get_persistence_dir(self)
-    if not dir.exists():
-        return
-
-    # Find all hidden JSON manifest files, each representing a single persisted buffer.
-    manifest_files = sorted(dir.glob("**/*.json"))
-    valid_manifests: list[tuple[float, Path]] = []
-
-    # Collect only valid buffer manifests and sort by creation time — oldest first.
-    for manifest_path in manifest_files:
-        # Parse the JSON manifest; skip on any read/parse error.
-        import json
-        try:
-            meta = json.loads(manifest_path.read_text())
-        except Exception:
-            continue
-
-        # Guard: skip files that do not carry the buffer kind marker.
-        if not isinstance(meta, dict) or meta.get("kind") != "buffer":
-            continue
-
-        # Extract buffer identity and timestamps from the manifest.
-        name = meta.get("name")
-        created_at = meta.get("created_at")
-        if not name or not created_at:
-            continue
-
-        # Record this manifest as valid for the restore pass.
-        valid_manifests.append((created_at, manifest_path))
-
-    # Restore in creation-time order — oldest buffers first.
-    valid_manifests.sort(key=lambda x: x[0])
-
-    for _, manifest_path in valid_manifests:
-        # Re-parse the manifest and extract all required fields for restoration.
-        import json
-        try:
-            meta = json.loads(manifest_path.read_text())
-        except Exception:
-            continue
-        name = meta.get("name")
-        created_at = meta.get("created_at")
-        modified_at = meta.get("modified_at")
-
-        # Guard: skip if the content file is absent — nothing to restore.
-        content_path = dir / name
-        if not content_path.exists():
-            continue
-
-        # Load the raw buffer content from the corresponding content file.
-        text = content_path.read_text()
-
-        # Re-create the buffer with its original timestamps.
-        metadata = {"created_at": created_at, "modified_at": modified_at or created_at}
-        try:
-            await _create_buffer_implementation(self, name, text, False, metadata)
-        except Exception as e:
-            # Best-effort: non-critical restore — log and continue.
-            import logging
-            logging.warning(f"[_restore_create_buffers] failed to restore buffer '{name}': {e}")
-
-        # Reconcile: the status buffer was created with an empty listing. Populate it now
-        # with an entry for every buffer currently in the manager, including itself.
-        # This is not recursive — we write directly via create_buffer, not through a hook.
-        records = [{"name": name, "lines": len(buffer)} for name, buffer in self._buffers.items()]
-        status_text = json.dumps(records, indent=2)
-        result = self._create_buffer(_STATUS_BUFFER, text=status_text)
-        if not result.get("ok"):
-            raise RuntimeError(
-                f"failed to seed status buffer: {result.get('error', 'unknown')}"
-            )
-
-
 def _lines_to_skip(segment: list[str], start_offset: int, max_chars: int) -> tuple[list[tuple[int, int]], int]:
     """Find the minimum set of longest lines whose removal makes the segment fit under max_chars.
 
@@ -481,32 +822,9 @@ def _make_buckets(segment: list[str], num_buckets: int, start_offset: int) -> li
     return buckets
 
 
-_NO_BUFFER_ = object()
-
-
-@dataclass
-class ReadBufferResult:
-    """Result of _read_buffer. Signals which branch was taken and carries data for hint construction."""
-    kind: Literal["content", "skip", "bucket", "error"]
-    content: str | None = None
-    start: int | None = None
-    end: int | None = None
-    total_chars: int = 0
-    line_count: int = 0
-    skip_lines: list[tuple[int, int]] | None = None  # (0-based line index, char count)
-    bucket_info: list[tuple[int, int, int]] | None = None  # (start, end, chars)
-    error: str | None = None
-
-
-@dataclass
-class GrepResult:
-    """Result of Buffer.grep and _grep_buffer. Carries raw match data for downstream processing."""
-    ok: bool
-    matches: list[int] | None = None
-    start: int | None = None
-    end: int | None = None
-    count: int = 0
-    error: str | None = None
+# --------------------------------------------------------------------------------------------------
+# Main class
+# --------------------------------------------------------------------------------------------------
 
 
 class BufferManager(AgenticObject):
@@ -578,6 +896,11 @@ class BufferManager(AgenticObject):
 
         # Register the restore hook so persisted buffers survive instance restarts.
         self._register_restore_hook("create_buffers", _restore_create_buffers)
+
+        # Own a Watchdog that watches the persistence directory for disk-originated
+        # buffer events so the BufferManager can sync disk changes back into memory.
+        # Named with the BufferManager's identity so logs are traceable.
+        self._watchdog = Watchdog(name=f"BufferManager/{hex(id(self))}")
 
     def get_buffer(self, name: str) -> Buffer | None:
         """Protected buffer lookup — returns the Buffer object or None if not found.
