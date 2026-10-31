@@ -381,6 +381,8 @@ async def _restore_create_buffers(self: BufferManager) -> None:
     valid_manifests.sort(key=lambda x: x[0])
 
     # Restore each buffer from its manifest — oldest first.
+    total_manifest_entries = len(valid_manifests)
+    restored_count = 0
     for _, name, meta in valid_manifests:
         # Extract the timestamps from the already-loaded manifest entry.
         created_at = meta.get("created_at")
@@ -405,6 +407,13 @@ async def _restore_create_buffers(self: BufferManager) -> None:
             # Best-effort: non-critical restore — log and continue.
             logging.warning(f"[_restore_create_buffers] failed to restore buffer '{name}': {e}")
             continue
+
+        restored_count += 1
+
+    logging.info(
+        f"[_restore_create_buffers] restore complete: {restored_count}/{total_manifest_entries} buffers restored, "
+        f"{len(legacy)} legacy manifests migrated"
+    )
 
     # Reconcile: the status buffer was created with an empty listing. Populate it once
     # after all buffers are restored, with an entry for every buffer in the manager.
@@ -889,8 +898,16 @@ class BufferManager(AgenticObject):
         self._buffers: dict[str, Buffer] = {}
 
         # In-memory manifest of all persisted buffers — keyed by buffer name.
-        # Each value is a dict with created_at, modified_at, and line_count.
-        self._buffer_manifest: dict[str, dict] = {}
+        # Seed from disk so that buffer creations during init do not overwrite the
+        # manifest with an incomplete state -- the persist hook merges, not replaces.
+        manifest_path = _get_persistence_manifest(self)
+        if manifest_path.exists():
+            try:
+                self._buffer_manifest = json.loads(manifest_path.read_text())
+            except Exception:
+                self._buffer_manifest = {}
+        else:
+            self._buffer_manifest = {}
 
         # Pattern-based hook registries keyed by hook point.
         # Each registry holds creation hooks to be mirrored to a buffer on first creation.
