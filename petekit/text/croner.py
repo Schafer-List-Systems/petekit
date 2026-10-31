@@ -297,8 +297,14 @@ def _validate_and_prepare_action_config(
 
     # For !notify, inject the current thread ID if absent.
     if action == "!notify":
-        # Validate that action_config exists and is a dict.
-        action_config = config.get("action_config", {})
+        # Fetch the existing action_config or create a new one and store it in config
+        # so that the subsequent mutation actually persists into the buffer.
+        action_config = config.get("action_config")
+        if action_config is None:
+            action_config = {}
+            config["action_config"] = action_config
+
+        # Validate that action_config is a dict.
         if not isinstance(action_config, dict):
             return f"[!notify] action_config must be a dictionary -- got {type(action_config).__name__}"
 
