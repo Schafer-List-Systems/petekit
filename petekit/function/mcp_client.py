@@ -466,7 +466,10 @@ def _make_mcp_tool_callable(
         # Extract plain text from content blocks and return a dict with
         # both raw content and structured content for the caller.
         text_parts = [block.text for block in result.content if isinstance(block, TextContent)]
-        return {"content": text_parts, "structured_content": result.structured_content}
+        if result.structured_content is None:
+            return "\n\n".join(text_parts)
+        else:
+            return {"content": text_parts, "structured_content": result.structured_content}
 
     # Describe the signature buffer so the agent can read the tool's parameter schema.
     tool_buffer_name = _tool_buffer_name(name, tool_name)

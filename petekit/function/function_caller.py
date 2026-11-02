@@ -7,6 +7,7 @@ from typing import Any
 
 from peteos import tool
 from peteos.oap.agentic_object import AgenticObject
+from peteos.utils.serialization import serialize
 
 from petekit.function.function_manager import FunctionManager
 from petekit.text.buffer_manager import BufferManager
@@ -28,7 +29,7 @@ def _call_result_buffer_name(call_id: int) -> str:
 
 async def _spill_to_buffer(caller, value: Any) -> str:
     # Serialize the value to a string for buffering.
-    result_text = str(value)
+    result_text = serialize(value)
 
     # Allocate a unique call ID and derive the tmp buffer name.
     call_id = _next_call_id(caller)
@@ -87,7 +88,7 @@ class FunctionCaller(FunctionManager, AgenticObject):
             result = await result
 
         # Spill to a buffer if the serialized result is too large; otherwise return inline.
-        result_str = str(result)
+        result_str = serialize(result)
         if len(result_str) > BufferManager._MAX_CHUNK_CHARS:
             buf_name = await _spill_to_buffer(self, result)
             return {"ok": True, "result_buffer": buf_name}
