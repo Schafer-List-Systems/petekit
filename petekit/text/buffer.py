@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Literal
 
+import logging
+
 
 class HookPoint(Enum):
     """Hook points at which buffer lifecycle events can be intercepted."""
@@ -619,8 +621,6 @@ class Buffer:
         receive (bm, buffer, args). Return values are ignored — post-op hooks are
         side-effect only and their return value has no meaning to the caller.
         """
-        import logging
-
         # Fire each hook in order; if it raises, log the error and move on.
         for hook_name, hook in hooks:
             try:
