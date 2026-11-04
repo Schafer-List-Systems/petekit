@@ -108,6 +108,56 @@ def _get_node_config(node_buffer: Buffer) -> dict[str, Any] | str:
     return config
 
 
+def get_node_config(grapher: Grapher, node_name: str) -> dict[str, Any] | str:
+    """Read and parse the config from a named node's option buffer.
+
+    Returns the parsed config dict on success, or an error string if the node
+    does not exist or its buffer is absent, empty, or contains invalid JSON.
+    """
+    # Guard: reject if the node is not registered in the graph.
+    node = get_node(grapher, node_name)
+    if node is None:
+        return f"[Grapher] node '{node_name}' does not exist"
+
+    # Look up the node's option buffer.
+    node_buffer = grapher.get_buffer(node_name + _GRAPHER_NODE_SUFFIX)
+    if node_buffer is None:
+        return f"[Grapher] node '{node_name}' has no associated option buffer"
+
+    # Parse and return the config from the buffer text.
+    return _get_node_config(node_buffer)
+
+
+def get_node(grapher: Grapher, node_name: str) -> _Node | None:
+    """Look up a node by name in the graph.
+
+    Returns the _Node if it exists, or None if it has not been registered.
+    """
+    return grapher._grapher_nodes.get(node_name)
+
+
+def get_predecessors(grapher: Grapher, node_name: str) -> set[str] | None:
+    """Return the set of predecessor node names for the given node.
+
+    Returns None if the node does not exist.
+    """
+    node = get_node(grapher, node_name)
+    if node is None:
+        return None
+    return node.predecessors
+
+
+def get_successors(grapher: Grapher, node_name: str) -> set[str] | None:
+    """Return the set of successor node names for the given node.
+
+    Returns None if the node does not exist.
+    """
+    node = get_node(grapher, node_name)
+    if node is None:
+        return None
+    return node.successors
+
+
 def _add_successor(
     grapher: Grapher,
     node: _Node,
@@ -172,6 +222,14 @@ def _before_update_node(
     config_or_error = _get_node_config(new_buffer)
     if isinstance(config_or_error, str):
         return config_or_error
+
+    # Guard: reject when any referenced successor node does not exist.
+    successors = config_or_error.get("successors")
+    if isinstance(successors, dict):
+        for successor_name in successors:
+            successor_buffer_name = successor_name + _GRAPHER_NODE_SUFFIX
+            if grapher.get_buffer(successor_buffer_name) is None:
+                return f"[Grapher] node '{new_buffer.name}' references unknown successor buffer '{successor_buffer_name}' (hint: create the node buffer '{successor_name}{_GRAPHER_NODE_SUFFIX}' first)"
 
     return None
 

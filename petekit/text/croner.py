@@ -15,7 +15,7 @@ from peteos.oap.agentic_object import AgenticObject
 
 from petekit.function.function_caller import FunctionCaller
 from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint
-from petekit.text.option_buffer_manager import OptionBufferManager
+from petekit.text.option_buffer_manager import _read_option_buffer_config, OptionBufferManager
 
 
 _logger = logging.getLogger("croner")
@@ -377,34 +377,6 @@ async def _do_notify(
         return f"[!notify] failed to deliver notification: {e}"
 
     return None
-
-
-def _read_option_buffer_config(croner: Croner, option_buffer_name: str) -> dict[str, Any] | None:
-    """Read and parse the JSON config from an option buffer.
-
-    Returns the parsed config dict on success, or None if the buffer is absent,
-    empty, or contains invalid JSON.
-    """
-    # Locate the option buffer by name.
-    option_buffer = croner.get_buffer(option_buffer_name)
-    if option_buffer is None:
-        _logger.error(f"[Croner] cannot locate {option_buffer_name}  --  discarding rearm")
-        return None
-
-    # Extract the text from the option buffer.
-    option_buffer_text = option_buffer.get_text()
-    if not option_buffer_text:
-        _logger.error(f"[Croner] {option_buffer_name} is empty  --  discarding rearm")
-        return None
-
-    # Parse the JSON config from the option buffer text.
-    try:
-        config = json.loads(option_buffer_text)
-    except json.JSONDecodeError:
-        _logger.error(f"[Croner] {option_buffer_name} has invalid JSON  --  discarding rearm")
-        return None
-
-    return config
 
 
 async def _fire_action(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None:
