@@ -99,7 +99,9 @@ def validate_and_prepare_action_config(
     Returns None on success or an error string on failure.
     """
     # Extract the action name to decide how to validate action_config.
-    action = config.get("action")
+    action = config.get("name")
+    if not action:
+        return f"[OptionBufferManager] action config is missing a 'name' field"
 
     # For !notify, inject the current thread ID if absent.
     if action == "!notify":
@@ -197,7 +199,7 @@ async def _fire_action(
     option_buffer_manager's function manager.
     """
     # Guard against a missing or empty action field.
-    action = config.get("action")
+    action = config.get("name")
     if not action:
         _logger.error(f"[OptionBufferManager] no action in config for '{origin}'")
         return

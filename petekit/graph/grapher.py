@@ -39,23 +39,33 @@ The Grapher manages a directed graph of named nodes, stored as option buffers.
 ### Node Config
 
 Each node buffer holds a flat JSON object with an optional `successors` dict.
-Each dict key is the name of a connected node, and each value is the label for that edge:
+Each dict key is the bare name of a connected node, and each value is the label for that edge.
+The key must be the node name only — never the buffer name with suffix.
 
 ```json
 {{
   "successors": {{
-    "other-node": "label for the edge to other-node"
+    "node-b": "label for the edge to node-b"
   }}
 }}
 ```
 
 The `successors` dict is optional. Omit it to declare a node with no outgoing edges.
 
+### Key Format
+
+The successor key must always be the bare node name (e.g., `"node-b"`), not the buffer
+name with the `{_GRAPHER_NODE_SUFFIX}` suffix (e.g., not `"node-b{_GRAPHER_NODE_SUFFIX}"`).
+The Grapher stores the key as-is and uses it for lookups. If you store the full buffer
+name, lookups will fail because the graph only knows bare node names.
+
 ### Creating a Node
 
-Create the option buffer `<node-name>{_GRAPHER_NODE_SUFFIX}` with the config above. The node is registered
-in the in-memory graph on create and update. The graph is stored in memory only and
-is not persisted across restarts.
+Create the option buffer `<node-name>{_GRAPHER_NODE_SUFFIX}` with the config above.
+The node is registered in the in-memory graph on create and update. The node referenced
+in `successors` does not need to exist yet — the key is stored as-is and resolved on
+lookup. You can create the target node afterward. The graph is stored in memory only
+and is not persisted across restarts.
 
 ### Updating Edges
 
@@ -81,6 +91,7 @@ class _Node:
     name: str
     predecessors: set[str] = field(default_factory=set)
     successors: set[str] = field(default_factory=set)
+    pending: bool = False
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -169,10 +180,11 @@ def _add_successor(
     the successor node's predecessors. Returns an error string if the
     successor node does not exist in the graph, or None on success.
     """
-    # Reject if the successor node does not exist -- a successor must be a known node.
+    # Create a placeholder node when the successor is not yet registered.
     successor = grapher._grapher_nodes.get(successor_name)
     if successor is None:
-        return f"[_add_successor] successor '{successor_name}' is not a known node"
+        successor = _Node(name=successor_name, pending=True)
+        grapher._grapher_nodes[successor_name] = successor
 
     # Add the edge in both directions.
     node.successors.add(successor_name)
@@ -223,13 +235,15 @@ def _before_update_node(
     if isinstance(config_or_error, str):
         return config_or_error
 
-    # Guard: reject when any referenced successor node does not exist.
-    successors = config_or_error.get("successors")
-    if isinstance(successors, dict):
-        for successor_name in successors:
-            successor_buffer_name = successor_name + _GRAPHER_NODE_SUFFIX
-            if grapher.get_buffer(successor_buffer_name) is None:
-                return f"[Grapher] node '{new_buffer.name}' references unknown successor buffer '{successor_buffer_name}' (hint: create the node buffer '{successor_name}{_GRAPHER_NODE_SUFFIX}' first)"
+    # Extract the successors dict from the node config.
+    successors = config_or_error.get("successors", {})
+    if not isinstance(successors, dict):
+        return f"[Grapher] 'successors' must be a dict of node-name to edge-label, got: {type(successors).__name__}"
+
+    # Reject when a referenced successor has no origin buffer.
+    for successor_name in successors:
+        if grapher.get_buffer(successor_name) is None:
+            return f"[Grapher] node '{new_buffer.name}' references unknown origin buffer '{successor_name}' (hint: create the origin buffer '{successor_name}' first)"
 
     return None
 
@@ -274,6 +288,8 @@ async def _after_update_node(
     if node is None:
         node = _Node(name=node_name)
         grapher._grapher_nodes[node_name] = node
+    else:
+        node.pending = False
 
     # Remove edges for successors that are no longer in the config.
     for successor_name in removed_successors:
