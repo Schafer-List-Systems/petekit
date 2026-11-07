@@ -809,6 +809,19 @@ async def _after_update_petri_node(
             if not transition_is_active(petri, successor_name):
                 continue
 
+            # Check if the transition can still fire after the token decrease.
+            can_fire = transition_can_fire(petri, successor_name)
+            if isinstance(can_fire, str):
+                _logger.error(f"[_after_update_petri_node] could not determine fire eligibility for '{successor_name}': {can_fire}")
+                continue
+
+            # Skip deactivation when the transition is still eligible to fire.
+            if can_fire:
+                continue
+
+            # Deactivate the successor transition when it became ineligible.
+            await _deactivate_transition(petri, successor_name)
+
 
 async def _before_drop_petri_node(
     petri: PetriNetor,
