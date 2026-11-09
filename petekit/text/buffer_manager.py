@@ -498,10 +498,18 @@ def _persist_buffer(bm: BufferManager, buffer: Buffer) -> None:
     manifest_path = _get_persistence_manifest(bm)
     manifest_path.write_text(json.dumps(bm._buffer_manifest, indent=2))
 
-    # Write content second — the manifest entry already exists, so a watchdog
-    # create event for this file is ignored.
+    # Write content second
     buffer_path.parent.mkdir(parents=True, exist_ok=True)
-    buffer_path.write_text(buffer.get_text())
+    new_text = buffer.get_text()
+    if buffer_path.exists():
+        # If the file already exists, write only if the content actually changed.
+        # This avoids triggering a watchdog loop with the notification system.
+        old_text = buffer_path.read_text().replace("\r\n", "\n")
+        new_text = new_text.replace("\r\n", "\n")
+        if len(old_text) != len(new_text) or old_text != new_text:
+            buffer_path.write_text(new_text)
+    else:
+        buffer_path.write_text(new_text)
 
 
 def _drop_persisted_buffer(bm: BufferManager, buffer_name: str) -> None:
