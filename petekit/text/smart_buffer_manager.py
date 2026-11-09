@@ -159,10 +159,15 @@ You can also attach a notification reaction:
 {{
   "!notify": {{
     "prompt": "MYBUFFER was updated",
-    "description": "alerts me whenever this buffer changes"
+    "description": "alerts me whenever this buffer changes",
+    "trigger_on_noop": false
   }}
 }}
 ```
+
+- `trigger_on_noop` -- default `false`. When `false`, the notification only fires when
+  the origin buffer content actually changed. When `true`, the notification fires on
+  every update, even if the new content is identical to the old.
 
 To remove a reaction, remove its entry from the option buffer.
 """
@@ -200,6 +205,16 @@ def _make_notify_hook_for_update(
         if not isinstance(reaction_config, dict):
             _logger.error(f"[notify_hook_for_update] '!notify' in '{option_buffer.name}' must be a dict -- got {type(reaction_config).__name__}")
             return
+
+        # Skip the notification when trigger_on_noop is False and the origin buffer content is unchanged.
+        trigger_on_noop = reaction_config.get("trigger_on_noop", False)
+        if not trigger_on_noop:
+            origin_name = _origin_name_from_option_buffer_name(option_buffer.name)
+            old_text = old_buffer.get_text()
+            new_text = new_buffer.get_text()
+            if old_text == new_text:
+                _logger.debug(f"[notify_hook_for_update] origin '{origin_name}' content unchanged -- skipping")
+                return
 
         # Extract the prompt -- use a default hint if absent.
         prompt = reaction_config.get("prompt")
@@ -690,7 +705,7 @@ def after_create_option_buffer(
 
 class SmartBufferManager(FunctionManager, OptionBufferManager, AgenticObject):
     """I can register hooks (functions) on before or after changes to buffers..
-    "doc:smart_buffers" holds details."""
+    "doc:buffer_hooks" holds details."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
