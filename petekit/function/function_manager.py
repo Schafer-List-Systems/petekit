@@ -19,28 +19,12 @@ from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint, AfterU
 
 _logger = logging.getLogger(__name__)
 
-_FUNCTION_STATUS_BUFFER = "system:status:function"
-_FUNCTION_STATUS_NAME_BASE = "system:status:function:"
 _CALLABLES_LIST_BUFFER = "sys/callables.json"
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
 # Data Classes                                                                                                         #
 # -------------------------------------------------------------------------------------------------------------------- #
-
-
-@dataclass
-class FunctionEntry:
-    """A registered callable with its runtime metadata and introspectable description."""
-    name: str
-    callable: Callable
-    short_description: str
-    long_description: str
-    signature: inspect.Signature
-    return_annotation: Any
-    required_args: list[str]  # names of params without defaults
-    created_at: float
-    modified_at: float
 
 
 class ManagedCallable:
@@ -173,13 +157,6 @@ def _compute_mac(fm: "FunctionManager", data: str) -> str:
         data.encode(),
         "sha256",
     ).hexdigest()
-
-
-def _sign_payload(fm: "FunctionManager", data: Any) -> str:
-    """Serialize data as HMAC-signed JSON with indent=2."""
-    signed = json.dumps(data, sort_keys=True)
-    mac = _compute_mac(fm, signed)
-    return json.dumps({"data": data, "mac": mac}, indent=2)
 
 
 def _sign_callables_list(fm: "FunctionManager", data: dict[str, Any]) -> dict[str, Any]:
@@ -350,107 +327,6 @@ async def _remove_callable_from_list(manager: "FunctionManager", wrapper: Manage
     await manager.create_buffer(_CALLABLES_LIST_BUFFER, text=callables_json, overwrite=True)
 
 
-def _make_stable_wrapper(manager: "FunctionManager", func_name: str) -> Callable:
-    """Build a stable delegating wrapper whose identity is fixed but delegates to the live sandbox proxy.
-
-    The wrapper is registered once and never replaced. Every call forwards to the
-    current sandbox proxy, so callers holding a reference are never stale.
-    """
-    # Stable wrapper -- delegates to the live sandbox proxy on every call.
-    # The proxy from getattr already has sandbox bound via closure capture.
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        sandbox = manager._oap_sandbox_builder.get_sandbox(freeze_namespaces=False)
-        proxy = getattr(sandbox, func_name)
-        return proxy(*args, **kwargs)
-
-    # Mirror signature from the proxy so inspect.signature sees the real interface.
-    sandbox = manager._oap_sandbox_builder.get_sandbox(freeze_namespaces=False)
-    proxy = getattr(sandbox, func_name)
-    wrapper.__signature__ = inspect.signature(proxy)
-    wrapper.__name__ = proxy.__name__
-    wrapper.__doc__ = getattr(proxy, "__doc__", "")
-
-    return wrapper
-
-
-def _function_status_name(name: str) -> str:
-    # Derive the canonical status buffer name for a single function.
-    return f"{_FUNCTION_STATUS_NAME_BASE}{_sanitize_buffer_name(name)}"
-
-
-def _make_readonly_sentinel(fm: "FunctionManager") -> BeforeUpdateBuffer:
-    """Factory that produces a pre-update hook verifying the MAC on every buffer write.
-
-    The sentinel rejects any write whose content does not carry a valid HMAC signed
-    by the function manager, preventing external modifications to protected buffers.
-    """
-    def readonly_sentinel(
-        buffer_manager: BufferManager,
-        buffer: Buffer,
-        new_buffer: Buffer,
-        args: dict[str, Any],
-    ) -> str | None:
-        # Extract the new text from the hook args.
-        new_text = args.get("new_text")
-        if not new_text:
-            return None
-
-        # Parse the new_text as JSON and verify the HMAC signature.
-        # Reject if the signature does not match -- buffer was modified externally.
-        try:
-            obj = json.loads(new_text)
-            signed = obj.get("data", "")
-            mac = obj.get("mac", "")
-            expect = _compute_mac(fm, json.dumps(signed, sort_keys=True))
-            if not hmac.compare_digest(mac, expect):
-                return "This buffer is protected!"
-        except Exception:
-            return "This buffer is protected!"
-        return None
-    return readonly_sentinel
-
-
-def _build_function_meta(entry: FunctionEntry) -> dict[str, Any]:
-    # Collect the full function metadata as a dict for JSON serialization.
-    return {
-        "name": entry.name,
-        "short_description": entry.short_description,
-        "long_description": entry.long_description,
-        "signature": {
-            "parameters": [
-                {
-                    "name": p.name,
-                    "type": str(p.annotation) if p.annotation is not inspect.Parameter.empty else "Any",
-                    "default": repr(p.default) if p.default is not inspect.Parameter.empty else None,
-                }
-                for p in entry.signature.parameters.values()
-            ],
-            "return": (
-                str(entry.return_annotation)
-                if entry.return_annotation is not inspect.Parameter.empty
-                else "None"
-            ),
-        },
-        "created_at": entry.created_at,
-        "modified_at": entry.modified_at,
-    }
-
-
-async def _refresh_list_buffer(fm: "FunctionManager") -> None:
-    # Collect each function's name, args, and short description for the catalog.
-    records = []
-    for entry in fm._functions.values():
-        arg_summary = ", ".join(p.name for p in entry.signature.parameters.values())
-        records.append({
-            "name": entry.name,
-            "args": f"({arg_summary})",
-            "description": entry.short_description,
-        })
-    # Write the signed JSON catalog to the _FUNCTION_STATUS_BUFFER, replacing existing content.
-    text = _sign_payload(fm, records)
-    await fm.create_buffer(_FUNCTION_STATUS_BUFFER, text=text, overwrite=True)
-
-
 # -------------------------------------------------------------------------------------------------------------------- #
 # Hooks                                                                                                                #
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -500,14 +376,10 @@ def _before_drop_callable_list(
 
 
 class FunctionManager(BufferManager, AgenticObject):
-    """I manage a namespace of runtime-created Callables via `create_function` and `drop_function`.
-    The "system:status:function" buffer catalogs all registered functions.
-    Each function is documented in a system:status:function:<name> buffer for introspection.
-    """
+    """I manage a namespace of runtime-created Callables via `register_function` and `unregister_function`."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._functions: dict[str, FunctionEntry] = {}
         self._callables: dict[str, ManagedCallable] = {}
         self._function_manager_signing_key: str = secrets.token_hex(32)
 
@@ -535,20 +407,6 @@ class FunctionManager(BufferManager, AgenticObject):
         )
         if not isinstance(callables_drop_result, dict) or not callables_drop_result.get("ok"):
             raise RuntimeError(f"failed to register before_drop_callable_list on {_CALLABLES_LIST_BUFFER}: {callables_drop_result.get('error')}")
-
-        # Create the initial catalog buffer.
-        init_result = self._create_buffer(_FUNCTION_STATUS_BUFFER, text=_sign_payload(self, []))
-        if not isinstance(init_result, dict) or not init_result.get("ok"):
-            raise RuntimeError(f"failed to create function list buffer: {init_result.get('error')}")
-
-        # Guard the catalog buffer against unsigned writes.
-        hook_result = self.get_buffer(_FUNCTION_STATUS_BUFFER).register_hook(
-            HookPoint.BEFORE_UPDATE_BUFFER,
-            "readonly_sentinel",
-            _make_readonly_sentinel(self),
-        )
-        if not isinstance(hook_result, dict) or not hook_result.get("ok"):
-            raise RuntimeError(f"failed to register readonly_sentinel on {_FUNCTION_STATUS_BUFFER}: {hook_result.get('error')}")
 
     async def register_function(self, callable: Callable, name: str | None = None) -> dict[str, Any]:
         """Create a ManagedCallable and register it in the functions registry."""
@@ -618,6 +476,15 @@ class FunctionManager(BufferManager, AgenticObject):
 
         return {"ok": True}
 
+    def acquire_function(self, name: str) -> CallableRef | dict[str, Any]:
+        """Return a CallableRef for the named function, creating it if needed."""
+        # Reject when the name is not in the callables registry.
+        if name not in self._callables:
+            return {"ok": False, "error": f"No function named '{name}'."}
+
+        # Create and return a CallableRef for the managed callable.
+        return CallableRef(self._callables[name])
+
     @sandbox
     async def create_function(
         self,
@@ -627,132 +494,36 @@ class FunctionManager(BufferManager, AgenticObject):
         long_description: str = "",
     ) -> dict[str, Any]:
         # Guard: reject duplicate names outright -- the namespace is flat and must stay unique.
-        if name in self._functions:
-            return {
-                "ok": False,
-                "error": f"Function '{name}' already registered.",
-            }
+        # Overwrite the docstring when a long description is available.
+        if long_description:
+            callable.__doc__ = long_description
 
-        # Sanitize the name by replacing colons and slashes with underscores,
-        # then verify it is a valid Python identifier.
-        sanitized = name.replace(":", "_").replace("/", "_")
-        if not sanitized.isidentifier():
-            return {
-                "ok": False,
-                "error": f"'{name}' is not a valid Python identifier.",
-            }
-
-        # Extract metadata from the callable; fall back to its docstring when descriptions are absent.
-        sig = inspect.signature(callable)
-        doc = callable.__doc__ or ""
-        if not short_description:
-            short_description = doc.split("\n")[0].strip() if doc else ""
-        if not long_description:
-            long_description = doc.strip() if doc else ""
-
-        # Assemble the function entry with all metadata, timestamps, and introspection data.
-        # self is never caller-provided — it's bound by the sandbox automatically.
-        required = [p for p, pv in sig.parameters.items() if pv.default is inspect.Parameter.empty and p != "self"]
-        now = time.time()
-        entry = FunctionEntry(
-            name=name,
-            callable=callable,
-            short_description=short_description,
-            long_description=long_description,
-            signature=sig,
-            return_annotation=sig.return_annotation,
-            required_args=required,
-            created_at=now,
-            modified_at=now,
-        )
-
-        # Mirror the function entry into a signed JSON buffer the agent can read;
-        # create_buffer with overwrite=True fires existing buffer hooks automatically.
-        buf_result = await self.create_buffer(
-            _function_status_name(name),
-            text=_sign_payload(self, _build_function_meta(entry)),
-            overwrite=True,
-        )
-        if not isinstance(buf_result, dict) or not buf_result.get("ok"):
-            return {
-                "ok": False,
-                "error": f"Cascaded error due to buffer creation for function description: {buf_result.get('error')}",
-            }
-
-        # Guard the new meta buffer against unsigned writes.
-        hook_result = self.get_buffer(_function_status_name(name)).register_hook(
-            HookPoint.BEFORE_UPDATE_BUFFER,
-            "readonly_sentinel",
-            _make_readonly_sentinel(self),
-        )
-        if not isinstance(hook_result, dict) or not hook_result.get("ok"):
-            return {
-                "ok": False,
-                "error": f"Function '{name}' created but could not be protected: {hook_result.get('error')}",
-            }
-
-        # Register AFTER_DROP_BUFFER to cascade drop to the code buffer.
-        from petekit.function.function_compiler import _CODE_BUFFER_PREFIX
-        code_buffer_name = _CODE_BUFFER_PREFIX + name
-
-        async def _on_function_dropped(bm: "BufferManager", buf: "Buffer", args: dict[str, Any]) -> str | None:
-            # Drop the code buffer when the function is dropped -- no-op if already gone.
-            drop_result = await bm.drop_buffer(code_buffer_name)
-            if not drop_result.get("ok"):
-                _logger.warning(f"[on_function_dropped] cascade to drop_buffer('{code_buffer_name}') failed: {drop_result.get('error')}")
-            return None
-
-        drop_cascade = self.get_buffer(_function_status_name(name)).register_hook(
-            HookPoint.AFTER_DROP_BUFFER,
-            "on_function_dropped",
-            _on_function_dropped,
-        )
-
-        # Register the callable in the function namespace.
-        self._functions[name] = entry
-
-        # Refresh the global function list so the new entry appears in the catalog.
-        await _refresh_list_buffer(self)
-
-        return {
-            "ok": True,
-            "name": name,
-            "args": list(entry.signature.parameters.keys()),
-            "returns": str(entry.return_annotation) if entry.return_annotation is not inspect.Parameter.empty else "None",
-        }
+        # Delegate to register_function.
+        return await self.register_function(callable, name)
 
     @tool
     async def drop_function(self, name: str) -> dict[str, Any]:
-        # Guard: reject unknown names to keep the namespace consistent.
-        if name not in self._functions:
-            return {"ok": False, "error": f"No function named '{name}'."}
-
-        # Drop the function's buffer; a hook rejection prevents the drop and returns the error.
-        buf_name = _function_status_name(name)
-
-        drop_result = await self.drop_buffer(buf_name)
-        if not drop_result.get("ok"):
-            return drop_result
-
-        # Remove the callable from the namespace now that the buffer has been dropped.
-        del self._functions[name]
-
-        # Refresh the global catalog so the removed function no longer appears.
-        await _refresh_list_buffer(self)
-
-        return {"ok": True, "dropped": name}
+        # Delegate to unregister_function.
+        return await self.unregister_function(name)
 
     @sandbox
     def get_function(self, name: str) -> dict[str, Any]:
         # Look up the callable by name; return an error if not found.
-        if name not in self._functions:
+        if name not in self._callables:
             return {"ok": False, "error": f"No function named '{name}'."}
-        entry = self._functions[name]
+        wrapper = self._callables[name]
+        sig = wrapper.__signature__
+        required = [p for p, pv in sig.parameters.items() if pv.default is inspect.Parameter.empty and p != "self"]
+        return_annotation = sig.return_annotation
         return {
             "ok": True,
-            "name": entry.name,
-            "callable": entry.callable,
-            "args": list(entry.signature.parameters.keys()),
-            "required_args": entry.required_args,
-            "returns": str(entry.return_annotation) if entry.return_annotation is not inspect.Parameter.empty else "None",
+            "name": wrapper.__name__,
+            "callable": wrapper.__wrapped__,
+            "args": list(sig.parameters.keys()),
+            "required_args": required,
+            "returns": str(return_annotation) if return_annotation is not inspect.Parameter.empty else "None",
         }
+
+    def has_function(self, name: str) -> bool:
+        """Return True when a function with the given name is registered."""
+        return name in self._callables

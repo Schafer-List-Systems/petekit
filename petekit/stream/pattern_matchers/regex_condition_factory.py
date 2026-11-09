@@ -10,7 +10,7 @@ from typing import Any, Callable
 _logger = logging.getLogger("regex_condition_factory")
 
 from peteos import AgenticObject
-from ...function.function_manager import FunctionManager, _FUNCTION_STATUS_NAME_BASE
+from ...function.function_manager import FunctionManager
 from ...text.buffer_manager import Buffer, BufferManager, HookPoint, _sanitize_buffer_name
 from ..stream_router import RoutingConditionError, CONDITION_FN
 
@@ -100,18 +100,6 @@ def _before_drop_conditions_list(
 ) -> str | None:
     """Block direct drops of the conditions list buffer."""
     return "This buffer is protected by the RegexConditionManager."
-
-
-def _before_drop_function_meta(
-    buffer_manager: BufferManager,
-    buffer: Buffer,
-    args: dict[str, Any],
-) -> str | None:
-    """Block direct drops of function meta buffers."""
-    return (
-        f"Buffer '{buffer.name}' is managed by RegexConditionManager. "
-        f"Remove entries via {_CONDITION_LIST_BUFFER} instead."
-    )
 
 
 def _make_condition(
@@ -297,8 +285,7 @@ async def _after_create_condition(factory: RegexConditionFactory, buffer: Buffer
     pattern_buffer_name = buffer.name
 
     # Skip on replay — the function is already registered from the initial add.
-    # factory._functions preserves state across restart.
-    if condition_name in factory._functions:
+    if factory.has_function(condition_name):
         return True
 
     # Register the pattern management update hook on the new config buffer.
@@ -327,22 +314,6 @@ async def _after_create_condition(factory: RegexConditionFactory, buffer: Buffer
     )
     if not func_result.get("ok"):
         return f"condition '{condition_name}' could not be added: {func_result.get('error')}"
-
-    # Guard the meta buffer against direct drops — remove via the conditions list.
-    meta_name = f"{_FUNCTION_STATUS_NAME_BASE}{condition_name}"
-
-    meta_buffer = factory.get_buffer(meta_name)
-    reg_result = meta_buffer.register_hook(
-        HookPoint.BEFORE_DROP_BUFFER,
-        "before_drop_function_meta",
-        _before_drop_function_meta,
-    )
-    if not reg_result.get("ok"):
-        return (
-            f"condition '{condition_name}' could not be added: "
-            f"before_drop_function_meta could not be registered on '{meta_name}': "
-            f"{reg_result.get('error')}"
-        )
 
     # Sync the conditions list now that the condition is created.
     return await _after_update_condition(factory, None, buffer, args)
