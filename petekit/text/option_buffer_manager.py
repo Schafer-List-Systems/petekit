@@ -223,9 +223,14 @@ async def _fire_action(
                 _logger.error(f"[_fire_action] !notify failed for '{origin}': {error}")
 
     else:
-        result = await option_buffer_manager.call_function(action, buffer_name=origin)
+        # Get the kwargs for the custom action.
+        kwargs = config.get("kwargs", {})
+
+        # Call the custom action and log an error when it fails.
+        result = await option_buffer_manager.call_function(action, kwargs)
         if not isinstance(result, dict) or not result.get("ok"):
-            _logger.error(f"[_fire_action] custom action '{action}' failed for '{origin}'")
+            error_msg = result.get("error", "unknown error") if isinstance(result, dict) else "unknown error"
+            _logger.error(f"[_fire_action] custom action '{action}' failed for '{origin}': {error_msg}")
 
 
 # -------------------------------------------------------------------------------------------------------------------- #

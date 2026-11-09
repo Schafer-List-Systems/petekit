@@ -1,9 +1,10 @@
-"""FunctionCompiler — FunctionManager subclass that compiles source-code strings into live callables."""
+"""FunctionCompiler -- FunctionManager subclass that compiles source-code strings into live callables."""
 
 from __future__ import annotations
 
 import ast
 import inspect
+import json
 import logging
 from pathlib import Path
 from typing import Any, Callable
@@ -11,56 +12,99 @@ from typing import Any, Callable
 from peteos.oap.agentic_object import AgenticObject
 from peteos.sandbox import SandboxBuilder
 
-from petekit.function.function_manager import FunctionManager
+from petekit.function.function_manager import FunctionManager, _check_signatures_compatible
 from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint, AfterBufferDropped, AfterUpdateBuffer, BeforeDropBuffer, BeforeUpdateBuffer, _get_persistence_dir
+from petekit.text.option_buffer_manager import OptionBufferManager, _origin_name_from_option_buffer_name
 
 _CODE_BUFFER_PREFIX = "system:code:"
+_CODE_BUFFER_SUFFIX = "[python]"
+_CODE_BUFFER_OPTION_BUFFER_PATTERN = rf".+\[{_CODE_BUFFER_SUFFIX[1:-1]}\]$"
 _FUNCTION_COMPILER_DOC_BUFFER = "doc:function_compiler"
 _logger = logging.getLogger(__name__)
 
 
 _FUNCTION_COMPILER_DOC = """\
-## Schema
+## Compile Python source into live callable functions
 
-Each compiled function lives in a `system:code:<name>` buffer. The buffer holds the
-Python source. The function is automatically compiled and registered when the buffer
-is created, and re-compiled when the buffer is updated.
+The FunctionCompiler turns arbitrary source code buffers into registered, callable
+functions. Source is validated, compiled, and wired into the sandbox on every change.
 
 ## Create a function
 
-Create a `system:code:<name>` buffer with your Python source. The function name in the
-source must match the buffer name suffix. Only one top-level `def` is allowed.
+**Step 1** — Create a buffer holding your Python source. A `.py` suffix is
+recommended. Only one top-level `def` is allowed.
 
-Result: `{"ok": true, "name": "...", "args": [...], "returns": "..."}`
+```
+buffer: my_module.py
+content: def greet(name): return f"Hello, {name}!"
+```
 
-On error: `{"ok": false, "error": "SyntaxError at line 2: ..."}`
+**Step 2** — Create the `[python]` option buffer on that source to trigger compilation
+and registration. The config can be an empty `{}` — the origin is derived from the
+option buffer name automatically.
 
-The first line of the docstring becomes the short description. The full docstring
-is the long description. The function is immediately callable.
+Buffer name: `my_module.py[python]`
+Config: `{}`
+
+The function is compiled and registered. Its name is whatever you called it
+in the Python source — in the example above: `greet`.
 
 ## Update a function
 
-Overwrite the `system:code:<name>` buffer with new source. The function is re-compiled
-automatically. If the source is invalid the update is rejected with a compile error
-and the previous source remains active.
+Overwrite the source buffer (`my_module.py`) with new Python code. The `[python]`
+option buffer update triggers re-validation, signature-compatibility checking, and
+re-compilation. If the new signature is incompatible with existing callers the update
+is rejected. The function must not be renamed — the name in the source must match the
+registered name.
 
 ## Drop a function
 
-Drop the `system:code:<name>` buffer. The function and its introspection buffer are
-removed automatically.
+Drop the `[python]` option buffer. The function is unregistered. Active `CallableRef`
+references block the drop until they are released.
+
+## Constraints
+
+- The source must define exactly one function at the top level.
+- Function names are fixed for the lifetime of the registration — renaming is
+  rejected at the `before_update` hook.
+- Signature changes are accepted only when they are backward-compatible
+  (no required parameter removed, no parameter kind narrowed).
 """
 
 
-# --- Internal helpers ---
+# -------------------------------------------------------------------------------------------------------------------- #
+# Utils                                                                                                                #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+def _get_code_config(buffer: Buffer) -> dict[str, Any] | str:
+    """Read and parse the JSON config from a code option buffer.
+
+    Returns the parsed config dict on success, or an error string if the buffer is
+    absent, empty, or contains invalid JSON.
+    """
+    # Read the raw text from the buffer.
+    buffer_text = buffer.get_text()
+    if not buffer_text:
+        return f"[FunctionCompiler] buffer '{buffer.name}' is empty"
+
+    # Parse the JSON config from the buffer text.
+    try:
+        config = json.loads(buffer_text)
+    except json.JSONDecodeError as e:
+        return f"[FunctionCompiler] buffer '{buffer.name}' has invalid JSON: {e}"
+
+    return config
+
 
 def _validate_and_trial_compile(
     compiler: "FunctionCompiler",
     source: str,
-) -> str:
+) -> tuple[str, inspect.Signature]:
     """Validate source structure and run a trial compilation without committing to the real sandbox.
 
     Parses the AST, enforces a single FunctionDef, and compiles into a throwaway builder.
-    Returns the function name on success. Raises on any validation or compilation failure.
+    Returns (func_name, signature) on success. Raises on any validation or compilation failure.
     """
     # Parse and require exactly one FunctionDef as the sole top-level construct.
     try:
@@ -76,14 +120,14 @@ def _validate_and_trial_compile(
         node_type = type(top_level_nodes[0]).__name__
         raise ValueError(f"Top-level construct must be a function definition, found '{node_type}'.")
 
-    # Derive the canonical function name from the AST — the single source of truth.
+    # Derive the canonical function name from the AST -- the single source of truth.
     func_name = top_level_nodes[0].name
 
-    # Trial compilation — mutate a throwaway child builder, not the real one.
+    # Trial compilation -- mutate a throwaway child builder, not the real one.
     trial_name = f"{compiler._oap_sandbox_builder._name}_trial"
     trial = SandboxBuilder(trial_name, base=compiler._oap_sandbox_builder)
 
-    # Attempt to add to the trial builder — catches all compilation errors.
+    # Attempt to add to the trial builder -- catches all compilation errors.
     try:
         entries = trial.add_source_code(source)
     except Exception as e:
@@ -91,7 +135,10 @@ def _validate_and_trial_compile(
     if not entries:
         raise ValueError(f"add_source_code returned no entries for '{func_name}'.")
 
-    return func_name
+    # Extract and return the signature from the trial sandbox proxy.
+    trial_sandbox = trial.get_sandbox(freeze_namespaces=False)
+    proxy = getattr(trial_sandbox, func_name)
+    return (func_name, inspect.signature(proxy))
 
 
 def _compile_function(
@@ -110,8 +157,9 @@ def _compile_function(
 
     Returns (func_name, proxy) on success. Raises on any validation or compilation failure.
     """
-    # Validation and trial compilation — raises on failure.
-    func_name = _validate_and_trial_compile(compiler, source)
+    # Validation and trial compilation -- raises on failure.
+    func_name, _sig = _validate_and_trial_compile(compiler, source)
+    del _sig  # signature from trial compile is not needed in _compile_function
 
     # Derive the source path from the persisted buffer file when a buffer name is given.
     if buffer_name is not None:
@@ -128,13 +176,70 @@ def _compile_function(
     return (func_name, proxy)
 
 
+async def _register_function_with_hooks(
+    compiler: FunctionCompiler,
+    proxy: Callable,
+    function_name: str,
+    origin_buffer: Buffer,
+    origin_name: str,
+) -> str | None:
+    """Register a compiled proxy in the function manager and attach update and drop hooks on the origin buffer."""
+    # Enlist the function in the function manager so callers can acquire and call it.
+    # Side effect: the callable becomes visible to get_function and callable refs are created.
+    register_result = await compiler.register_function(proxy, function_name)
+    if not register_result.get("ok"):
+        return f"register failed for '{function_name}': {register_result.get('error')}"
+
+    # Reject any source change that would rename the function or break existing callers
+    # with an incompatible signature -- must happen before the buffer update is accepted.
+    before_hook = origin_buffer.register_hook(
+        HookPoint.BEFORE_UPDATE_BUFFER,
+        "function_compiler:before_update_code",
+        _before_update_code,
+    )
+    if not before_hook.get("ok"):
+        return f"failed to register before_update_code on '{origin_name}': {before_hook.get('error')}"
+
+    # Recompile the function and replace the registered callable after every source update.
+    # This hook fires after the buffer update has already succeeded -- it performs the swap.
+    after_hook = origin_buffer.register_hook(
+        HookPoint.AFTER_UPDATE_BUFFER,
+        "function_compiler:after_update_code",
+        _after_update_code,
+    )
+    if not after_hook.get("ok"):
+        return f"failed to register after_update_code on '{origin_name}': {after_hook.get('error')}"
+
+    # Block the buffer drop when the function has active callable refs -- callers may depend on it.
+    # The drop is rejected until every reference has been released.
+    before_drop_hook = origin_buffer.register_hook(
+        HookPoint.BEFORE_DROP_BUFFER,
+        "function_compiler:before_drop_code",
+        _before_drop_code,
+    )
+    if not before_drop_hook.get("ok"):
+        return f"failed to register before_drop_code on '{origin_name}': {before_drop_hook.get('error')}"
+
+    # Unregister the function from the function manager after the buffer is dropped.
+    # Side effect: the callable is removed from the manager; callable refs become invalid.
+    after_drop_hook = origin_buffer.register_hook(
+        HookPoint.AFTER_DROP_BUFFER,
+        "function_compiler:after_drop_code",
+        _after_drop_code,
+    )
+    if not after_drop_hook.get("ok"):
+        return f"failed to register after_drop_code on '{origin_name}': {after_drop_hook.get('error')}"
+
+    return None
+
+
 def _make_stable_wrapper(compiler: "FunctionCompiler", func_name: str) -> Callable:
     """Build a stable delegating wrapper whose identity is fixed but delegates to the live sandbox proxy.
 
     The wrapper is registered once and never replaced. Every call forwards to the
     current sandbox proxy, so callers holding a reference are never stale.
     """
-    # Stable wrapper — delegates to the live sandbox proxy on every call.
+    # Stable wrapper -- delegates to the live sandbox proxy on every call.
     # The proxy from getattr already has sandbox bound via closure capture.
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         sandbox = compiler._oap_sandbox_builder.get_sandbox(freeze_namespaces=False)
@@ -151,6 +256,11 @@ def _make_stable_wrapper(compiler: "FunctionCompiler", func_name: str) -> Callab
     return wrapper
 
 
+# -------------------------------------------------------------------------------------------------------------------- #
+# Hooks                                                                                                                #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
 def _make_on_update_code(compiler: "FunctionCompiler", func_name: str) -> BeforeUpdateBuffer:
     """Factory producing a pre-update hook that validates source code on every buffer mutation.
 
@@ -164,9 +274,9 @@ def _make_on_update_code(compiler: "FunctionCompiler", func_name: str) -> Before
         args: dict[str, Any],
     ) -> bool | str | None:
         new_text = new_buffer.get_text()
-        # Validate structure and run trial compilation — raises on any error.
+        # Validate structure and run trial compilation -- raises on any error.
         try:
-            compiled_name = _validate_and_trial_compile(compiler, new_text)
+            compiled_name, _ = _validate_and_trial_compile(compiler, new_text)
         except ValueError as e:
             return str(e)
 
@@ -174,7 +284,7 @@ def _make_on_update_code(compiler: "FunctionCompiler", func_name: str) -> Before
         if compiled_name != func_name:
             return f"Function name must be '{func_name}', found '{compiled_name}'"
 
-        return None  # validation passed — allow the buffer update
+        return None  # validation passed -- allow the buffer update
 
     return on_update_code
 
@@ -189,7 +299,7 @@ def _make_on_code_drop(compiler: "FunctionCompiler", func_name: str) -> BeforeDr
         buffer: Buffer,
         args: dict[str, Any],
     ) -> str | None:
-        # Delegate to drop_function — removes the introspection buffer and the callable.
+        # Delegate to drop_function -- removes the introspection buffer and the callable.
         drop_result = await compiler.drop_function(func_name)
         # Log if the cascade failed, but still allow the buffer drop.
         if not drop_result.get("ok"):
@@ -203,7 +313,7 @@ def _make_on_code_dropped(compiler: "FunctionCompiler", func_name: str) -> After
     """Factory producing the AFTER_DROP_BUFFER safety-net hook for system:code:.* buffers.
 
     Fires after the buffer is dropped. If the function is still registered, the normal
-    cascade in on_code_drop failed somehow — this logs the anomaly but does not
+    cascade in on_code_drop failed somehow -- this logs the anomaly but does not
     re-attempt the cascade to avoid re-entrancy issues.
     """
     def on_code_dropped(
@@ -211,10 +321,10 @@ def _make_on_code_dropped(compiler: "FunctionCompiler", func_name: str) -> After
         buffer: Buffer,
         args: dict[str, Any],
     ) -> None:
-        # Check whether the function is still registered — it should have been removed by on_code_drop.
+        # Check whether the function is still registered -- it should have been removed by on_code_drop.
         buffer_name = buffer.name
-        if func_name in compiler._functions:
-            _logger.warning(f"[on_code_dropped] buffer '{buffer_name}' dropped but func '{func_name}' still in namespace — normal cascade may have failed")
+        if compiler.has_function(func_name):
+            _logger.warning(f"[on_code_dropped] buffer '{buffer_name}' dropped but func '{func_name}' still in namespace -- normal cascade may have failed")
         else:
             _logger.debug(f"[on_code_dropped] buffer '{buffer_name}' dropped, func '{func_name}' already gone (normal)")
 
@@ -233,7 +343,7 @@ def _make_on_code_updated(compiler: FunctionCompiler, func_name: str, buf_name: 
         new_buffer: Buffer,
         args: dict[str, Any],
     ) -> None:
-        # Read the new source from the persisted buffer file — the authoritative content after the update.
+        # Read the new source from the persisted buffer file -- the authoritative content after the update.
         source_path = _get_persistence_dir(compiler) / buf_name
         if not source_path.exists():
             return
@@ -242,29 +352,341 @@ def _make_on_code_updated(compiler: FunctionCompiler, func_name: str, buf_name: 
         try:
             compiler._oap_sandbox_builder.add_source_code(source_path)
         except Exception:
-            return  # best-effort — log and continue
-
-        # Refresh the function catalog so the updated entry is visible.
-        from petekit.function.function_manager import _refresh_list_buffer
-        await _refresh_list_buffer(compiler)
+            return  # best-effort -- log and continue
 
     return on_code_updated
 
 
-# --- Hook handlers ---
+# -------------------------------------------------------------------------------------------------------------------- #
+# Code Option Buffer Hooks                                                                                             #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+async def _before_create_code_option(
+    compiler: FunctionCompiler,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_UPDATE_BUFFER hook for [python] option buffers -- validate source before mutation."""
+    # Get the JSON config from the code option buffer.
+    config = _get_code_config(new_buffer)
+    if isinstance(config, str):
+        return config
+
+    # Derive the origin buffer name from the option buffer name.
+    origin_name = _origin_name_from_option_buffer_name(new_buffer.name)
+    if origin_name is None:
+        return f"[_before_update_code_option] cannot derive origin from '{new_buffer.name}'"
+
+    # Read the source code from the origin buffer.
+    origin_buffer = compiler.get_buffer(origin_name)
+    if origin_buffer is None:
+        return f"[_before_update_code_option] origin buffer '{origin_name}' not found"
+
+    # Extract the source text -- the function body to be validated.
+    source = origin_buffer.get_text()
+    if not source:
+        return f"[_before_update_code_option] source in '{origin_name}' is empty"
+
+    # Validate and trial-compile -- return an error when the source is invalid.
+    try:
+        func_name, _ = _validate_and_trial_compile(compiler, source)
+    except ValueError as e:
+        return str(e)
+
+    # Check for naming conflicts -- new functions must not already exist.
+    if compiler.has_function(func_name):
+        return f"[_before_update_code_option] function '{func_name}' already exists"
+
+    # Persist the function name in the buffer config so it survives restarts.
+    config["function_name"] = func_name
+    new_buffer.set_text(json.dumps(config, indent=2) + "\n")
+
+
+async def _before_update_code_option(
+    compiler: FunctionCompiler,
+    old_buffer: Buffer,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_UPDATE_BUFFER hook for [python] option buffers -- validate source before mutation."""
+    # Get the JSON config from the code option buffer.
+    config = _get_code_config(new_buffer)
+    if isinstance(config, str):
+        return config
+
+    # Derive the origin buffer name from the option buffer name.
+    origin_name = _origin_name_from_option_buffer_name(new_buffer.name)
+    if origin_name is None:
+        return f"[_before_update_code_option] cannot derive origin from '{new_buffer.name}'"
+
+    # Read the source code from the origin buffer.
+    origin_buffer = compiler.get_buffer(origin_name)
+    if origin_buffer is None:
+        return f"[_before_update_code_option] origin buffer '{origin_name}' not found"
+
+    # Extract the source text -- the function body to be validated.
+    source = origin_buffer.get_text()
+    if not source:
+        return f"[_before_update_code_option] source in '{origin_name}' is empty"
+
+    # Validate and trial-compile -- return an error when the source is invalid.
+    try:
+        func_name, _ = _validate_and_trial_compile(compiler, source)
+    except ValueError as e:
+        return str(e)
+
+    # Read the old config to compare function names.
+    old_config = _get_code_config(old_buffer)
+    if isinstance(old_config, str):
+        return f"[_before_update_code_option] could not read old config: {old_config}"
+
+    # Reject the update when the function name in the source differs from the persisted one.
+    old_func_name = old_config.get("function_name")
+    if old_func_name is not None and old_func_name != func_name:
+        return f"[_before_update_code_option] renaming functions is not allowed ('{old_func_name}' -> '{func_name}')"
+
+    # Persist the function name in the buffer config so it survives restarts.
+    config["function_name"] = func_name
+    new_buffer.set_text(json.dumps(config, indent=2) + "\n")
+
+    return None
+
+
+async def _after_update_code_option(
+    compiler: FunctionCompiler,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """AFTER_UPDATE_BUFFER hook for code option buffers -- recompile from the origin buffer."""
+    # Parse the configuration from the new buffer.
+    try:
+        config = json.loads(new_buffer.get_text())
+    except json.JSONDecodeError as e:
+        _logger.error(f"[_after_update_code_option] option buffer is not valid JSON: {e.msg} — buffer: {new_buffer.name}")
+        return None
+
+    # Derive the origin buffer name from the option buffer configuration.
+    origin_name = _origin_name_from_option_buffer_name(new_buffer.name)
+    if not origin_name:
+        _logger.error(f"[_after_update_code_option] option buffer is missing 'origin' field: {new_buffer.name}")
+        return None
+
+    # Get the origin buffer.
+    origin_buffer = compiler.get_buffer(origin_name)
+    if origin_buffer is None:
+        _logger.error(f"[_after_update_code_option] origin buffer not found: {origin_name}")
+        return None
+
+    # Extract the source code from the origin buffer.
+    source = origin_buffer.get_text()
+    if not source.strip():
+        _logger.error(f"[_after_update_code_option] origin buffer is empty: {origin_name}")
+        return None
+
+    # Validate and compile -- raises on any error.
+    try:
+        func_name, proxy = _compile_function(compiler, source)
+    except ValueError as e:
+        _logger.error(f"[_after_update_code_option] compile failed for '{origin_name}': {e}")
+        return None
+
+    # Determine whether this is an initial registration or an update.
+    # Initial registration -- the buffer is new or the old config is absent.
+    function_name = config.get("function_name")
+    if old_buffer is None:
+        hook_error = await _register_function_with_hooks(compiler, proxy, function_name, origin_buffer, origin_name)
+        if hook_error is not None:
+            _logger.error(f"[_after_update_code_option] {hook_error}")
+        return None
+
+    # Try to retrieve the old config to check whether this is an update.
+    try:
+        json.loads(old_buffer.get_text())
+    except json.JSONDecodeError:
+        hook_error = await _register_function_with_hooks(compiler, proxy, function_name, origin_buffer, origin_name)
+        if hook_error is not None:
+            _logger.error(f"[_after_update_code_option] {hook_error}")
+        return None
+
+
+async def _before_update_code(
+    compiler: FunctionCompiler,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_UPDATE_BUFFER hook for code buffers -- validate the update does not rename the function."""
+    # Derive the config buffer name from the code buffer name.
+    config_buffer_name = new_buffer.name + _CODE_BUFFER_SUFFIX
+
+    # Get the config buffer and read the function name from it.
+    config_buffer = compiler.get_buffer(config_buffer_name)
+    if config_buffer is None:
+        return f"[_before_update_code] config buffer not found: {config_buffer_name}"
+
+    config = _get_code_config(config_buffer)
+    if isinstance(config, str):
+        return f"[_before_update_code] could not read config: {config}"
+
+    # Retrieve the function name from the config.
+    func_name = config.get("function_name")
+    if not func_name:
+        return f"[_before_update_code] config is missing 'function_name': {config_buffer_name}"
+
+    # Extract the new source and trial-compile to get the proposed new function name and signature.
+    new_source = new_buffer.get_text()
+    try:
+        new_func_name, new_sig = _validate_and_trial_compile(compiler, new_source)
+    except ValueError as e:
+        return str(e)
+
+    # Reject when the new source defines a function with a different name.
+    if new_func_name != func_name:
+        return f"[_before_update_code] renaming functions is not allowed ('{func_name}' -> '{new_func_name}')"
+
+    # Get the signature of the currently registered callable.
+    wrapper = compiler._callables.get(func_name)
+    if wrapper is None:
+        return f"[_before_update_code] function '{func_name}' not in callables"
+    old_sig = wrapper.__signature__
+
+    # Check that the new signature is compatible with the registered callable.
+    compatible_error = _check_signatures_compatible(old_sig, new_sig)
+    if compatible_error is not None:
+        return f"[_before_update_code] function '{func_name}' signature incompatible: {compatible_error}"
+
+
+async def _after_update_code(
+    compiler: FunctionCompiler,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """AFTER_UPDATE_BUFFER hook for code buffers -- compile updated source and update the registered callable."""
+    # Derive the config buffer name from the code buffer name.
+    config_buffer_name = new_buffer.name + _CODE_BUFFER_SUFFIX
+
+    # Get the config buffer and reject when it is absent.
+    config_buffer = compiler.get_buffer(config_buffer_name)
+    if config_buffer is None:
+        _logger.error(f"[_after_update_code] config buffer not found: {config_buffer_name}")
+        return None
+
+    # Parse the config from the config buffer.
+    config = _get_code_config(config_buffer)
+    if isinstance(config, str):
+        _logger.error(f"[_after_update_code] could not read config: {config}")
+        return None
+
+    # Retrieve the function name from the config.
+    func_name = config.get("function_name")
+    if not func_name:
+        _logger.error(f"[_after_update_code] config is missing 'function_name': {config_buffer_name}")
+        return None
+
+    # Extract the updated source from the buffer.
+    source = new_buffer.get_text()
+    if not source.strip():
+        _logger.error(f"[_after_update_code] source buffer is empty: {new_buffer.name}")
+        return None
+
+    # Compile the source to get the new proxy.
+    try:
+        _func_name, proxy = _compile_function(compiler, source)
+    except ValueError as e:
+        _logger.error(f"[_after_update_code] compile failed for '{func_name}': {e}")
+        return None
+
+    # Update the registered callable with the newly compiled proxy.
+    update_result = await compiler.update_registered_function(proxy, func_name)
+    if not update_result.get("ok"):
+        _logger.error(f"[_after_update_code] update failed for '{func_name}': {update_result.get('error')}")
+
+
+async def _before_drop_code(
+    compiler: FunctionCompiler,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_DROP_BUFFER hook for code buffers -- reject drop when the function has active references."""
+    # Derive the config buffer name from the code buffer name.
+    config_buffer_name = buffer.name + _CODE_BUFFER_SUFFIX
+
+    # Get the config buffer and reject when it is absent.
+    config_buffer = compiler.get_buffer(config_buffer_name)
+    if config_buffer is None:
+        return None
+
+    # Parse the config from the config buffer.
+    config = _get_code_config(config_buffer)
+    if isinstance(config, str):
+        return None
+
+    # Retrieve the function name from the config.
+    func_name = config.get("function_name")
+    if not func_name:
+        return None
+
+    # Check whether the function has active references.
+    if not compiler.has_function(func_name):
+        return None
+    wrapper = compiler._callables.get(func_name)
+    if wrapper is not None and wrapper._reference_count > 0:
+        return f"[_before_drop_code] function '{func_name}' is still in use (ref_count={wrapper._reference_count})"
+
+    return None
+
+
+async def _after_drop_code(
+    compiler: FunctionCompiler,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """AFTER_DROP_BUFFER hook for code buffers -- unregister the function from the function manager."""
+    # Derive the config buffer name from the code buffer name.
+    config_buffer_name = buffer.name + _CODE_BUFFER_SUFFIX
+
+    # Get the config buffer.
+    config_buffer = compiler.get_buffer(config_buffer_name)
+    if config_buffer is None:
+        _logger.error(f"[_after_drop_code] config buffer not found: {config_buffer_name}")
+        return None
+
+    # Parse the config from the config buffer.
+    config = _get_code_config(config_buffer)
+    if isinstance(config, str):
+        _logger.error(f"[_after_drop_code] could not read config: {config}")
+        return None
+
+    # Retrieve the function name from the config.
+    func_name = config.get("function_name")
+    if not func_name:
+        _logger.error(f"[_after_drop_code] config is missing 'function_name': {config_buffer_name}")
+        return None
+
+    # Unregister the function from the function manager.
+    unregister_result = await compiler.unregister_function(func_name)
+    if not unregister_result.get("ok"):
+        _logger.error(f"[_after_drop_code] unregister failed for '{func_name}': {unregister_result.get('error')}")
+        return None
+
+    _logger.info(f"[>>] '{func_name}' unregistered after buffer drop")
+
 
 async def _on_create_code(
     compiler: FunctionCompiler,
     buffer_name: str,
     args: dict[str, Any],
 ) -> str | None:
-    """BEFORE_CREATE_BUFFER hook for the system:code: scope — compiles and registers a function from source text."""
+    """BEFORE_CREATE_BUFFER hook for the system:code: scope -- compiles and registers a function from source text."""
     # Parse the source from the create args.
     source: str = args.get("text", "")
     if not source.strip():
         return "source buffer is empty"
 
-    # Validate and compile — raises on any error.
+    # Validate and compile -- raises on any error.
     try:
         func_name, proxy = _compile_function(compiler, source)
     except ValueError as e:
@@ -275,7 +697,7 @@ async def _on_create_code(
     short_description = doc.split("\n")[0].strip() if doc else ""
     long_description = doc.strip() if doc else ""
 
-    # Build stable wrapper — its identity is fixed, it delegates to the live sandbox proxy.
+    # Build stable wrapper -- its identity is fixed, it delegates to the live sandbox proxy.
     stable_wrapper = _make_stable_wrapper(compiler, func_name)
 
     # Register in the function namespace via the parent.
@@ -303,12 +725,12 @@ async def _on_code_created(
     new_buffer: Buffer,
     args: dict[str, Any],
 ) -> str | None:
-    """AFTER_CREATE_BUFFER hook for the system:code: scope — registers pre/post update and drop hooks on the new buffer."""
-    # Derive the function name from the buffer name — prefix confirmed by scope registration.
+    """AFTER_CREATE_BUFFER hook for the system:code: scope -- registers pre/post update and drop hooks on the new buffer."""
+    # Derive the function name from the buffer name -- prefix confirmed by scope registration.
     buffer_name = new_buffer.name
     func_name = buffer_name[len(_CODE_BUFFER_PREFIX) :]
 
-    # Register the on_update_code guard as a pre-update hook — validates source before mutation.
+    # Register the on_update_code guard as a pre-update hook -- validates source before mutation.
     guard_result = new_buffer.register_hook(
         HookPoint.BEFORE_UPDATE_BUFFER,
         "on_update_code",
@@ -317,7 +739,7 @@ async def _on_code_created(
     if not isinstance(guard_result, dict) or not guard_result.get("ok"):
         return f"failed to register on_update_code on {buffer_name}: {guard_result.get('error')}"
 
-    # Register the on_code_updated post-update hook — commits to sandbox and refreshes the catalog.
+    # Register the on_code_updated post-update hook -- commits to sandbox and refreshes the catalog.
     commit_result = new_buffer.register_hook(
         HookPoint.AFTER_UPDATE_BUFFER,
         "on_code_updated",
@@ -326,7 +748,7 @@ async def _on_code_created(
     if not isinstance(commit_result, dict) or not commit_result.get("ok"):
         return f"failed to register on_code_updated on {buffer_name}: {commit_result.get('error')}"
 
-    # Register the on_code_drop pre-drop hook — cascades buffer drop to the function namespace.
+    # Register the on_code_drop pre-drop hook -- cascades buffer drop to the function namespace.
     drop_result = new_buffer.register_hook(
         HookPoint.BEFORE_DROP_BUFFER,
         "on_code_drop",
@@ -335,7 +757,7 @@ async def _on_code_created(
     if not isinstance(drop_result, dict) or not drop_result.get("ok"):
         return f"failed to register on_code_drop on {buffer_name}: {drop_result.get('error')}"
 
-    # Register the on_code_dropped safety-net — logs if the function is still registered after the drop.
+    # Register the on_code_dropped safety-net -- logs if the function is still registered after the drop.
     dropped_result = new_buffer.register_hook(
         HookPoint.AFTER_DROP_BUFFER,
         "on_code_dropped",
@@ -347,7 +769,12 @@ async def _on_code_created(
     return None
 
 
-class FunctionCompiler(FunctionManager, AgenticObject):
+# -------------------------------------------------------------------------------------------------------------------- #
+# FunctionCompiler                                                                                                     #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+class FunctionCompiler(FunctionManager, OptionBufferManager, AgenticObject):
     """I compile Python source-code strings into live callable functions.
     "doc:function_compiler" holds details.
     """
@@ -355,25 +782,57 @@ class FunctionCompiler(FunctionManager, AgenticObject):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
 
-        # Register the BEFORE_CREATE_BUFFER scope hook — compiles and registers functions on buffer creation.
+        # Seed the function compiler documentation buffer.
+        self._create_buffer(_FUNCTION_COMPILER_DOC_BUFFER, text=_FUNCTION_COMPILER_DOC)
+
+        # Register the BEFORE_CREATE_BUFFER scope hook -- compiles and registers functions on buffer creation.
         on_create_result = self.register_buffer_pattern_hook(
             HookPoint.BEFORE_CREATE_BUFFER,
-            "on_create_code",
+            "function_compiler:on_create_code",
             _CODE_BUFFER_PREFIX + ".*",
             _on_create_code,
         )
         if not isinstance(on_create_result, dict) or not on_create_result.get("ok"):
             raise RuntimeError(f"failed to register on_create_code hook: {on_create_result.get('error')}")
 
-        # Register the AFTER_CREATE_BUFFER scope hook — registers pre/post update hooks on new code buffers.
+        # Register the AFTER_CREATE_BUFFER scope hook -- registers pre/post update hooks on new code buffers.
         on_created_result = self.register_buffer_pattern_hook(
             HookPoint.AFTER_CREATE_BUFFER,
-            "on_code_created",
+            "function_compiler:on_code_created",
             _CODE_BUFFER_PREFIX + ".*",
             _on_code_created,
         )
         if not isinstance(on_created_result, dict) or not on_created_result.get("ok"):
             raise RuntimeError(f"failed to register on_code_created hook: {on_created_result.get('error')}")
 
-        # Seed the function compiler documentation buffer.
-        self._create_buffer(_FUNCTION_COMPILER_DOC_BUFFER, text=_FUNCTION_COMPILER_DOC)
+        # Register the before hooks for [python] option buffers -- validate source before mutation.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_CREATE_BUFFER,
+            "function_compiler:python_code_option_before_create",
+            _CODE_BUFFER_OPTION_BUFFER_PATTERN,
+            _before_create_code_option,
+            apply_to_existing=True,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_UPDATE_BUFFER,
+            "function_compiler:python_code_option_before_update",
+            _CODE_BUFFER_OPTION_BUFFER_PATTERN,
+            _before_update_code_option,
+            apply_to_existing=True,
+        )
+
+        # Register the after hooks for [python] option buffers -- compile and register after mutation.
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_UPDATE_BUFFER,
+            "function_compiler:python_code_option_after_update",
+            _CODE_BUFFER_OPTION_BUFFER_PATTERN,
+            _after_update_code_option,
+            apply_to_existing=True,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            "function_compiler:python_code_option_after_create",
+            _CODE_BUFFER_OPTION_BUFFER_PATTERN,
+            lambda bm, new_buffer, args: _after_update_code_option(bm, None, new_buffer, args),
+            apply_to_existing=True,
+        )

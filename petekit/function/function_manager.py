@@ -20,6 +20,18 @@ from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint, AfterU
 _logger = logging.getLogger(__name__)
 
 _CALLABLES_LIST_BUFFER = "sys/callables.json"
+_FUNCTION_MANAGER_DOC_BUFFER = "doc:function_manager"
+
+
+_FUNCTION_MANAGER_DOC = """\
+## FunctionManager -- runtime Callable management
+
+The FunctionManager holds registered callables in `sys/callables.json`. That buffer
+is the authoritative list of every live callable -- its name, signature, and module.
+
+Do not edit this buffer manually -- it is managed automatically by the FunctionManager
+and protected against unauthorized modification.
+"""
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -51,13 +63,16 @@ class ManagedCallable:
         # Swap the callable and refresh all fields via _update_callable -- sets version to 1.
         self._update_callable(callable)
 
-    def __del__(self) -> None:
-        """Decrement the reference counter when the wrapper is garbage collected."""
-        raise NotImplementedError("stub only")
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    async def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Forward the call to the current callable in the FunctionManager."""
-        raise NotImplementedError("stub only")
+        # Call the underlying wrapped callable with the caller's arguments.
+        result = self.__wrapped__(*args, **kwargs)
+
+        # Await the result if it is a coroutine (i.e. the wrapped callable is an async def).
+        if inspect.iscoroutine(result):
+            result = await result
+
+        return result
 
     def acquire(self) -> None:
         """Acquire a callable reference to this managed callable."""
@@ -140,9 +155,9 @@ class CallableRef:
         """Release the reference to the managed callable when garbage collected."""
         self._managed.release()
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    async def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Forward the call to the managed callable."""
-        return self._managed(*args, **kwargs)
+        return await self._managed(*args, **kwargs)
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -259,7 +274,7 @@ def _callable_wrapper_to_dict(wrapper: ManagedCallable) -> dict[str, Any]:
     }
 
 
-def _recreate_callable_list(manager: "FunctionManager") -> dict[str, Any]:
+def _recreate_callables_list(manager: "FunctionManager") -> dict[str, Any]:
     """Rebuild the callables list dictionary from the current registry state."""
     # Start with an empty dictionary keyed by function name.
     callables_dict: dict[str, Any] = {}
@@ -279,19 +294,20 @@ def _get_callables_list(manager: "FunctionManager") -> dict[str, Any]:
 
     # When the buffer is absent, recreate the callables dict from the current registry.
     if callables_buffer is None:
-        return _recreate_callable_list(manager)
+        return _recreate_callables_list(manager)
 
     # The buffer is present. Read the raw text from the buffer.
     callables_text = callables_buffer.get_text()
 
-    # Parse and return the JSON list from the buffer text.
+    # Parse and return the data field from the signed JSON buffer.
     try:
-        return json.loads(callables_text)
+        obj = json.loads(callables_text)
+        return obj.get("data", {})
     except json.JSONDecodeError as e:
         _logger.error(f"[_get_callables_list] failed to parse '{_CALLABLES_LIST_BUFFER}': {e}")
-        
+
         # We could not parse the callables list, so we recreate it.
-        return _recreate_callable_list(manager)
+        return _recreate_callables_list(manager)
 
 
 async def _update_callable_list(manager: "FunctionManager", wrapper: ManagedCallable) -> None:
@@ -384,7 +400,7 @@ class FunctionManager(BufferManager, AgenticObject):
         self._function_manager_signing_key: str = secrets.token_hex(32)
 
         # Create the initial callables list buffer.
-        callables_json = json.dumps(_recreate_callable_list(self), indent=2, sort_keys=True)
+        callables_json = json.dumps(_recreate_callables_list(self), indent=2, sort_keys=True)
         callables_result = self._create_buffer(_CALLABLES_LIST_BUFFER, text=callables_json)
         if not isinstance(callables_result, dict) or not callables_result.get("ok"):
             raise RuntimeError(f"failed to create callables list buffer: {callables_result.get('error')}")
@@ -407,6 +423,9 @@ class FunctionManager(BufferManager, AgenticObject):
         )
         if not isinstance(callables_drop_result, dict) or not callables_drop_result.get("ok"):
             raise RuntimeError(f"failed to register before_drop_callable_list on {_CALLABLES_LIST_BUFFER}: {callables_drop_result.get('error')}")
+
+        # Seed the function manager documentation buffer.
+        self._create_buffer(_FUNCTION_MANAGER_DOC_BUFFER, text=_FUNCTION_MANAGER_DOC)
 
     async def register_function(self, callable: Callable, name: str | None = None) -> dict[str, Any]:
         """Create a ManagedCallable and register it in the functions registry."""

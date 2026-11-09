@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, "/home/frygge/projects/AIOS/peteos-kit")
 sys.path.insert(0, "/home/frygge/projects/private/petekit/src/peteos/peteos")
 
-from petekit.function import FunctionCompiler, FunctionEntry, FunctionManager
+from petekit.function import FunctionCompiler, FunctionManager
 from petekit.text.buffer_manager import HookPoint
 
 

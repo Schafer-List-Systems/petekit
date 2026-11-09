@@ -2,7 +2,7 @@
 
 from petekit.function.function_caller import FunctionCaller
 from petekit.function.function_compiler import FunctionCompiler
-from petekit.function.function_manager import FunctionEntry, FunctionManager
+from petekit.function.function_manager import FunctionManager
 from petekit.function.mcp_client import MCPClient
 
-__all__ = ["FunctionCaller", "FunctionCompiler", "FunctionEntry", "FunctionManager", "MCPClient"]
+__all__ = ["FunctionCaller", "FunctionCompiler", "FunctionManager", "MCPClient"]
