@@ -12,6 +12,7 @@ _logger = logging.getLogger("regex_condition_factory")
 from peteos import AgenticObject
 from ...function.function_manager import FunctionManager
 from ...text.buffer_manager import Buffer, BufferManager, HookPoint, _sanitize_buffer_name
+from ...text.option_buffer_manager import _origin_name_from_option_buffer_name
 from ..stream_router import RoutingConditionError, CONDITION_FN
 
 
@@ -19,6 +20,8 @@ _CONDITION_LIST_BUFFER = "system:status:regex_condition"
 _REGEX_DOC_BUFFER = "doc:regex_conditions"
 _REGEX_PATTERN_BUFFER = "system:config:regex_condition"
 _CONDITION_BUFFER_PATTERN = r"^system:config:regex_condition:[^[]+$"
+_REGEX_CONDITION_SUFFIX = "[regex_condition]"
+_REGEX_CONDITION_OPTION_BUFFER_PATTERN = rf".+\[{_REGEX_CONDITION_SUFFIX[1:-1]}\]$"
 _READ_BUFFER_FN = Callable[[str], dict[str, Any]]
 
 
@@ -30,10 +33,11 @@ A regex condition matches incoming text against one or more regular expression
 patterns. The text must fullmatch (the entire line including the trailing newline
 character '\\n') at least one pattern (^...\\n$) for the condition to return True.
 
-### Create a condition
+### Create a condition (two buffers)
 
-Create a pattern buffer with the name `system:config:regex_condition:<condition_name>`
-and provide at least one pattern entry:
+**Step 1 — Origin buffer** (holds the patterns)
+
+Create an <origin_buffer> buffer (e.g., `example-patterns.json`):
 
 ```json
 {{
@@ -44,51 +48,121 @@ and provide at least one pattern entry:
 }}
 ```
 
-The `regex` and `sample_line` are required. The regex is validated against
-`sample_line` immediately — if it does not fullmatch, the creation is rejected.
+**Step 2 — Option buffer** (registers the condition)
 
-To add more patterns, write additional entries to the same buffer.
+Create a buffer named `<origin_buffer>[regex_condition]`:
+
+```json
+{{
+    "condition_name": "<condition_name>"
+}}
+```
+
+The origin buffer must exist before the option buffer is created.
+The `condition_name` is immutable after creation — renaming is not allowed.
+
+### Update a condition
+
+Edit the **origin buffer** directly. Changes are validated against `sample_line`
+before being accepted.
 
 ### Remove a condition
 
-Drop the pattern buffer `system:config:regex_condition:<condition_name>`. The
-condition is deregistered and its entry is removed from the conditions catalog.
+**Option 1** — Drop the option buffer `<origin_name>[regex_condition]`. The
+condition is unregistered and its catalog entry is removed. The origin buffer
+is left intact.
 
-### Requirements per pattern
+**Option 2** — Drop the origin buffer. The condition is unregistered and
+the catalog entry is removed.
 
-- `regex` — a valid regular expression. Note that it should include the trailing '\\n'
-- `sample_line` — a line of text that the regex must fullmatch exactly
-  (including the trailing '\\n')
+A condition cannot be dropped while it is in use.
 
-The `sample_line` is used for validation only. It is not stored after creation.
+### Pattern requirements
 
-### What happens automatically
-
-- The condition is registered as a callable in the function manager
-- The `pattern_count` in the conditions catalog is updated
+- `regex` — a valid regular expression including the trailing '\\n'
+- `sample_line` — a line of text the regex must fullmatch exactly (including '\\n').
+  Used for validation only, not stored after creation.
 
 ### Conditions catalog
 
-`system:config:regex_condition` — a catalog of all conditions:
+`system:status:regex_condition` — a managed catalog of all conditions (do not edit manually):
 
 ```json
 {{
     "conditions": {{
         "<condition_name>": {{
             "name": "<condition_name>",
-            "pattern_count": N
+            "pattern_count": N,
+            "origin": "<origin_buffer_name>"
         }}
     }}
 }}
 ```
 
-Read this buffer to discover available conditions and their pattern counts.
+Read this buffer to discover available conditions. The `origin` field shows
+which buffer holds the patterns.
 """
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
 # Utils                                                                                                                #
 # -------------------------------------------------------------------------------------------------------------------- #
+
+
+def _get_option_config(option_buffer: Buffer) -> dict[str, Any] | str:
+    """Read and parse the JSON config from an option buffer.
+
+    Returns the parsed config dict on success, or an error string if the buffer is
+    absent, empty, or contains invalid JSON.
+    """
+    # Read the raw text from the option buffer.
+    buffer_text = option_buffer.get_text()
+    if not buffer_text:
+        return f"[RegexConditionFactory] option buffer '{option_buffer.name}' is empty"
+
+    # Parse the JSON config from the buffer text.
+    try:
+        config = json.loads(buffer_text)
+    except json.JSONDecodeError as e:
+        return f"[RegexConditionFactory] option buffer '{option_buffer.name}' has invalid JSON: {e}"
+
+    return config
+
+
+async def _remove_condition_from_catalog(
+    factory: RegexConditionFactory,
+    condition_name: str,
+) -> bool:
+    """Remove a condition entry from the conditions catalog.
+
+    Returns True if the entry was found and removed, False otherwise.
+    """
+    # Get the conditions catalog buffer.
+    conditions_buffer = factory.get_buffer(_CONDITION_LIST_BUFFER)
+    if conditions_buffer is None:
+        return False
+
+    # Parse the conditions catalog JSON.
+    try:
+        conditions_data = json.loads(conditions_buffer.get_text())
+    except json.JSONDecodeError:
+        return False
+
+    # Return early when the condition is not in the catalog.
+    conditions = conditions_data.get("conditions", {})
+    if condition_name not in conditions:
+        return False
+
+    # Remove the condition entry from the catalog.
+    del conditions["conditions"][condition_name]
+
+    # Write the updated catalog back to the buffer.
+    await factory.create_buffer(
+        _CONDITION_LIST_BUFFER,
+        text=json.dumps(conditions_data, indent=2) + "\n",
+        overwrite=True,
+    )
+    return True
 
 
 def _make_condition(
@@ -235,14 +309,28 @@ async def _after_update_condition(
 ) -> bool | str:
     """Synchronize the conditions list pattern_count after a pattern buffer update.
 
-    This is a side effect — the update already succeeded. We only keep
-    the conditions list view current here.
+    This is a side effect -- the update already succeeded. We only keep
+    the conditions list view current here. Handles both the old system:config:
+    flow and the new [regex_condition] option buffer flow.
     """
     # Parse the updated buffer text as JSON to count patterns.
     try:
         new_json = json.loads(new_buffer.get_text())
     except json.JSONDecodeError:
         return True  # Best-effort bookkeeping; do not block.
+
+    # Determine the condition name: use the option buffer config if available (new flow),
+    # otherwise derive from the buffer name (old flow).
+    option_name = new_buffer.name + _REGEX_CONDITION_SUFFIX
+    option_buffer = factory.get_buffer(option_name)
+    if option_buffer is not None:
+        config = _get_option_config(option_buffer)
+        if not isinstance(config, str):
+            condition_name = config.get("condition_name")
+        else:
+            condition_name = new_buffer.name.removeprefix(f"{_REGEX_PATTERN_BUFFER}:")
+    else:
+        condition_name = new_buffer.name.removeprefix(f"{_REGEX_PATTERN_BUFFER}:")
 
     # Read the conditions list and update the pattern count.
     read_result = factory._read_buffer(_CONDITION_LIST_BUFFER)
@@ -254,25 +342,27 @@ async def _after_update_condition(
     except json.JSONDecodeError:
         return True
 
-    # Get the conditions dict from conditions_data and derive the condition name.
+    # Get the conditions dict from conditions_data.
     conditions = conditions_data.get("conditions", {})
-    derived_name = new_buffer.name.removeprefix(f"{_REGEX_PATTERN_BUFFER}:")
 
-    # Replace the entire catalog entry with updated data — robust to missing entries.
-    conditions[derived_name] = {
+    # Replace the catalog entry with updated data -- preserve origin if already set (new flow).
+    existing = conditions.get(condition_name, {})
+    conditions[condition_name] = {
+        "name": condition_name,
         "pattern_count": len(new_json),
+        "origin": existing.get("origin", new_buffer.name),
     }
     conditions_data["conditions"] = conditions
 
-    # Write the updated conditions list back — non-critical bookkeeping.
+    # Write the updated conditions list back -- non-critical bookkeeping.
     try:
         await factory.create_buffer(
             _CONDITION_LIST_BUFFER,
             text=json.dumps(conditions_data, indent=2) + "\n",
             overwrite=True,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"[_after_update_condition] failed to write conditions catalog: {e}")
 
     return True
 
@@ -355,6 +445,414 @@ async def _after_drop_condition(factory: RegexConditionFactory, buffer: Buffer, 
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
+# Option Buffer Flow -- [regex_condition] suffix                                                                                      #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+async def _before_create_condition_option(
+    factory: RegexConditionFactory,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_CREATE_BUFFER hook for [regex_condition] option buffers -- validate before creation.
+
+    Checks that the config contains a condition_name, that it is not already registered,
+    that the origin buffer exists, and that all patterns in the origin validate.
+    Persists the condition_name in the config before allowing creation.
+    """
+    # Parse the config from the option buffer -- must be a dict.
+    config = _get_option_config(buffer)
+    if isinstance(config, str):
+        return config
+
+    # The config must supply a condition_name -- this is the source of truth for the function name.
+    condition_name = config.get("condition_name")
+    if not condition_name:
+        return f"[_before_create_condition_option] config must supply 'condition_name'"
+
+    # Reject if a function with this name is already registered.
+    if factory.has_function(condition_name):
+        return f"condition '{condition_name}' is already registered"
+
+    # Derive the origin buffer name from the option buffer name.
+    origin_name = _origin_name_from_option_buffer_name(buffer.name)
+    if not origin_name:
+        return f"[_before_create_condition_option] cannot derive origin from '{buffer.name}'"
+
+    # The origin buffer must exist at creation time -- patterns live there.
+    origin_buffer = factory.get_buffer(origin_name)
+    if origin_buffer is None:
+        return f"[_before_create_condition_option] origin buffer '{origin_name}' not found"
+
+    # Validate the regex patterns in the origin buffer.
+    try:
+        origin_json = json.loads(origin_buffer.get_text())
+    except json.JSONDecodeError as e:
+        return f"[_before_create_condition_option] origin '{origin_name}' is not valid JSON: {e}"
+
+    # Validate each pattern against its sample_line -- reject if any fails.
+    for pat_name, pat_value in origin_json.items():
+        validation = _guard_pattern_value("create", pat_value)
+        if isinstance(validation, str):
+            return f"[_before_create_condition_option] pattern '{pat_name}' in '{origin_name}': {validation}"
+
+    # Persist the condition_name in the config so it survives restarts.
+    config["condition_name"] = condition_name
+    buffer.set_text(json.dumps(config, indent=2) + "\n")
+
+    return None
+
+
+async def _before_update_condition_option(
+    factory: RegexConditionFactory,
+    old_buffer: Buffer,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_UPDATE_BUFFER hook for [regex_condition] option buffers -- reject rename of condition_name.
+
+    The condition_name stored in the config is immutable -- renaming would change the registered
+    function and break callers. Allow the update only when the condition_name is unchanged.
+    """
+    # Parse the old and new configs.
+    old_config = _get_option_config(old_buffer)
+    if isinstance(old_config, str):
+        return f"[_before_update_condition_option] could not read old config: {old_config}"
+
+    # Get the new config from the new buffer.
+    new_config = _get_option_config(new_buffer)
+    if isinstance(new_config, str):
+        return f"[_before_update_condition_option] could not read new config: {new_config}"
+
+    # Retrieve the condition_name from both configs.
+    old_name = old_config.get("condition_name")
+    new_name = new_config.get("condition_name")
+
+    # Reject the update when the condition_name differs from the persisted one -- no renaming allowed.
+    if old_name is not None and new_name != old_name:
+        return f"[_before_update_condition_option] renaming conditions is not allowed ('{old_name}' -> '{new_name}')"
+
+    return None
+
+
+async def _after_create_condition_option(
+    factory: RegexConditionFactory,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """AFTER_CREATE_BUFFER hook for [regex_condition] option buffers -- register and wire hooks.
+
+    Creates the condition function, registers it in the function manager for ref_count support,
+    and registers update and drop hooks on the origin buffer.
+    """
+    # Parse the config from the option buffer to retrieve the condition_name.
+    config = _get_option_config(buffer)
+    if isinstance(config, str):
+        _logger.error(f"[_after_create_condition_option] {config}")
+        return None
+
+    # Get the condition_name from the config.
+    condition_name = config.get("condition_name")
+    if not condition_name:
+        _logger.error(f"[_after_create_condition_option] config is missing 'condition_name'")
+        return None
+
+    # Derive the origin buffer name from the option buffer name.
+    origin_name = _origin_name_from_option_buffer_name(buffer.name)
+    if not origin_name:
+        _logger.error(f"[_after_create_condition_option] cannot derive origin from '{buffer.name}'")
+        return None
+
+    # Get the origin buffer to register hooks on it.
+    origin_buffer = factory.get_buffer(origin_name)
+    if origin_buffer is None:
+        _logger.error(f"[_after_create_condition_option] origin buffer '{origin_name}' not found")
+        return None
+
+    # Create and register the condition function via register_function (gives ref_count support).
+    condition_fn = _make_condition(origin_name, factory._read_buffer, condition_name)
+    register_result = await factory.register_function(condition_fn, condition_name)
+    if not register_result.get("ok"):
+        _logger.error(f"[_after_create_condition_option] register failed for '{condition_name}': {register_result.get('error')}")
+        return None
+
+    # Register BEFORE_UPDATE on the origin buffer -- validates pattern changes against sample_lines.
+    before_update_result = origin_buffer.register_hook(
+        HookPoint.BEFORE_UPDATE_BUFFER,
+        "condition_factory:origin_before_update",
+        _before_update_condition,
+    )
+    if not before_update_result.get("ok"):
+        _logger.error(f"[_after_create_condition_option] failed to register before_update on '{origin_name}': {before_update_result.get('error')}")
+        return None
+
+    # Register AFTER_UPDATE on the origin buffer -- syncs pattern_count in the conditions catalog.
+    after_update_result = origin_buffer.register_hook(
+        HookPoint.AFTER_UPDATE_BUFFER,
+        "condition_factory:origin_after_update",
+        _after_update_condition,
+    )
+    if not after_update_result.get("ok"):
+        _logger.error(f"[_after_create_condition_option] failed to register after_update on '{origin_name}': {after_update_result.get('error')}")
+        return None
+
+    # Register BEFORE_DROP on the origin buffer -- blocks if refs are held or option buffer still exists.
+    before_drop_result = origin_buffer.register_hook(
+        HookPoint.BEFORE_DROP_BUFFER,
+        "condition_factory:origin_before_drop",
+        _before_drop_from_origin,
+    )
+    if not before_drop_result.get("ok"):
+        _logger.error(f"[_after_create_condition_option] failed to register before_drop on '{origin_name}': {before_drop_result.get('error')}")
+        return None
+
+    # Register AFTER_DROP on the origin buffer -- unregisters the condition and removes all hooks.
+    after_drop_result = origin_buffer.register_hook(
+        HookPoint.AFTER_DROP_BUFFER,
+        "condition_factory:origin_after_drop",
+        _after_drop_from_origin,
+    )
+    if not after_drop_result.get("ok"):
+        _logger.error(f"[_after_create_condition_option] failed to register after_drop on '{origin_name}': {after_drop_result.get('error')}")
+        return None
+
+    # Confirm successful registration.
+    _logger.info(f"[>>] condition '{condition_name}' registered, hooks wired on '{origin_name}'")
+
+    # Sync the conditions catalog -- record origin so _after_drop_from_origin can find the entry.
+    conditions_buffer = factory.get_buffer(_CONDITION_LIST_BUFFER)
+    if conditions_buffer is None:
+        return None
+
+    # Parse the conditions catalog JSON.
+    try:
+        conditions_data = json.loads(conditions_buffer.get_text())
+    except json.JSONDecodeError as e:
+        _logger.error(f"[_after_create_condition_option] conditions catalog is not valid JSON: {e}")
+        return None
+
+    # Extract the conditions subdirectory from the catalog.
+    conditions = conditions_data.get("conditions", {})
+
+    # Parse the pattern count from the origin buffer's JSON content.
+    try:
+        origin_json = json.loads(origin_buffer.get_text())
+        pattern_count = len(origin_json)
+    except Exception as e:
+        _logger.error(f"[_after_create_condition_option] failed to parse origin buffer '{origin_name}': {e}")
+        pattern_count = 0
+
+    # Update the conditions catalog entry with the new pattern count and origin.
+    conditions[condition_name] = {
+        "name": condition_name,
+        "pattern_count": pattern_count,
+        "origin": origin_name,
+    }
+    conditions_data["conditions"] = conditions
+
+    # Write the updated conditions catalog back to the buffer via create_buffer
+    # so that BEFORE_UPDATE / AFTER_UPDATE hooks fire for dependent listeners.
+    try:
+        await factory.create_buffer(
+            _CONDITION_LIST_BUFFER,
+            text=json.dumps(conditions_data, indent=2) + "\n",
+            overwrite=True,
+        )
+    except Exception as e:
+        _logger.error(f"[_after_create_condition_option] failed to write conditions catalog: {e}")
+
+
+async def _before_drop_condition_option(
+    factory: RegexConditionFactory,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_DROP_BUFFER hook for [regex_condition] option buffers -- reject when refs are held.
+
+    Blocks the drop of the option buffer while the condition function has active references.
+    """
+    # Parse the config from the option buffer.
+    config = _get_option_config(buffer)
+    if isinstance(config, str):
+        return None
+
+    # Retrieve the condition_name from the config.
+    condition_name = config.get("condition_name")
+    if not condition_name:
+        return None
+
+    # Reject when the function is not registered or has active callable refs.
+    if not factory.has_function(condition_name):
+        return None
+    wrapper = factory._callables.get(condition_name)
+    if wrapper is not None and wrapper._reference_count > 0:
+        return f"[_before_drop_condition_option] condition '{condition_name}' is still in use (ref_count={wrapper._reference_count})"
+
+    return None
+
+
+async def _after_drop_condition_option(
+    factory: RegexConditionFactory,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """AFTER_DROP_BUFFER hook for [regex_condition] option buffers -- remove hooks from origin, unregister.
+
+    Cleans up the hooks registered on the origin buffer and unregisters the condition
+    from the function manager. The origin buffer itself is left intact.
+    """
+    # Parse the config from the option buffer.
+    config = _get_option_config(buffer)
+    if isinstance(config, str):
+        _logger.error(f"[_after_drop_condition_option] {config}")
+        return None
+
+    # Retrieve the condition_name from the config.
+    condition_name = config.get("condition_name")
+    if not condition_name:
+        _logger.error(f"[_after_drop_condition_option] config is missing 'condition_name'")
+        return None
+
+    # Derive the origin buffer name from the option buffer name.
+    origin_name = _origin_name_from_option_buffer_name(buffer.name)
+    if not origin_name:
+        _logger.error(f"[_after_drop_condition_option] cannot derive origin from '{buffer.name}'")
+        return None
+
+    # Get the origin buffer to remove the hooks from it.
+    origin_buffer = factory.get_buffer(origin_name)
+    if origin_buffer is not None:
+        # Remove the hooks that were registered on the origin buffer at create time.
+        origin_buffer.unregister_hook(HookPoint.BEFORE_UPDATE_BUFFER, "condition_factory:origin_before_update")
+        origin_buffer.unregister_hook(HookPoint.AFTER_UPDATE_BUFFER, "condition_factory:origin_after_update")
+        origin_buffer.unregister_hook(HookPoint.BEFORE_DROP_BUFFER, "condition_factory:origin_before_drop")
+        origin_buffer.unregister_hook(HookPoint.AFTER_DROP_BUFFER, "condition_factory:origin_after_drop")
+        _logger.debug(f"[_after_drop_condition_option] hooks removed from '{origin_name}'")
+
+    # Unregister the condition from the function manager.
+    unregister_result = await factory.unregister_function(condition_name)
+    if not unregister_result.get("ok"):
+        _logger.error(f"[_after_drop_condition_option] unregister failed for '{condition_name}': {unregister_result.get('error')}")
+        return None
+
+    # Remove the entry from the conditions catalog.
+    removed = await _remove_condition_from_catalog(factory, condition_name)
+    if not removed:
+        _logger.warning(f"[_after_drop_condition_option] condition '{condition_name}' was not found in the catalog")
+
+    _logger.info(f"[>>] condition '{condition_name}' unregistered after option buffer drop")
+
+
+async def _before_drop_from_origin(
+    factory: RegexConditionFactory,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_DROP_BUFFER hook on origin buffer -- reject when option buffer exists or refs are held.
+
+    The origin buffer must not be dropped while a [regex_condition] option buffer still points to it,
+    and it must not be dropped while the condition function has active references.
+    """
+    # Derive the option buffer name from the origin buffer name.
+    option_name = buffer.name + _REGEX_CONDITION_SUFFIX
+
+    # Check new-flow option buffer if one exists.
+    option_buffer = factory.get_buffer(option_name)
+    if option_buffer is None:
+        _logger.error(f"[_before_drop_from_origin] option buffer not found: {option_name}")
+        return None
+
+    # Get the option buffer config.
+    config = _get_option_config(option_buffer)
+    if isinstance(config, str):
+        _logger.error(f"[_before_drop_from_origin] option buffer config invalid: {option_name}")
+        return None
+
+    # The option buffer is valid -- check ref_count for the named condition.
+    condition_name = config.get("condition_name")
+    if not condition_name:
+        _logger.error(f"[_before_drop_from_origin] option buffer '{option_name}' is missing 'condition_name' -- inconsistent state")
+        return None
+
+    # Block the drop when the condition has active refs.
+    wrapper = factory._callables.get(condition_name)
+    if wrapper is not None and wrapper._reference_count > 0:
+        return f"[_before_drop_from_origin] condition '{condition_name}' is still in use (ref_count={wrapper._reference_count})"
+
+    # Check if any old-flow condition points to this origin.
+    conditions_buffer = factory.get_buffer(_CONDITION_LIST_BUFFER)
+    if conditions_buffer is None:
+        return None
+
+    # Parse the conditions catalog JSON.
+    try:
+        conditions_data = json.loads(conditions_buffer.get_text())
+    except json.JSONDecodeError as e:
+        _logger.error(f"[_before_drop_from_origin] conditions catalog is not valid JSON: {e}")
+        return None
+
+    # Extract the conditions subdirectory from the catalog.
+    conditions = conditions_data.get("conditions", {})
+
+    # Scan for any old-flow condition that points to this origin and check ref_count.
+    for cond_name, cond_meta in conditions.items():
+        if cond_meta.get("origin") != buffer.name:
+            continue
+        wrapper = factory._callables.get(cond_name)
+        if wrapper is not None and wrapper._reference_count > 0:
+            return f"[_before_drop_from_origin] condition '{cond_name}' is still in use (ref_count={wrapper._reference_count})"
+
+    return None
+
+
+async def _after_drop_from_origin(
+    factory: RegexConditionFactory,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """AFTER_DROP_BUFFER hook on origin buffer -- unregister condition and clean up.
+
+    The origin buffer has been dropped. All hooks are already gone. Unregister the condition
+    from the function manager and remove the entry from the conditions catalog.
+    """
+    # Derive the option buffer name from the origin buffer name.
+    option_name = buffer.name + _REGEX_CONDITION_SUFFIX
+    condition_name: str | None = None
+
+    # Get the option buffer that may hold the condition_name.
+    option_buffer = factory.get_buffer(option_name)
+    if option_buffer is None:
+        _logger.error(f"[_after_drop_from_origin] option buffer not found: {option_name}")
+        return None
+
+    # Get the option config from the option buffer.
+    config = _get_option_config(option_buffer)
+    if isinstance(config, str):
+        _logger.error(f"[_after_drop_from_origin] option buffer config invalid: {option_name}")
+        return None
+
+    # Get the condition_name from the config.
+    condition_name = config.get("condition_name")
+    if not condition_name:
+        _logger.error(f"[_after_drop_from_origin] condition_name not found in config")
+        return None
+
+    # Unregister the condition from the function manager.
+    unregister_result = await factory.unregister_function(condition_name)
+    if not unregister_result.get("ok"):
+        _logger.error(f"[_after_drop_from_origin] unregister failed for '{condition_name}': {unregister_result.get('error')}")
+        return None
+
+    # Remove the entry from the conditions catalog.
+    removed = await _remove_condition_from_catalog(factory, condition_name)
+    if not removed:
+        _logger.warning(f"[_after_drop_from_origin] condition '{condition_name}' was not found in the catalog")
+
+    _logger.info(f"[>>] condition '{condition_name}' unregistered after origin buffer drop")
+    return None
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
 # RegexConditionFactory                                                                                                #
 # -------------------------------------------------------------------------------------------------------------------- #
 
@@ -419,3 +917,48 @@ class RegexConditionFactory(FunctionManager, AgenticObject):
 
         # Seed the schema documentation buffer.
         self._create_buffer(_REGEX_DOC_BUFFER, text=_REGEX_DOC)
+
+        # Validate the origin buffer and config before creating the option buffer.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_CREATE_BUFFER,
+            "condition_option:before_create",
+            _REGEX_CONDITION_OPTION_BUFFER_PATTERN,
+            _before_create_condition_option,
+            apply_to_existing=True,
+        )
+
+        # Reject renames of the condition_name in the option buffer config.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_UPDATE_BUFFER,
+            "condition_option:before_update",
+            _REGEX_CONDITION_OPTION_BUFFER_PATTERN,
+            _before_update_condition_option,
+            apply_to_existing=True,
+        )
+
+        # Block the option buffer drop when the condition has active refs.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_DROP_BUFFER,
+            "condition_option:before_drop",
+            _REGEX_CONDITION_OPTION_BUFFER_PATTERN,
+            _before_drop_condition_option,
+            apply_to_existing=True,
+        )
+
+        # Clean up hooks from the origin buffer and unregister the condition after the option buffer is dropped.
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_DROP_BUFFER,
+            "condition_option:after_drop",
+            _REGEX_CONDITION_OPTION_BUFFER_PATTERN,
+            _after_drop_condition_option,
+            apply_to_existing=True,
+        )
+
+        # Register the condition function and wire hooks on the origin buffer after the option buffer is created.
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            "condition_option:after_create",
+            _REGEX_CONDITION_OPTION_BUFFER_PATTERN,
+            _after_create_condition_option,
+            apply_to_existing=True,
+        )
