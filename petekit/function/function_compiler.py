@@ -675,6 +675,74 @@ async def _after_drop_code(
     _logger.info(f"[>>] '{func_name}' unregistered after buffer drop")
 
 
+async def _before_drop_code_option(
+    compiler: FunctionCompiler,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_DROP_BUFFER hook for [python] option buffers -- reject drop when the function has active references."""
+    # Parse the config from the option buffer.
+    config = _get_code_config(buffer)
+    if isinstance(config, str):
+        return None
+
+    # Retrieve the function name from the config.
+    func_name = config.get("function_name")
+    if not func_name:
+        return None
+
+    # Reject when the function has active callable refs.
+    if not compiler.has_function(func_name):
+        return None
+    wrapper = compiler._callables.get(func_name)
+    if wrapper is not None and wrapper._reference_count > 0:
+        return f"[_before_drop_code_option] function '{func_name}' is still in use (ref_count={wrapper._reference_count})"
+
+    return None
+
+
+async def _after_drop_code_option(
+    compiler: FunctionCompiler,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """AFTER_DROP_BUFFER hook for [python] option buffers -- unregister the function and clean up hooks from the origin buffer."""
+    # Parse the config from the option buffer.
+    config = _get_code_config(buffer)
+    if isinstance(config, str):
+        _logger.error(f"[_after_drop_code_option] could not read config: {config}")
+        return None
+
+    # Retrieve the function name from the config.
+    func_name = config.get("function_name")
+    if not func_name:
+        _logger.error(f"[_after_drop_code_option] config is missing 'function_name'")
+        return None
+
+    # Derive the origin buffer name from the option buffer name.
+    origin_name = _origin_name_from_option_buffer_name(buffer.name)
+    if origin_name is None:
+        _logger.error(f"[_after_drop_code_option] cannot derive origin from '{buffer.name}'")
+        return None
+
+    # Get the origin buffer to remove the hooks from it.
+    origin_buffer = compiler.get_buffer(origin_name)
+    if origin_buffer is not None:
+        # Remove the hooks that were registered on the origin buffer at compile time.
+        origin_buffer.unregister_hook(HookPoint.BEFORE_UPDATE_BUFFER, "function_compiler:before_update_code")
+        origin_buffer.unregister_hook(HookPoint.AFTER_UPDATE_BUFFER, "function_compiler:after_update_code")
+        origin_buffer.unregister_hook(HookPoint.BEFORE_DROP_BUFFER, "function_compiler:before_drop_code")
+        origin_buffer.unregister_hook(HookPoint.AFTER_DROP_BUFFER, "function_compiler:after_drop_code")
+
+    # Unregister the function from the function manager.
+    unregister_result = await compiler.unregister_function(func_name)
+    if not unregister_result.get("ok"):
+        _logger.error(f"[_after_drop_code_option] unregister failed for '{func_name}': {unregister_result.get('error')}")
+        return None
+
+    _logger.info(f"[>>] '{func_name}' unregistered and hooks removed after option buffer drop")
+
+
 async def _on_create_code(
     compiler: FunctionCompiler,
     buffer_name: str,
@@ -834,5 +902,21 @@ class FunctionCompiler(FunctionManager, OptionBufferManager, AgenticObject):
             "function_compiler:python_code_option_after_create",
             _CODE_BUFFER_OPTION_BUFFER_PATTERN,
             lambda bm, new_buffer, args: _after_update_code_option(bm, None, new_buffer, args),
+            apply_to_existing=True,
+        )
+
+        # Register the drop hooks for [python] option buffers -- block drop when refs are active, then clean up.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_DROP_BUFFER,
+            "function_compiler:python_code_option_before_drop",
+            _CODE_BUFFER_OPTION_BUFFER_PATTERN,
+            _before_drop_code_option,
+            apply_to_existing=True,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_DROP_BUFFER,
+            "function_compiler:python_code_option_after_drop",
+            _CODE_BUFFER_OPTION_BUFFER_PATTERN,
+            _after_drop_code_option,
             apply_to_existing=True,
         )

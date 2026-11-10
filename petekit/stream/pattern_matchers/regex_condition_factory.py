@@ -22,13 +22,6 @@ _CONDITION_BUFFER_PATTERN = r"^system:config:regex_condition:[^[]+$"
 _READ_BUFFER_FN = Callable[[str], dict[str, Any]]
 
 
-def _pattern_buffer_name(condition_name: str) -> str:
-    """Derive the canonical buffer name for a single pattern buffer."""
-    # Derive the canonical buffer name by combining the base pattern buffer prefix
-    # with a sanitized version of the condition name.
-    return f"{_REGEX_PATTERN_BUFFER}:{_sanitize_buffer_name(condition_name)}"
-
-
 
 _REGEX_DOC = f"""\
 ## Regex Conditions
@@ -93,13 +86,9 @@ Read this buffer to discover available conditions and their pattern counts.
 """
 
 
-def _before_drop_conditions_list(
-    buffer_manager: BufferManager,
-    buffer: Buffer,
-    args: dict[str, Any],
-) -> str | None:
-    """Block direct drops of the conditions list buffer."""
-    return "This buffer is protected by the RegexConditionManager."
+# -------------------------------------------------------------------------------------------------------------------- #
+# Utils                                                                                                                #
+# -------------------------------------------------------------------------------------------------------------------- #
 
 
 def _make_condition(
@@ -182,6 +171,20 @@ def _validate_pattern_against_sample(pattern: str, sample_line: str) -> re.Patte
         )
 
     return compiled
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Hooks                                                                                                                #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+def _before_drop_conditions_list(
+    buffer_manager: BufferManager,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """Block direct drops of the conditions list buffer."""
+    return "This buffer is protected by the RegexConditionManager."
 
 
 async def _before_update_condition(
@@ -349,6 +352,11 @@ async def _after_drop_condition(factory: RegexConditionFactory, buffer: Buffer, 
             _logger.error(f"[_after_drop_condition] failed to update conditions list: {write_result.get('error')}")
 
     return True
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# RegexConditionFactory                                                                                                #
+# -------------------------------------------------------------------------------------------------------------------- #
 
 
 class RegexConditionFactory(FunctionManager, AgenticObject):
