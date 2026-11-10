@@ -90,6 +90,32 @@ with their process IDs, titles, commands, and working directories.
 """
 
 
+# -------------------------------------------------------------------------------------------------------------------- #
+# Data Classes                                                                                                         #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+@dataclass
+class BashHandle:
+    """Holds the execution context for a tracked process."""
+    title: str
+    command: str
+    cwd: str | None = None
+    process: asyncio.subprocess.Process | None = None
+    task: asyncio.Task | None = None
+    stdin_buffer: str = ""
+    stdout_buffer: str = ""
+    stderr_buffer: str = ""
+    status_buffer: str = ""
+    closed: bool = False
+    exit_code: int | None = None
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Utils                                                                                                                #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
 def _bash_title_from_name(buffer_name: str) -> str:
     """Parse the title from a bash:{title} buffer name.
 
@@ -97,6 +123,112 @@ def _bash_title_from_name(buffer_name: str) -> str:
     for ensuring the buffer name matches the _BASH_PROCESS_PATTERN.
     """
     return buffer_name[len("bash:") :]
+
+
+async def _bash_send_hook(basher, title: str, text: str = "", flush: bool = True, trailing_newline: bool = False) -> str:
+    """Send text to a running process's stdin. Pass flush=True to drain the write buffer without closing. Pass trailing_newline=True to append a trailing newline (as if pressing Enter)."""
+    if title not in basher.bash_processes:
+        raise KeyError(f"No process with title '{title}'.")
+    handle = basher.bash_processes[title]
+
+    # Guard: reject sends to closed or exited processes.
+    if handle.closed:
+        raise ConnectionError(f"Process '{handle.title}' is not running (exit_code={handle.exit_code}).")
+    if handle.process is None or handle.process.stdin is None:
+        raise ConnectionError(f"Process '{handle.title}' has no stdin.")
+
+    # Write: encode text and write to the subprocess stdin; optionally append a trailing newline.
+    try:
+        if text:
+            data = text.encode("utf-8")
+            handle.process.stdin.write(data)
+            if trailing_newline:
+                handle.process.stdin.write(b"\n")
+        if flush:
+            await handle.process.stdin.drain()
+    except Exception as e:
+        raise ConnectionError(f"Send error: {e}")
+
+    return f"Sent {len(text)} chars to process '{handle.title}'."
+
+
+async def _bash_read_loop(basher, handle: BashHandle) -> None:
+    """Continuously read stdout and stderr from the process using concurrent tasks."""
+    stdout = handle.process.stdout
+    stderr = handle.process.stderr
+
+    # Stream: spin up two async line readers for stdout and stderr, writing each line to the respective buffer.
+    async def read_stdout() -> None:
+        # Guard: no pipe means nothing to stream.
+        if stdout is None:
+            return
+        try:
+            # Drain: read lines until EOF, writing each to the stdout buffer.
+            while True:
+                line_bytes = await stdout.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="replace")
+                await basher.write_buffer(handle.stdout_buffer, line)
+        except asyncio.CancelledError:
+            # Silently absorb cancellation — the caller drives cleanup via gather.
+            pass
+
+    async def read_stderr() -> None:
+        # Guard: no pipe means nothing to_bash_send_hook stream.
+        if stderr is None:
+            return
+        try:
+            # Drain: read lines until EOF, writing each to the stderr buffer.
+            while True:
+                line_bytes = await stderr.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="replace")
+                await basher.write_buffer(handle.stderr_buffer, line)
+        except asyncio.CancelledError:
+            # Silently absorb cancellation — the caller drives cleanup via gather.
+            pass
+
+    # Wait: drive both stream readers to completion or cancellation, then clean up.
+    out_task = asyncio.create_task(read_stdout())
+    err_task = asyncio.create_task(read_stderr())
+    try:
+        # Wait: drive both stream readers to completion.
+        await asyncio.gather(out_task, err_task)
+
+    except asyncio.CancelledError:
+        # Propagate: cancel both reader tasks before re-raising.
+        out_task.cancel()
+        err_task.cancel()
+        raise
+
+    finally:
+        # Clean up: mark the handle closed, reap the subprocess, refresh the processes listing.
+        handle.closed = True
+        if handle.process:
+            handle.exit_code = handle.process.returncode
+            try:
+                await handle.process.wait()
+            except asyncio.CancelledError:
+                pass
+
+        else:
+            handle.exit_code = None
+        
+        await _refresh_bash_processes_buffer(basher)
+
+
+async def _refresh_bash_processes_buffer(basher) -> None:
+    records = basher.list_bash_processes()
+    import json
+    text = json.dumps(records, indent=2)
+    await basher.create_buffer(_BASH_PROCESSES_BUFFER, text=text, overwrite=True)
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Hooks                                                                                                                #
+# -------------------------------------------------------------------------------------------------------------------- #
 
 
 async def before_create_bash_buffer(
@@ -267,121 +399,9 @@ async def after_drop_bash_buffer(
     await _refresh_bash_processes_buffer(basher)
 
 
-async def _bash_send_hook(basher, title: str, text: str = "", flush: bool = True, trailing_newline: bool = False) -> str:
-    """Send text to a running process's stdin. Pass flush=True to drain the write buffer without closing. Pass trailing_newline=True to append a trailing newline (as if pressing Enter)."""
-    if title not in basher.bash_processes:
-        raise KeyError(f"No process with title '{title}'.")
-    handle = basher.bash_processes[title]
-
-    # Guard: reject sends to closed or exited processes.
-    if handle.closed:
-        raise ConnectionError(f"Process '{handle.title}' is not running (exit_code={handle.exit_code}).")
-    if handle.process is None or handle.process.stdin is None:
-        raise ConnectionError(f"Process '{handle.title}' has no stdin.")
-
-    # Write: encode text and write to the subprocess stdin; optionally append a trailing newline.
-    try:
-        if text:
-            data = text.encode("utf-8")
-            handle.process.stdin.write(data)
-            if trailing_newline:
-                handle.process.stdin.write(b"\n")
-        if flush:
-            await handle.process.stdin.drain()
-    except Exception as e:
-        raise ConnectionError(f"Send error: {e}")
-
-    return f"Sent {len(text)} chars to process '{handle.title}'."
-
-
-async def _bash_read_loop(basher, handle: BashHandle) -> None:
-    """Continuously read stdout and stderr from the process using concurrent tasks."""
-    stdout = handle.process.stdout
-    stderr = handle.process.stderr
-
-    # Stream: spin up two async line readers for stdout and stderr, writing each line to the respective buffer.
-    async def read_stdout() -> None:
-        # Guard: no pipe means nothing to stream.
-        if stdout is None:
-            return
-        try:
-            # Drain: read lines until EOF, writing each to the stdout buffer.
-            while True:
-                line_bytes = await stdout.readline()
-                if not line_bytes:
-                    break
-                line = line_bytes.decode("utf-8", errors="replace")
-                await basher.write_buffer(handle.stdout_buffer, line)
-        except asyncio.CancelledError:
-            # Silently absorb cancellation — the caller drives cleanup via gather.
-            pass
-
-    async def read_stderr() -> None:
-        # Guard: no pipe means nothing to_bash_send_hook stream.
-        if stderr is None:
-            return
-        try:
-            # Drain: read lines until EOF, writing each to the stderr buffer.
-            while True:
-                line_bytes = await stderr.readline()
-                if not line_bytes:
-                    break
-                line = line_bytes.decode("utf-8", errors="replace")
-                await basher.write_buffer(handle.stderr_buffer, line)
-        except asyncio.CancelledError:
-            # Silently absorb cancellation — the caller drives cleanup via gather.
-            pass
-
-    # Wait: drive both stream readers to completion or cancellation, then clean up.
-    out_task = asyncio.create_task(read_stdout())
-    err_task = asyncio.create_task(read_stderr())
-    try:
-        # Wait: drive both stream readers to completion.
-        await asyncio.gather(out_task, err_task)
-
-    except asyncio.CancelledError:
-        # Propagate: cancel both reader tasks before re-raising.
-        out_task.cancel()
-        err_task.cancel()
-        raise
-
-    finally:
-        # Clean up: mark the handle closed, reap the subprocess, refresh the processes listing.
-        handle.closed = True
-        if handle.process:
-            handle.exit_code = handle.process.returncode
-            try:
-                await handle.process.wait()
-            except asyncio.CancelledError:
-                pass
-
-        else:
-            handle.exit_code = None
-        
-        await _refresh_bash_processes_buffer(basher)
-
-
-async def _refresh_bash_processes_buffer(basher) -> None:
-    records = basher.list_bash_processes()
-    import json
-    text = json.dumps(records, indent=2)
-    await basher.create_buffer(_BASH_PROCESSES_BUFFER, text=text, overwrite=True)
-
-
-@dataclass
-class BashHandle:
-    """Holds the execution context for a tracked process."""
-    title: str
-    command: str
-    cwd: str | None = None
-    process: asyncio.subprocess.Process | None = None
-    task: asyncio.Task | None = None
-    stdin_buffer: str = ""
-    stdout_buffer: str = ""
-    stderr_buffer: str = ""
-    status_buffer: str = ""
-    closed: bool = False
-    exit_code: int | None = None
+# -------------------------------------------------------------------------------------------------------------------- #
+# Basher                                                                                                               #
+# -------------------------------------------------------------------------------------------------------------------- #
 
 
 class Basher(StreamBufferManager, AgenticObject):
