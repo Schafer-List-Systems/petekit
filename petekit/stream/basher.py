@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import subprocess
 import time
 from dataclasses import dataclass
@@ -12,13 +14,20 @@ from peteos.oap.agentic_object import AgenticObject
 from peteos import sandbox, tool
 from .stream_buffer_manager import StreamBufferManager
 from ..text.buffer_manager import Buffer, BufferManager, HookPoint
+from ..text.option_buffer_manager import _origin_name_from_option_buffer_name
 
 
 _BASH_PROCESSES_BUFFER = "system:status:bash"
 _BASH_MANAGER_DOC_BUFFER = "doc:bash"
 
+_logger = logging.getLogger("basher")
+
 # Pattern matching agent-created bash buffers (not system buffers).
 _BASH_PROCESS_PATTERN = r"^bash:[^:\[\]]+$"
+
+# New-flow: arbitrary script buffer with [bash] option buffer trigger.
+_BASH_SUFFIX = "[bash]"
+_BASH_OPTION_BUFFER_PATTERN = rf".+\[{_BASH_SUFFIX[1:-1]}\]$"
 
 _BASH_MANAGER_DOC = f"""\
 ## Bash Process Manager
@@ -26,44 +35,50 @@ _BASH_MANAGER_DOC = f"""\
 You can run bash commands and interact with their input and output as stream buffers.
 The system manages process lifecycle — you work directly with the buffers.
 
-### Start a process
+### Start a process (two buffers)
 
-Create a buffer named `bash:<title>` (in that scope, not a subscope) containing your
-command or script. The buffer's text is the command or script to execute — any valid
-bash code is accepted. The system starts the process and creates four stream buffers
-for you automatically.
+**Step 1** — Create a script buffer with your bash code. The name is arbitrary:
 
-For example, to run `ls -la` in `/tmp`:
+```
+buffer: my-script.sh
+content: cd /tmp && ls -la
+```
 
-1. Create a buffer named `bash:ls` with content: `cd /tmp && ls -la`
-2. The system creates these buffers for you:
-   - `bash:ls:stdin` — write to this to send input to the process
-   - `bash:ls:stdout` — read from this to see the process output
-   - `bash:ls:stderr` — read from this to see error output
-   - `bash:ls:status` — current status as JSON
+**Step 2** — Create the `[bash]` option buffer to start the process:
 
-The process starts as soon as the `bash:<title>` buffer is created.
+```
+buffer: my-script.sh[bash]
+content: {{}}
+```
+
+The system creates four stream buffers automatically:
+- `my-script.sh:stdin` — write to this to send input to the process
+- `my-script.sh:stdout` — read from this to see the process output
+- `my-script.sh:stderr` — read from this to see error output
+- `my-script.sh:status` — current status as JSON
+
+The process starts as soon as the `[bash]` option buffer is created.
+The origin buffer (`my-script.sh`) is left intact while the process runs.
 
 ### Send input to a running process
 
-Write to the `bash:<title>:stdin` buffer. Each line you write is forwarded to the
+Write to the `<origin>:stdin` buffer. Each line you write is forwarded to the
 process's standard input. To simulate pressing Enter, write your input with a
 trailing newline.
 
 ### Read output from a running process
 
-Read from `bash:<title>:stdout` for normal output, or `bash:<title>:stderr` for
+Read from `<origin>:stdout` for normal output, or `<origin>:stderr` for
 error output. Both are stream buffers — new output appears here as the process runs.
 
 ### Check if a process is still running
 
-Read the `bash:<title>:status` buffer. It contains JSON:
+Read the `<origin>:status` buffer. It contains JSON:
 
 ```json
 {{
-    "process_id": 42,
-    "title": "ls",
-    "command": "ls -la",
+    "pid": 42,
+    "title": "my-script.sh",
     "running": true,
     "exit_code": null
 }}
@@ -73,8 +88,14 @@ When the process exits, `running` becomes `false` and `exit_code` is set.
 
 ### Stop a process
 
-Drop the `bash:<title>` buffer. This terminates the process and removes all four
-associated buffers (stdin, stdout, stderr, status).
+**Option 1** — Drop the option buffer `<origin>[bash]`. The process is terminated
+and all four associated buffers (stdin, stdout, stderr, status) are removed.
+The origin buffer is left intact.
+
+**Option 2** — Drop the origin buffer `<origin>`. The process is terminated and all
+buffers are cleaned up. The option buffer is also removed automatically.
+
+A process cannot be stopped while it is in use.
 
 ### Monitor all running processes
 
@@ -83,10 +104,10 @@ with their process IDs, titles, commands, and working directories.
 
 ### Requirements
 
-- The `bash:<title>` buffer name must not contain colons or brackets — those are
-  reserved for the stdin/stdout/stderr/status sub-buffers
+- The script buffer can have any name (e.g. `deploy.sh`, `build.sh`)
+- The `[bash]` option buffer must be created after the script buffer exists
 - Commands run in the current working directory
-- Only one process can run per title at a time
+- Only one process can run per script buffer at a time
 """
 
 
@@ -100,6 +121,7 @@ class BashHandle:
     """Holds the execution context for a tracked process."""
     title: str
     command: str
+    origin: str = ""  # the script buffer that triggered this process
     cwd: str | None = None
     process: asyncio.subprocess.Process | None = None
     task: asyncio.Task | None = None
@@ -376,11 +398,15 @@ async def after_drop_bash_buffer(
         handle.task.cancel()
     if handle.process and handle.process.returncode is None:
         handle.process.terminate()
+
+        # Wait for the process to exit, then kill it if it times out.
         try:
             await asyncio.wait_for(handle.process.wait(), timeout=5.0)
         except asyncio.TimeoutError:
+            # Force-kill the process after the graceful timeout.
             handle.process.kill()
         except asyncio.CancelledError:
+            # Force-kill the process when cancelled.
             handle.process.kill()
     handle.closed = True
     handle.exit_code = handle.process.returncode if handle.process else None
@@ -397,6 +423,282 @@ async def after_drop_bash_buffer(
 
     # Refresh the system process list.
     await _refresh_bash_processes_buffer(basher)
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Option Buffer Flow -- [bash] suffix                                                                                                   #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+async def _before_create_bash_option(
+    basher: Basher,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_CREATE_BUFFER hook for [bash] option buffers -- validate the origin buffer and config."""
+    # Parse the JSON config from the option buffer.
+    try:
+        config = json.loads(buffer.get_text())
+    except json.JSONDecodeError as e:
+        return f"[_before_create_bash_option] option buffer is not valid JSON: {e}"
+
+    # Derive the origin buffer name from the option buffer name.
+    origin_name = _origin_name_from_option_buffer_name(buffer.name)
+    if not origin_name:
+        return f"[_before_create_bash_option] cannot derive origin from '{buffer.name}'"
+
+    # The origin buffer must exist and hold a non-empty script.
+    origin_buffer = basher.get_buffer(origin_name)
+    if origin_buffer is None:
+        return f"[_before_create_bash_option] origin buffer '{origin_name}' not found"
+
+    # Reject when the origin buffer holds an empty script.
+    script = origin_buffer.get_text()
+    if not script.strip():
+        return f"[_before_create_bash_option] script in '{origin_name}' is empty"
+
+    # Syntax-check the script without executing it -- read-only, no side effects.
+    proc = await asyncio.create_subprocess_exec(
+        "/bin/bash", "-n", "-",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr_bytes = await proc.communicate(input=script.encode("utf-8"))
+
+    # Reject when the script has a syntax error.
+    if proc.returncode != 0:
+        stderr = stderr_bytes.decode("utf-8", errors="replace").splitlines()[0]
+        return f"[_before_create_bash_option] bash syntax error: {stderr}"
+
+    return None
+
+
+async def _after_create_bash_option(
+    basher: Basher,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """AFTER_CREATE_BUFFER hook for [bash] option buffers -- spawn the process and wire hooks."""
+    # Derive the origin buffer name from the option buffer name.
+    origin_name = _origin_name_from_option_buffer_name(buffer.name)
+    if not origin_name:
+        _logger.error(f"[_after_create_bash_option] cannot derive origin from '{buffer.name}'")
+        return None
+
+    # Guard: do not spawn if a process for this origin is already running.
+    if origin_name in basher.bash_processes:
+        return f"[_after_create_bash_option] process for '{origin_name}' is already running"
+
+    # Read the script from the origin buffer.
+    origin_buffer = basher.get_buffer(origin_name)
+    if origin_buffer is None:
+        _logger.error(f"[_after_create_bash_option] origin buffer '{origin_name}' not found")
+        return None
+
+    # Extract the script and derive the title from the origin buffer name.
+    script = origin_buffer.get_text().strip()
+    title = origin_name
+
+    # Derive the four sub-buffer names from the origin buffer name.
+    stdin_name = f"{origin_name}:stdin"
+    stdout_name = f"{origin_name}:stdout"
+    stderr_name = f"{origin_name}:stderr"
+    status_name = f"{origin_name}:status"
+
+    # Create the three stream buffers for stdout, stderr, and stdin.
+    await basher.create_stream_buffer(stdin_name)
+    await basher.create_stream_buffer(stdout_name)
+    await basher.create_stream_buffer(stderr_name)
+
+    # Get the stdin buffer to attach the forward hook.
+    stdin_buf = basher.get_buffer(stdin_name)
+    if stdin_buf is None:
+        await basher.drop_buffer(stdin_name)
+        await basher.drop_buffer(stdout_name)
+        await basher.drop_buffer(stderr_name)
+        return f"[_after_create_bash_option] stdin buffer '{stdin_name}' not found after creation"
+
+    # Register: attach AFTER_UPDATE_BUFFER on stdin to forward writes to the process.
+    async def _bash_forward(
+        buffer_manager: BufferManager,
+        old_buffer: Buffer,
+        new_buffer: Buffer,
+        inner_args: dict[str, Any],
+    ) -> str | None:
+        appended_text = new_buffer.get_text(start=len(old_buffer) - 1)
+        return await _bash_send_hook(basher, title, appended_text)
+
+    # Register AFTER_UPDATE_BUFFER on stdin to forward writes to the process.
+    stdin_buf.register_hook(HookPoint.AFTER_UPDATE_BUFFER, "bash_send", _bash_forward)
+
+    # Launch the subprocess with connected stdin/stdout/stderr pipes.
+    process: asyncio.subprocess.Process | None = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "/bin/sh",
+            "-c",
+            script,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=None,
+        )
+    except Exception as e:
+        return f"[_after_create_bash_option] failed to start process: {e}"
+
+    # Register: store the handle, start the read loop, and refresh the processes listing.
+    handle = BashHandle(
+        title=title,
+        command=script,
+        origin=origin_name,
+        process=process,
+        stdin_buffer=stdin_name,
+        stdout_buffer=stdout_name,
+        stderr_buffer=stderr_name,
+        status_buffer=status_name,
+    )
+    basher.bash_processes[origin_name] = handle
+    handle.task = asyncio.create_task(_bash_read_loop(basher, handle))
+
+    # Seed the status buffer and refresh the system process list.
+    status_content = (
+        f'{{"pid": {process.pid}, "title": "{title}", '
+        f'"running": true, "exit_code": null}}\n'
+    )
+    await basher.create_buffer(status_name, text=status_content)
+    await _refresh_bash_processes_buffer(basher)
+
+    # Confirm successful registration.
+    _logger.info(f"[>>] process '{title}' started, stdin/stdout/stderr/status buffers created")
+
+
+async def _before_drop_bash_option(
+    basher: Basher,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_DROP_BUFFER hook for [bash] option buffers -- allow the drop."""
+    return None
+
+
+async def _after_drop_bash_option(
+    basher: Basher,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """AFTER_DROP_BUFFER hook for [bash] option buffers -- terminate the process and clean up sub-buffers."""
+    # Derive the origin buffer name from the option buffer name.
+    origin_name = _origin_name_from_option_buffer_name(buffer.name)
+    if not origin_name:
+        _logger.error(f"[_after_drop_bash_option] cannot derive origin from '{buffer.name}'")
+        return None
+
+    # Look up the handle for this origin.
+    if origin_name not in basher.bash_processes:
+        _logger.warning(f"[_after_drop_bash_option] no process for '{origin_name}'")
+        return None
+
+    # Remove the handle from the processes dictionary.
+    handle = basher.bash_processes.pop(origin_name)
+
+    # Stop: cancel the read loop task and terminate the subprocess.
+    if handle.task:
+        handle.task.cancel()
+    if handle.process and handle.process.returncode is None:
+        handle.process.terminate()
+
+        # Wait for the process to exit, then kill it if it times out.
+        try:
+            await asyncio.wait_for(handle.process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            # Force-kill the process after the graceful timeout.
+            handle.process.kill()
+        except asyncio.CancelledError:
+            # Force-kill the process when cancelled.
+            handle.process.kill()
+    handle.closed = True
+    handle.exit_code = handle.process.returncode if handle.process else None
+
+    # Drop the four associated sub-buffers.
+    for buf_name in (
+        handle.stdin_buffer,
+        handle.stdout_buffer,
+        handle.stderr_buffer,
+        handle.status_buffer,
+    ):
+        if buf_name:
+            await basher.drop_buffer(buf_name)
+
+    # Refresh the system process list.
+    await _refresh_bash_processes_buffer(basher)
+
+    # Confirm the cleanup is complete.
+    _logger.info(f"[>>] process '{origin_name}' terminated, sub-buffers removed")
+
+
+async def _before_drop_command(
+    basher: Basher,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """BEFORE_DROP_BUFFER hook on the script buffer -- allow the drop."""
+    return None
+
+
+async def _after_drop_command(
+    basher: Basher,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """AFTER_DROP_BUFFER hook on the script buffer -- clean up when the command buffer is dropped directly."""
+    # Look up the handle for this origin.
+    origin_name = buffer.name
+    if origin_name not in basher.bash_processes:
+        return None
+
+    # Remove the handle from the processes dictionary.
+    handle = basher.bash_processes.pop(origin_name)
+
+    # Stop: cancel the read loop task and terminate the subprocess.
+    if handle.task:
+        handle.task.cancel()
+    if handle.process and handle.process.returncode is None:
+        handle.process.terminate()
+
+        # Wait for the process to exit, then kill it if it times out.
+        try:
+            await asyncio.wait_for(handle.process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            # Force-kill the process after the graceful timeout.
+            handle.process.kill()
+        except asyncio.CancelledError:
+            # Force-kill the process when cancelled.
+            handle.process.kill()
+    handle.closed = True
+    handle.exit_code = handle.process.returncode if handle.process else None
+
+    # Derive the option buffer name and drop it.
+    option_name = origin_name + _BASH_SUFFIX
+    option_exists = basher.get_buffer(option_name)
+    if option_exists is not None:
+        await basher.drop_buffer(option_name)
+
+    # Drop the four associated sub-buffers.
+    for buf_name in (
+        handle.stdin_buffer,
+        handle.stdout_buffer,
+        handle.stderr_buffer,
+        handle.status_buffer,
+    ):
+        if buf_name:
+            await basher.drop_buffer(buf_name)
+
+    # Refresh the system process list.
+    await _refresh_bash_processes_buffer(basher)
+
+    # Confirm the cleanup is complete.
+    _logger.info(f"[>>] process '{origin_name}' cleaned up after command buffer drop")
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -433,6 +735,42 @@ class Basher(StreamBufferManager, AgenticObject):
             "teardown_bash_process",
             _BASH_PROCESS_PATTERN,
             after_drop_bash_buffer,
+        )
+
+        # Validate the origin buffer and config before creating the [bash] option buffer.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_CREATE_BUFFER,
+            "bash_option:before_create",
+            _BASH_OPTION_BUFFER_PATTERN,
+            _before_create_bash_option,
+            apply_to_existing=True,
+        )
+
+        # Block the option buffer drop when the process has active refs.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_DROP_BUFFER,
+            "bash_option:before_drop",
+            _BASH_OPTION_BUFFER_PATTERN,
+            _before_drop_bash_option,
+            apply_to_existing=True,
+        )
+
+        # Terminate the process and remove sub-buffers after the option buffer is dropped.
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_DROP_BUFFER,
+            "bash_option:after_drop",
+            _BASH_OPTION_BUFFER_PATTERN,
+            _after_drop_bash_option,
+            apply_to_existing=True,
+        )
+
+        # Spawn the process, create sub-buffers, and wire the stdin forward hook.
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            "bash_option:after_create",
+            _BASH_OPTION_BUFFER_PATTERN,
+            _after_create_bash_option,
+            apply_to_existing=True,
         )
 
     @sandbox
