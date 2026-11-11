@@ -1371,9 +1371,16 @@ class IMAPer(BufferManager, AgenticObject):
         Overwrites email:tree with a JSON list of path lists (e.g. [["INBOX"], ["INBOX", "Work"]]).
         Updates email:status with the delimiter, count, and a refreshed timestamp.
         """
-        # Bail out if there is no active IMAP connection.
+        # Try to (re-) connect when there is no connection.
         if self._imap_connection is None:
-            raise RuntimeError("no active IMAP connection")
+            # Try to reconnect before surfacing an error.
+            _logger.warning(f"[_refresh_imap_mailbox_list] no connection, reconnecting first.")
+            reconnect_error = await self._reconnect_imap()
+
+            # Bail out when the reconnect also fails.
+            if isinstance(reconnect_error, str):
+                _logger.error(f"[_refresh_imap_mailbox_list] reconnect failed: {reconnect_error}")
+                raise RuntimeError("no active IMAP connection")
 
         # Fetch the current mailbox list from the server -- retry with reconnect on failure.
         mailboxes = self._list_imap_mailboxes()
@@ -1423,9 +1430,16 @@ class IMAPer(BufferManager, AgenticObject):
         existing email:box/<mailbox>/* buffers, creates empty buffers for new UIDs,
         and drops buffers for UIDs no longer on the server.
         """
-        # Bail out if there is no active IMAP connection.
+        # Try to (re-) connect when there is no connection.
         if self._imap_connection is None:
-            raise RuntimeError("no active IMAP connection")
+            # Try to reconnect before surfacing an error.
+            _logger.warning(f"[_refresh_imap_box] Trying to reconnect first.")
+            reconnect_error = await self._reconnect_imap()
+
+            # Bail out when the reconnect also fails.
+            if isinstance(reconnect_error, str):
+                _logger.error(f"[_refresh_imap_box] reconnect failed: {reconnect_error}")
+                raise RuntimeError("no active IMAP connection")
 
         # Read the filter buffer for this mailbox if it exists.
         # The filter holds {criteria, limit, offset} for the search.
