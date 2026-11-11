@@ -109,6 +109,11 @@ _RAGER_DEFAULT_TIMING = "eager"
 _RAGER_DEFAULT_THRESHOLD = float("inf")
 _RAGER_EMBED_TIMEOUT = 15
 
+# Buffer name patterns — match all buffers belonging to any index under the rag: scope.
+_RAGER_CONFIG_PATTERN = rf"^{_RAGER_SCOPE}:.+:config$"
+_RAGER_QUERY_PATTERN = rf"^{_RAGER_SCOPE}:.+:query:.+$"
+_RAGER_RESULT_PATTERN = rf"^{_RAGER_SCOPE}:.+:result:.+$"
+
 _RAGER_DOC = f"""\
 ## RAGer
 
@@ -1945,21 +1950,18 @@ class RAGer(BufferManager, AgenticObject):
         # In-memory storage for live RAGIndex objects, keyed by index name.
         self._rag_indexes: dict[str, RAGIndex] = {}
 
-        # Register hooks on all index config buffers.
-        config_pattern = rf"^{_RAGER_SCOPE}:.+:config$"
-
-        # Register hooks on config buffers to validate config changes.
+        # Register hooks on all index config buffers to validate config changes.
         self.register_buffer_pattern_hook(
             HookPoint.BEFORE_UPDATE_BUFFER,
             "rager_before_update_config",
-            config_pattern,
+            _RAGER_CONFIG_PATTERN,
             _before_update_config,
             apply_to_existing=True,
         )
         self.register_buffer_pattern_hook(
             HookPoint.BEFORE_CREATE_BUFFER,
             "rager_before_create_config",
-            config_pattern,
+            _RAGER_CONFIG_PATTERN,
             lambda bm, new_buffer, args: _before_update_config(bm, None, new_buffer, args),
             apply_to_existing=True,
         )
@@ -1968,14 +1970,14 @@ class RAGer(BufferManager, AgenticObject):
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_UPDATE_BUFFER,
             "rager_after_update_config",
-            config_pattern,
+            _RAGER_CONFIG_PATTERN,
             _after_update_config,
             apply_to_existing=True,
         )
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_CREATE_BUFFER,
             "rager_after_create_config",
-            config_pattern,
+            _RAGER_CONFIG_PATTERN,
             lambda bm, new_buffer, args: _after_update_config(bm, None, new_buffer, args),
             apply_to_existing=True,
         )
@@ -1984,26 +1986,23 @@ class RAGer(BufferManager, AgenticObject):
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_DROP_BUFFER,
             "rager_after_drop_config",
-            config_pattern,
+            _RAGER_CONFIG_PATTERN,
             _after_drop_config,
             apply_to_existing=True,
         )
 
-        # Register hooks on all index query buffers.
-        query_pattern = rf"^{_RAGER_SCOPE}:.+:query:.+$"
-
-        # Register hooks on query buffers to validate query changes.
+        # Register hooks on all index query buffers to validate query changes.
         self.register_buffer_pattern_hook(
             HookPoint.BEFORE_UPDATE_BUFFER,
             "rager_before_update_query",
-            query_pattern,
+            _RAGER_QUERY_PATTERN,
             _before_update_query,
             apply_to_existing=True,
         )
         self.register_buffer_pattern_hook(
             HookPoint.BEFORE_CREATE_BUFFER,
             "rager_before_create_query",
-            query_pattern,
+            _RAGER_QUERY_PATTERN,
             lambda bm, new_buffer, args: _before_update_query(bm, None, new_buffer, args),
             apply_to_existing=True,
         )
@@ -2012,14 +2011,14 @@ class RAGer(BufferManager, AgenticObject):
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_UPDATE_BUFFER,
             "rager_after_update_query",
-            query_pattern,
+            _RAGER_QUERY_PATTERN,
             _after_update_query,
             apply_to_existing=True,
         )
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_CREATE_BUFFER,
             "rager_after_create_query",
-            query_pattern,
+            _RAGER_QUERY_PATTERN,
             lambda bm, new_buffer, args: _after_update_query(bm, None, new_buffer, args),
             apply_to_existing=True,
         )
@@ -2028,19 +2027,16 @@ class RAGer(BufferManager, AgenticObject):
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_DROP_BUFFER,
             "rager_after_drop_query",
-            query_pattern,
+            _RAGER_QUERY_PATTERN,
             _after_drop_query,
             apply_to_existing=True,
         )
-
-        # Register hooks on all index result buffers.
-        result_pattern = rf"^{_RAGER_SCOPE}:.+:result:.+$"
 
         # Register the BEFORE_READ hook on result buffers to pre-populate results.
         self.register_buffer_pattern_hook(
             HookPoint.BEFORE_READ_BUFFER,
             "rager_before_read_result",
-            result_pattern,
+            _RAGER_RESULT_PATTERN,
             _before_read_result,
             apply_to_existing=True,
         )
