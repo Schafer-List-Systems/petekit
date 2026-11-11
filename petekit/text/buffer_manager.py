@@ -970,6 +970,9 @@ class BufferManager(AgenticObject):
         # Named with the BufferManager's identity so logs are traceable.
         self._watchdog = Watchdog(name=f"BufferManager/{hex(id(self))}")
 
+    def list_buffers(self) -> dict[str, Buffer]:
+        return self._buffers
+
     def get_buffer(self, name: str) -> Buffer | None:
         """Protected buffer lookup — returns the Buffer object or None if not found.
 

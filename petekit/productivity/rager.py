@@ -12,7 +12,7 @@ from typing import Any
 
 from peteos.oap.agentic_object import AgenticObject
 
-from petekit.text.buffer_manager import AfterBufferDropped, AfterUpdateBuffer, Buffer, BufferManager, HookPoint, _STATUS_BUFFER
+from petekit.text.buffer_manager import AfterBufferDropped, AfterUpdateBuffer, Buffer, BufferManager, HookPoint
 
 
 _logger = logging.getLogger("rager")
@@ -972,7 +972,7 @@ def _flush_index(rager: RAGer, rag_index: RAGIndex) -> dict[str, Any]:
     ids_to_labels_file = index_dir / _RAGER_IDS_TO_LABELS_FILE
     try:
         with open(ids_to_labels_file, "w") as f:
-            json.dump(rag_index.ids_to_labels, f)
+            json.dump(rag_index.ids_to_labels, f, indent=2)
     except Exception as e:
         _logger.error(f"[RAGer] failed to persist ids_to_labels for '{rag_index.name}': {e}")
         return {"ok": False, "error": str(e)}
@@ -981,7 +981,7 @@ def _flush_index(rager: RAGer, rag_index: RAGIndex) -> dict[str, Any]:
     labels_to_ids_file = index_dir / _RAGER_LABELS_TO_IDS_FILE
     try:
         with open(labels_to_ids_file, "w") as f:
-            json.dump(rag_index.labels_to_ids, f)
+            json.dump(rag_index.labels_to_ids, f, indent=2)
     except Exception as e:
         _logger.error(f"[RAGer] failed to persist labels_to_ids for '{rag_index.name}': {e}")
         return {"ok": False, "error": str(e)}
@@ -990,7 +990,7 @@ def _flush_index(rager: RAGer, rag_index: RAGIndex) -> dict[str, Any]:
     ids_to_vectors_file = index_dir / _RAGER_IDS_TO_VECTORS_FILE
     try:
         with open(ids_to_vectors_file, "w") as f:
-            json.dump(rag_index.ids_to_vectors, f)
+            json.dump(rag_index.ids_to_vectors, f, indent=2)
     except Exception as e:
         _logger.error(f"[RAGer] failed to persist ids_to_vectors for '{rag_index.name}': {e}")
         return {"ok": False, "error": str(e)}
@@ -1216,18 +1216,11 @@ async def _sync_index(
         _logger.error(f"[RAGer] {msg}")
         return msg
 
-    # Read the list of all buffer names from the status buffer.
-    status_buffer = rager.get_buffer(_STATUS_BUFFER)
-    if status_buffer is None:
-        msg = f"buffer list '{_STATUS_BUFFER}' is not available"
-        _logger.error(f"[RAGer] {msg}")
-        return msg
-    try:
-        buffer_names: list[str] = [b["name"] for b in json.loads(status_buffer.get_text() or "[]")]
-    except json.JSONDecodeError:
-        msg = f"buffer list '{_STATUS_BUFFER}' is corrupted"
-        _logger.error(f"[RAGer] {msg}")
-        return msg
+    # Get the list of all buffer names from the buffer manager.
+    # Read directly rather than from the status buffer -- buffers created during
+    # construction bypass AFTER_CREATE_BUFFER hooks and are absent from the
+    # status buffer. This avoids the staleness window and keeps indices in sync.
+    buffer_names = list(rager.list_buffers().keys())
 
     # Read the buffer selection pattern from the index configuration.
     # Buffers matching this pattern are candidates for inclusion in the index.

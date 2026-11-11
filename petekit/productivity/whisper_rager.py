@@ -91,10 +91,30 @@ def _make_rag_query_action(
             _logger.error(f"[WhisperRAGer] !{_QUERY_RAG_NAME} called without 'index' in action_config")
             return None
 
-        # Build the query args from config with no query-name suffix.
+        # Set the query name for this session.
         query_name = "current_whisperer"
-        query_text = str(msg_dict)
+
+        # Extract the text and thinking parts from the message content.
+        content = msg_dict.get("content", [])
+        relevant_types = ("text", "thinking")
+        text_parts = [
+            part["text"]
+            for part in content
+            if part.get("type") in relevant_types
+            and part.get("text")
+        ]
+
+        # Join the parts into the query text.
+        query_text = "\n".join(text_parts)
+
+        # Return early when there is nothing to search.
+        if not query_text:
+            return ""
+
+        # Get the query arguments from the action config.
         query_args = action_config.get("query_args", {})
+
+        # Build the query data dictionary for the RAGer.
         query_data = {"search": query_text, "query_args": query_args}
 
         # Create the query buffer so the RAGer system picks it up and processes it.
