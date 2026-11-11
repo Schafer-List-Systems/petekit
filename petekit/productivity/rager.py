@@ -94,7 +94,7 @@ _logger = logging.getLogger("rager")
 # Constants                                                                                                          #
 # -------------------------------------------------------------------------------------------------------------------- #
 
-_RAGER_SCOPE = "rag"
+_RAGER_SCOPE = r"(?:rag|.+[:/]rag)"
 _RAGER_DOC_BUFFER = "doc:rager"
 
 # Side-index files: map FAISS integer IDs to domain string labels and back.
@@ -333,8 +333,20 @@ def _get_index_config(
 
     Returns the parsed JSON dict on success, None if the buffer is absent.
     """
+    # Look up the RAGIndex to get the authoritative config buffer name.
+    rag_index = rager._rag_indexes.get(index_name)
+    if rag_index is None:
+        _logger.error(f"[_get_index_config] RAGIndex '{index_name}' is not registered")
+        return None
+
+    # Extract the config buffer name from the index config.
+    config_buffer_name = rag_index.config.get("config_buffer_name", "")
+    if not config_buffer_name:
+        _logger.error(f"[_get_index_config] index '{index_name}' has no 'config_buffer_name' in config")
+        return None
+
     # Locate the config buffer for this index.
-    config_buffer = rager.get_buffer(f"{_RAGER_SCOPE}:{index_name}:config")
+    config_buffer = rager.get_buffer(config_buffer_name)
     if config_buffer is None:
         return None
 
@@ -378,10 +390,14 @@ def _index_name_from_config(config_buffer_name: str) -> str | None:
     Example: rag:docs:config -> docs
     Returns None if the buffer name is malformed.
     """
+    # Split from the right with at most 2 splits so the index name is always
+    # the second-to-last segment regardless of any prefix on the buffer name.
     parts = config_buffer_name.rsplit(":", 2)
     if len(parts) < 3:
         _logger.error(f"[RAGer] config buffer name '{config_buffer_name}' is malformed")
         return None
+
+    # The index name is the second-to-last segment, e.g. "docs" from "rag:docs:config".
     return parts[1]
 
 
@@ -472,7 +488,7 @@ def _get_results_for_query(
 
     # Read limit and threshold from the pre-filled query_args.
     limit = query_dict["query_args"]["limit"]
-    threshold = query_dict["query_args"]["threshold"]
+    threshold = query_dict["query_args"]["threshold"] or float("inf")
 
     # Embed the search string into a query vector.
     embed_result = _embed(rager, rag_index, search)
@@ -1324,8 +1340,14 @@ async def _before_update_config(
             f"{_RAGER_SCOPE}:{new_buffer.name}"
         )
 
+    if old_buffer is None:
+        # This is an index creation -- reject when the index is already registered.
+        index_name = _index_name_from_config(new_buffer.name)
+        if index_name is not None and index_name in rager._rag_indexes:
+            return f"index '{index_name}' is already registered"
+
     # Reject any change to buffer_pattern after index creation; a resync cannot safely refresh result buffers.
-    if old_buffer is not None:
+    else:
         # Read the old config to extract its buffer_pattern.
         old_text = old_buffer.get_text() or ""
         try:
@@ -1431,6 +1453,10 @@ async def _after_update_config(
             f"[RAGer] auto-discovered embedding dimension {new_config["dim"]} "
             f"for index '{index_name}'"
         )
+
+        # Inject the config buffer name into the config so the index knows
+        # which buffer owns it and can persist that to index.json.
+        new_config["config_buffer_name"] = new_buffer.name
 
         # Delegate creation or reload to the helper; store the result in live memory.
         rag_index: RAGIndex | str = _create_or_load_index(rager, index_name, new_config)
