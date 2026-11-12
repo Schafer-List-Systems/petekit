@@ -1784,7 +1784,7 @@ def _make_after_update_buffer(
             # Compare the new distance with results to find out, if it is a new candidate.
             # Results are sorted ascending by distance; the last entry is the worst.
             # Skip if the result list is full and the new distance does not beat the current worst result.
-            threshold = query_dict["query_args"]["hreshold"]
+            threshold = query_dict["query_args"]["threshold"]
             if threshold < float("inf") and new_distance > threshold:
                 continue
             limit = query_dict["query_args"]["limit"]
