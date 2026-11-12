@@ -184,6 +184,90 @@ To remove a reaction, remove its entry from the option buffer.
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
+def _compute_unified_diff(
+    old_lines: list[str],
+    new_lines: list[str],
+    fromfile: str,
+    tofile: str,
+) -> list[str]:
+    """Compute a unified diff between old_lines and new_lines."""
+    # Produce the unified diff using difflib with the given file labels.
+    result = list(difflib.unified_diff(old_lines, new_lines, fromfile=fromfile, tofile=tofile, lineterm=""))
+
+    # Return the list of diff lines.
+    return result
+
+
+def _make_full_diff(
+    diff_lines: list[str],
+    max_chars: int,
+    new_buffer_name: str,
+) -> str | None:
+    """Format diff_lines as a fenced diff block if it fits within max_chars."""
+    # Guard against an empty diff.
+    if not diff_lines:
+        return None
+
+    # Join the diff lines and check whether the result fits within max_chars.
+    diff_text = "\n".join(diff_lines)
+    if len(diff_text) <= max_chars:
+        # The diff fits -- wrap it in a fenced Markdown diff block.
+        return f"\n\n```diff\n{diff_text}\n```"
+
+    # The diff exceeds the size threshold.
+    return None
+
+
+def _make_opcodes_diff(
+    old_lines: list[str],
+    new_lines: list[str],
+    max_chars: int,
+    new_buffer_name: str,
+) -> str | None:
+    """Format the diff as an opcodes summary if it fits within max_chars."""
+    # Guard against empty input.
+    if not old_lines or not new_lines:
+        return None
+
+    # Compute the sequence matcher opcodes and derive change counts.
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+    opcodes = list(matcher.get_opcodes())
+    added = sum(j2 - j1 for tag, _, _, j1, j2 in opcodes if tag == "insert")
+    removed = sum(i2 - i1 for tag, i1, i2, _, _ in opcodes if tag == "delete")
+    changed = sum(min(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in opcodes if tag == "replace")
+
+    # Encode only the non-equal opcodes into a compact string.
+    opcode_parts = [
+        ",".join(str(x) for x in op)
+        for op in opcodes
+        if op[0] != "equal"
+    ]
+    opcode_str = "".join(f"[{p}]" for p in opcode_parts)
+    text = f"{new_buffer_name} updated +{added} -{removed} ~{changed} opcodes: {opcode_str}"
+
+    # Return the compact form when it fits, or None when it exceeds max_chars.
+    if len(text) <= max_chars:
+        return f"\n\n{text}"
+    return None
+
+
+def _make_brief_diff(
+    old_lines: list[str],
+    new_lines: list[str],
+    new_buffer_name: str,
+) -> str:
+    """Format a counts-only brief diff from old_lines and new_lines."""
+    # Derive change counts from the sequence matcher opcodes.
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+    opcodes = list(matcher.get_opcodes())
+    added = sum(j2 - j1 for tag, _, _, j1, j2 in opcodes if tag == "insert")
+    removed = sum(i2 - i1 for tag, i1, i2, _, _ in opcodes if tag == "delete")
+    changed = sum(min(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in opcodes if tag == "replace")
+
+    # Return the brief counts-only summary as a fixed-width string.
+    return f"\n\n{new_buffer_name} updated +{added} -{removed} ~{changed}"
+
+
 def _make_notify_hook_for_update(
     option_buffer: Buffer,
 ) -> Callable:
@@ -232,21 +316,27 @@ def _make_notify_hook_for_update(
         # Append a unified diff to the prompt when include_diff is true.
         include_diff = reaction_config.get("include_diff", False)
         if include_diff:
-            # Compute the unified diff between the old and new content.
+            # Split old and new content into lines for diffing.
             old_lines = old_text.splitlines()
             new_lines = new_text.splitlines()
-            diff_lines = list(difflib.unified_diff(
-                old_lines,
-                new_lines,
-                fromfile=f"buffer:{old_buffer.name}" if old_buffer else "buffer:?",
-                tofile=f"buffer:{new_buffer.name}",
-                lineterm="",
-            ))
+            fromfile = f"buffer:{old_buffer.name}" if old_buffer else "buffer:?"
+            tofile = f"buffer:{new_buffer.name}"
 
-            # Join the diff lines and format them as a fenced Markdown block.
-            if diff_lines:
-                diff_text = "\n".join(diff_lines)
-                prompt = f"{prompt}\n\n```diff\n{diff_text}\n```"
+            # Compute the unified diff and cascade from full diff to opcodes to brief.
+            diff_lines = _compute_unified_diff(old_lines, new_lines, fromfile, tofile)
+
+            # Try the full unified diff first -- attach it to the prompt when it fits within the size threshold.
+            diff_str = _make_full_diff(diff_lines, BufferManager._MAX_CHUNK_CHARS, new_buffer.name)
+            if diff_str is not None:
+                prompt = f"{prompt}{diff_str}"
+            else:
+                # Fall back to the compact opcodes form when the full diff exceeds the threshold.
+                opcodes_str = _make_opcodes_diff(old_lines, new_lines, BufferManager._MAX_CHUNK_CHARS, new_buffer.name)
+                if opcodes_str is not None:
+                    prompt = f"{prompt}{opcodes_str}"
+                else:
+                    # Last resort: emit a counts-only brief diff that never exceeds the threshold.
+                    prompt = f"{prompt}{_make_brief_diff(old_lines, new_lines, new_buffer.name)}"
 
         # Use the configured persistent_thread_id, or None if absent.
         persistent_thread_id = reaction_config.get("persistent_thread_id")
