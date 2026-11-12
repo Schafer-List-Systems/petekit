@@ -672,10 +672,11 @@ def before_update_option_buffer(
             if not isinstance(reaction_config, dict):
                 return f"[!notify] reaction config must be a dictionary -- got {type(reaction_config).__name__}"
 
-            # Validate that only the expected keys are present -- prompt, persistent_thread_id, description.
+            # Validate that only the expected keys are present
+            # -- prompt, include_diff, persistent_thread_id, description.
             for key in reaction_config:
-                if key not in ("prompt", "persistent_thread_id", "description"):
-                    return f"[!notify] unexpected key '{key}' -- expected prompt, persistent_thread_id, or description"
+                if key not in ("prompt", "include_diff", "persistent_thread_id", "description"):
+                    return f"[!notify] unexpected key '{key}' -- expected prompt, include_diff, persistent_thread_id, or description"
 
             # Config is valid -- skip further function-based validation since `!notify` is a built-in.
             continue
