@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import functools
 import inspect
 import json
@@ -83,12 +84,17 @@ maps `!notify` to a notification config dict:
 {{
   "!notify": {{
     "prompt": "the origin buffer has changed",
+    "include_diff": false,
     "description": "notifies the agent of changes to this buffer"
   }}
 }}
 ```
 
 - `prompt` -- the notification text delivered to you
+- `include_diff` -- default `false`. When `true`, the old and new buffer
+  content are diffed and the unified diff is appended to the prompt. The
+  diff uses the standard `diff -u` format so additions and deletions are
+  clearly visible. Use this when you need to see what exactly changed.
 - `persistent_thread_id` -- if omitted, your current conversation receives
   the prompt automatically. Set this only if you know what you are doing --
   `null` redirects the prompt to a fresh ephemeral context; a thread ID
@@ -222,6 +228,25 @@ def _make_notify_hook_for_update(
             origin = _origin_name_from_option_buffer_name(option_buffer.name)
             now = datetime.datetime.now()
             prompt = f"buffer hook fired for [{origin}] at {now.strftime('%Y-%m-%d %H:%M:%S')}"
+
+        # Append a unified diff to the prompt when include_diff is true.
+        include_diff = reaction_config.get("include_diff", False)
+        if include_diff:
+            # Compute the unified diff between the old and new content.
+            old_lines = old_text.splitlines()
+            new_lines = new_text.splitlines()
+            diff_lines = list(difflib.unified_diff(
+                old_lines,
+                new_lines,
+                fromfile=f"buffer:{old_buffer.name}" if old_buffer else "buffer:?",
+                tofile=f"buffer:{new_buffer.name}",
+                lineterm="",
+            ))
+
+            # Join the diff lines and format them as a fenced Markdown block.
+            if diff_lines:
+                diff_text = "\n".join(diff_lines)
+                prompt = f"{prompt}\n\n```diff\n{diff_text}\n```"
 
         # Use the configured persistent_thread_id, or None if absent.
         persistent_thread_id = reaction_config.get("persistent_thread_id")
