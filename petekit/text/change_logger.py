@@ -261,6 +261,40 @@ async def _after_update_origin(
         _logger.error(f"[ChangeLogger] write to '{log_buffer_name}' failed: {write_result.get('error', 'unknown')}")
 
 
+async def _after_drop_changelog(
+    changelog: ChangeLogger,
+    option_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Called after the [changelog] option buffer is dropped.
+
+    Unregisters the AFTER_UPDATE hook from the origin buffer so the
+    changelog stops processing updates to the origin.
+    """
+    # Derive the origin buffer name from the dropped option buffer.
+    origin = _origin_name_from_changelog_option(option_buffer.name)
+    if origin is None:
+        _logger.error(f"[ChangeLogger] cannot derive origin from '{option_buffer.name}'")
+        return
+
+    # Guard that the origin buffer still exists -- if it is gone, there is nothing to unregister from.
+    origin_buffer = changelog.get_buffer(origin)
+    if origin_buffer is None:
+        _logger.debug(f"[ChangeLogger] origin '{origin}' is gone -- skipping hook unregister")
+        return
+
+    # Unregister the AFTER_UPDATE hook that was placed on the origin at changelog creation time.
+    unregister_result = origin_buffer.unregister_hook(
+        HookPoint.AFTER_UPDATE_BUFFER,
+        "changelog_update_origin",
+    )
+    if not unregister_result.get("ok"):
+        _logger.warning(f"[ChangeLogger] failed to unregister changelog hook from '{origin}': {unregister_result.get('error', 'unknown')}")
+        return
+
+    _logger.debug(f"[ChangeLogger] unregistered changelog hook from '{origin}'")
+
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # ChangeLogger                                                                                                      #
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -278,8 +312,16 @@ class ChangeLogger(StreamBufferManager, OptionBufferManager, AgenticObject):
         # Seed the doc buffer with the module documentation.
         self._create_buffer(_CHANGELOG_DOC_BUFFER, text=_CHANGELOG_DOC)
 
-        # Register the pattern hook for [changelog] option buffers.
-        # On AFTER_CREATE: register the AFTER_UPDATE origin hook and seed the changelog config.
+        # Guard the option buffer before creation so invalid JSON or missing log_buffer is rejected early.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_CREATE_BUFFER,
+            "changelog_requires_json",
+            r"^.+\[changelog\]$",
+            _before_create_changelog,
+            apply_to_existing=True,
+        )
+
+        # After the option buffer is created, register AFTER_UPDATE on the origin buffer to start capturing changes.
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_CREATE_BUFFER,
             "changelog_created",
@@ -287,10 +329,12 @@ class ChangeLogger(StreamBufferManager, OptionBufferManager, AgenticObject):
             _after_create_changelog,
             apply_to_existing=True,
         )
+
+        # When the option buffer is dropped, unregister the hook from the origin buffer to avoid stale references.
         self.register_buffer_pattern_hook(
-            HookPoint.BEFORE_CREATE_BUFFER,
-            "changelog_requires_json",
+            HookPoint.AFTER_DROP_BUFFER,
+            "changelog_dropped",
             r"^.+\[changelog\]$",
-            _before_create_changelog,
+            _after_drop_changelog,
             apply_to_existing=True,
         )
