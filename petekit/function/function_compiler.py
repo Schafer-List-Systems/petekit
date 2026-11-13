@@ -594,7 +594,7 @@ async def _after_update_code(
 
     # Compile the source to get the new proxy.
     try:
-        _func_name, proxy = _compile_function(compiler, source)
+        _func_name, proxy = _compile_function(compiler, source, buffer_name=new_buffer.name)
     except ValueError as e:
         _logger.error(f"[_after_update_code] compile failed for '{func_name}': {e}")
         return None
