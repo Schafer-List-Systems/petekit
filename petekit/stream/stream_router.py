@@ -363,7 +363,7 @@ async def route_dispatch(
         for condition_name in condition_list:
             # Evaluate the condition — RoutingConditionError means fall-through for this entry.
             try:
-                matched = evaluate_condition(
+                matched = await evaluate_condition(
                     processor,
                     condition_name,
                     text,
@@ -465,7 +465,7 @@ async def route_dispatch_batch(
         await route_dispatch(processor, config, new_buffer.name, table_name, appended_text)
 
 
-def evaluate_condition(
+async def evaluate_condition(
     function_manager: FunctionManager,
     condition_name: str,
     text: str,
@@ -482,7 +482,7 @@ def evaluate_condition(
     # Handle negation prefix by recursing with the inner name.
     if condition_name.startswith("!"):
         inner = condition_name[1:]
-        return not evaluate_condition(function_manager, inner, text, stream, table_name)
+        return not await evaluate_condition(function_manager, inner, text, stream, table_name)
 
     # Handle the built-in "true" and "false" conditions.
     if condition_name.lower() == "true":
@@ -511,6 +511,8 @@ def evaluate_condition(
             reason=f"incompatible signature: {params}",
         )
     result = method(function_manager, stream, text, metadata={"routing_table": table_name})
+    if inspect.iscoroutine(result):
+        result = await result
     return result
 
 

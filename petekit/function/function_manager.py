@@ -537,7 +537,7 @@ class FunctionManager(BufferManager, AgenticObject):
         return {
             "ok": True,
             "name": wrapper.__name__,
-            "callable": wrapper.__wrapped__,
+            "callable": wrapper,
             "args": list(sig.parameters.keys()),
             "required_args": required,
             "returns": str(return_annotation) if return_annotation is not inspect.Parameter.empty else "None",
