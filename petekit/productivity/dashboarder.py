@@ -37,54 +37,59 @@ content buffers and subscribed to one or more dashboard servers.
 
 ### Workflow
 
-1. Create a dashboard server option buffer on MAIN[dashboard]:
-   {id: "<server-id>", port: <port>, host: "<host>", title: "<title>", template: "<template-buffer-name>"}
+1. Create the main HTML template buffer:
+   e.g. `my_directory/my_dashboard.html` — a content buffer with HTML + JS.
+   This page opens a WebSocket to the server and handles the four event types.
    -> The Dashboarder opens an HTTP server on host:port and starts serving the page.
 
-2. Create template buffers for your cards. Each is HTML + JavaScript:
-   - Define a global function `window["<card-id>"].updateContent(event)` in JS.
-   - The function receives the full JSON event from the WebSocket (see step 5 for event shape).
-   - Return a string from updateContent to replace the card's HTML, or None to skip re-render.
+2. Create the dashboard server option buffer on that HTML template buffer:
+   e.g. `my_directory/my_dashboard.html[dashboard]` stores:
+   {id: "mysrv", port: 8000, host: "0.0.0.0", title: "My Dashboard"}
+   -> The Dashboarder opens an HTTP server on host:port and starts serving the main page.
 
-3. Create a dashboard card option buffer on a content buffer:
-   The option buffer is named `dashboard-card` and lives on the content buffer `<content-name>`.
-   Stores:
-   {id: "<card-id>", template: "<template-buffer-name>", servers: ["<server-id>", ...]}
-   -> The Dashboarder broadcasts a "create_card" event to all listed servers.
-   -> The Dashboarder registers AFTER_UPDATE_BUFFER and BEFORE_DROP_BUFFER hooks on the content buffer.
+3. Create the card HTML template buffers (one per card type):
+   e.g. `my_directory/my_card.html` — with a `<template>` element and a JS namespace that exposes window["my_card"].updateContent(event).
 
-4. The browser receives create_card and adds a layer to the page.
+4. Create the content JSON buffer:
+   e.g. `any_directory/my_data.json` stores:
+   {"title": "Server A", "value": "All systems nominal", "status": "online"}
+
+5. Create the dashboard card option buffer on that content buffer:
+   e.g. `any_directory/my_data.json[dashboard-card]` stores:
+   {id: "my-card", template: "my_directory/my_card.html", servers: ["mysrv"]}
+
+6. The browser receives create_card and adds a layer to the page.
    The browser calls `updateContent(event)` from the card template to render.
 
-5. When the content buffer updates, the AFTER_UPDATE_BUFFER hook fires.
-   -> The content buffer is a JSON object. Its raw text is read as the event payload.
-   -> The Dashboarder broadcasts an "update_card" event to all servers: {event: "update_card", id: "<card-id>", payload: <content-buffer-json>}
+7. When the content buffer updates, the Dashboarder streams the new data to all cards.
+   -> The raw text payload is read from the content buffer and forwarded as-is.
+   -> The Dashboarder broadcasts an "update_card" event to all servers:
+     {event: "update_card", id: "my_card", payload: <raw-text>}
    -> The browser re-renders by calling updateContent on that card.
 
-6. When the dashboard card option buffer drops, AFTER_DROP_BUFFER fires.
-   -> The Dashboarder unregisters the content buffer hooks.
+8. When the dashboard card option buffer drops, the Dashboarder closes the card on all servers.
    -> The Dashboarder broadcasts "remove_card" to all servers.
    -> The browser removes the card layer.
 
-7. When the dashboard server option buffer drops, the HTTP server stops.
+9. When the dashboard server option buffer drops, the HTTP server stops.
 
 ### Buffer Formats
 
-MAIN[dashboard]                     Dashboard server option buffer
-  id: str                           Unique server identifier
-  port: int                         TCP port (1-65535)
-  host: str                        Bind address (default "0.0.0.0")
-  title: str                       Page title shown in the browser
-  template: str                    Name of the main page template buffer
-
-<template-buffer>                  Main page template buffer (HTML + JS)
+<main-template-buffer>             Main page template buffer (HTML + JS)
   Full HTML page served to the browser.
   Must include JS that opens a WebSocket to the server.
   WebSocketListener parses JSON events: create_card, update_card, remove_card, template_updated.
   The main page adds/removes/updates card layers via the DOM.
 
-<content-name>                     Your data buffer (JSON). Updates to it fan out to all servers.
-<content-name>[dashboard-card]     Card configuration
+<main-template-buffer>[dashboard]  Dashboard server option buffer (lives on the main template buffer)
+  id: str                          Unique server identifier
+  port: int                        TCP port (1-65535)
+  host: str                        Bind address (default "0.0.0.0")
+  title: str                       Page title shown in the browser
+  template: str                    Buffer name of the main template (see <main-template-buffer> above)
+
+<content-buffer>                   Your data buffer. Any format — the card template parses the raw text payload as needed.
+<content-buffer>[dashboard-card]   Card configuration
   id: str                          Unique card identifier (used as JS namespace)
   template: str                    Name of the card template buffer (see <card-template-buffer> below)
   servers: list[str]               Dashboard server IDs this card is published to
@@ -93,13 +98,8 @@ MAIN[dashboard]                     Dashboard server option buffer
   HTML fragment inserted into the card layer.
   JavaScript defines window["<card-id>"].updateContent(event):
     - Called by the browser on every update_card event for this card.
-    - event = {event: "update_card", id: "<card-id>", payload: <content-buffer-json>}
-    - Return HTML string to replace the card content, or None to skip re-render.
-
-<content-name>                     Content buffer
-  A JSON object with arbitrary structure. Its raw text is the payload
-  broadcast on every update_card event to all servers that subscribe to it.
-  When this buffer updates, the Dashboarder reads its JSON text and fans it out.
+    - event = {event: "update_card", id: "<card-id>", payload: <raw-text>}
+    - Mutates the card DOM in place.
 
 ### Examples
 
@@ -120,19 +120,20 @@ See `doc:dashboarder:card.html` for a working example.
 
 #### Minimal workflow
 
-1. Create the main page template buffer `my-dashboard-main` with the main page
-   HTML (or use the default page if you do not set a template).
+1. Create the main HTML template buffer `my_directory/my_dashboard.html`.
 
-2. Create the dashboard server option buffer on `MAIN[dashboard]`:
-   {id: "mysrv", port: 8000, host: "0.0.0.0", title: "My Dashboard", template: "my-dashboard-main"}
+2. Create the dashboard server option buffer on that HTML template buffer:
+   `my_directory/my_dashboard.html[dashboard]` stores:
+   {id: "mysrv", port: 8000, host: "0.0.0.0", title: "My Dashboard"}
 
-3. Create a card template buffer `my-card` with the card HTML and JS namespace.
+3. Create the card HTML template buffer `my_directory/my_card.html`.
 
-4. Create the content buffer `my-data` with a JSON payload:
-   {"title": "Server A", "body": "All systems nominal"}
+4. Create the content JSON buffer `any_directory/my_data.json`:
+   {"title": "Server A", "value": "All systems nominal", "status": "online"}
 
-5. Create the dashboard card option buffer on `my-data`:
-   {id: "my-card", template: "my-card", servers: ["mysrv"]}
+5. Create the dashboard card option buffer on that content buffer:
+   `any_directory/my_data.json[dashboard-card]` stores:
+   {id: "my-card", template: "my_directory/my_card.html", servers: ["mysrv"]}
 
 The Dashboarder opens the HTTP server, the browser loads the page, opens the
 WebSocket, receives the create_card event, renders the card, and re-renders on
