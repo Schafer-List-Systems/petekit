@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "petekit"
-version = "0.5.75"
+version = "0.5.76"
 description = "PeteOS Kit — agentic building blocks for streams, text, and images"
 requires-python = ">=3.10"
 dependencies = [
@@ -23,7 +23,10 @@ dependencies = [
     "imapclient",
     "croniter",
     "mcp",
-    "faiss-cpu"
+    "faiss-cpu",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.27.0",
+    "websockets>=12.0"
 
 ]
 

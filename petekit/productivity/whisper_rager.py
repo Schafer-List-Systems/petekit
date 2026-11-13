@@ -138,7 +138,7 @@ def _make_rag_query_action(
             return None
 
         # Guard against an empty result -- nothing to inject.
-        if not result:
+        if not result or result == "[]":
             return None
 
         return f"The following buffers could be relevant: {result}"

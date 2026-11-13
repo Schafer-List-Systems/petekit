@@ -26,11 +26,12 @@ from petekit.image import (
 )
 from petekit.reflection import SelfReflector
 from petekit.function import FunctionCaller, FunctionCompiler, FunctionManager, MCPClient
-from petekit.productivity import AgentWhisperer, IMAPer, Mailer, RAGer, WhisperRAGer
+from petekit.productivity import AgentWhisperer, Dashboarder, IMAPer, Mailer, RAGer, WhisperRAGer
 
 __all__ = [
     "AgentWhisperer",
     "BufferManager",
+    "Dashboarder",
     "ChangeLogger",
     "Croner",
     "Grapher",
