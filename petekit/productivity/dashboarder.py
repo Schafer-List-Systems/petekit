@@ -708,7 +708,7 @@ async def _after_update_content_buffer(
     """
     # Derive the dashboard card option buffer name from the content buffer name.
     origin_name = new_buffer.name
-    option_name = f"{origin_name}_dashboard_card"
+    option_name = f"{origin_name}[dashboard-card]"
 
     # Resolve the option buffer and guard that it exists.
     option_buffer = dashboarder.get_buffer(option_name)
