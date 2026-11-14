@@ -400,7 +400,7 @@ async def _start_server(
             try:
                 # Receive a JSON event from the browser; exit on any error.
                 data = await websocket.receive_json()
-            except Exception as exc:
+            except BaseException as exc:
                 # Log the error and exit the loop.
                 _logger.warning(f"[Dashboarder] WS[{dashboard_id}] connection error: {exc}")
                 break
@@ -427,6 +427,9 @@ async def _start_server(
         try:
             _logger.info(f"[Dashboarder] server '{dashboard_id}' starting on {host}:{port}")
             await server.serve()
+        except OSError as exc:
+            _logger.error(f"[Dashboarder] server '{dashboard_id}' failed to start on {host}:{port}: {exc}")
+            dashboarder._dashboards.pop(dashboard_id, None)
         finally:
             # Log the server shutdown and evict it from the registry.
             _logger.info(f"[Dashboarder] server '{dashboard_id}' stopped")
@@ -678,11 +681,10 @@ def _before_drop_template(
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Dashboard Card Option Buffer Hooks                                                          #
+# Content Buffer Hooks                                                              #
 # -------------------------------------------------------------------------------------------------------------------- #
-# Fired when a dashboard card option buffer is created on or dropped from a content buffer.
-# The dashboard card option buffer lives on its content buffer: CONTENT[dashboard-card].
-# It holds {id: "<card-id>", template: "<template-buffer-name>"}.
+# Fired when the content buffer (the data source for a card) changes or is dropped.
+# These hooks are registered on the content buffer when the card option buffer is created.
 
 
 def _before_drop_content_buffer(
@@ -751,6 +753,16 @@ async def _after_update_content_buffer(
 
         # Broadcast the update_card event -- this will cause a refresh in the browser.
         await _broadcast_to_dashboard(dashboarder, event, server_id)
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Dashboard Card Option Buffer Hooks                                                        #
+# -------------------------------------------------------------------------------------------------------------------- #
+# Fired when the dashboard card option buffer is created on or dropped from a content buffer.
+# The dashboard card option buffer lives on its content buffer: CONTENT[dashboard-card].
+# It holds {id: "<card-id>", template: "<template-buffer-name>", servers: [...]}.
+# The BEFORE hook on the option buffer triggers validation;
+# the AFTER hook registers content-buffer hooks and sends create_card to browsers.
 
 
 def _before_create_dashboard_card(
