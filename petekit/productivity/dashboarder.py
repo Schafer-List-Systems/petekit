@@ -26,6 +26,14 @@ _logger = logging.getLogger("dashboarder")
 # Constants                                                                                                            #
 # -------------------------------------------------------------------------------------------------------------------- #
 
+
+# Pattern for dashboard card option buffers on content buffers: "BUFFER_NAME[dashboard-card]".
+_DASHBOARD_CARD_OPTION_BUFFER_PATTERN = r"^.+\[dashboard-card\]$"
+
+# Pattern for dashboard server option buffers on main page buffers: "MAIN_PAGE[dashboard]".
+_DASHBOARD_SERVER_OPTION_BUFFER_PATTERN = r"^.+\[dashboard\]$"
+
+
 _DASHBOARDER_DOC_BUFFER = "doc:dashboarder"
 
 _DASHBOARDER_DOC = """
@@ -314,12 +322,6 @@ _EXAMPLE_CARD_TEMPLATE = """
   };
 </script>
 """
-
-# Pattern for dashboard card option buffers on content buffers: "BUFFER_NAME[dashboard-card]".
-_DASHBOARD_CARD_OPTION_BUFFER_PATTERN = r"^.+\[dashboard-card\]$"
-
-# Pattern for dashboard server option buffers on main page buffers: "MAIN_PAGE[dashboard]".
-_DASHBOARD_SERVER_OPTION_BUFFER_PATTERN = r"^.+\[dashboard\]$"
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -681,6 +683,68 @@ def _before_drop_template(
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
+# Card Template Buffer Hooks                                                           #
+# -------------------------------------------------------------------------------------------------------------------- #
+# Fired when a card template buffer is updated or dropped.
+# These hooks are registered on the card template buffer when a dashboard card
+# option buffer that references it is created.
+# The template name is the buffer name used in the 'template' field of the card config.
+
+
+def _before_drop_card_template(
+    dashboarder: Dashboarder,
+    buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """Called before the card template buffer is dropped.
+
+    Reject the drop if any dashboard card is still using this template.
+    """
+    return "cannot drop card template while a dashboard card is using it"
+
+
+async def _after_update_card_template(
+    dashboarder: Dashboarder,
+    old_buffer: Buffer,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Called after the card template buffer is updated.
+
+    Broadcast a template_updated event to all dashboard servers that have
+    a card using this template so the browser picks up the refreshed HTML.
+    """
+    # Guard: nothing to do when no dashboards are running.
+    if not dashboarder._dashboards:
+        return
+
+    # Derive the template name from the updated buffer.
+    template_name = new_buffer.name
+
+    # Fan out to all servers that have a card using this template.
+    for opt_buf in dashboarder.list_buffers().values():
+        # Skip buffers that are not card option buffers.
+        if not re.match(_DASHBOARD_CARD_OPTION_BUFFER_PATTERN, opt_buf.name):
+            continue
+
+        # Parse the config and skip if this template is not referenced.
+        try:
+            config: dict[str, Any] = json.loads(opt_buf.get_text())
+        except json.JSONDecodeError:
+            continue
+        if config.get("template") != template_name:
+            continue
+
+        # Fan out the template_updated event to each target server.
+        servers: list[str] = config.get("servers", [])
+        for server_id in servers:
+            if server_id not in dashboarder._dashboards:
+                continue
+            event = {"event": "template_updated", "template": template_name}
+            await _broadcast_to_dashboard(dashboarder, event, server_id)
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
 # Content Buffer Hooks                                                              #
 # -------------------------------------------------------------------------------------------------------------------- #
 # Fired when the content buffer (the data source for a card) changes or is dropped.
@@ -886,6 +950,18 @@ async def _after_create_dashboard_card(
         _before_drop_content_buffer,
     )
 
+    # Register the card template buffer hooks for refresh and drop guard.
+    template_buffer.register_hook(
+        HookPoint.AFTER_UPDATE_BUFFER,
+        f"_dashboard_card_template_refresh_{card_id}",
+        _after_update_card_template,
+    )
+    template_buffer.register_hook(
+        HookPoint.BEFORE_DROP_BUFFER,
+        f"_dashboard_card_template_guard_{card_id}",
+        _before_drop_card_template,
+    )
+
     # Read the payload from the content buffer.
     payload = content_buffer.get_text()
 
@@ -918,33 +994,10 @@ async def _after_drop_dashboard_card(
       - send "remove_card" over the WebSocket to tear the card down on the frontend
       - unregister _after_update_content_card from the content buffer to stop updates
     """
-    # Derive the content buffer name from the option buffer name.
-    origin_name = _origin_name_from_option_buffer_name(option_buffer.name)
-    if origin_name is None:
-        return
-
-    # Resolve the content buffer to unregister the hooks.
-    content_buffer = dashboarder.get_buffer(origin_name)
-    if content_buffer is None:
-        _logger.error(f"[Dashboarder] content buffer '{origin_name}' not found")
-        return
-
-    # Unregister the content buffer hooks to stop updates and drop guard.
-    content_buffer.unregister_hook(
-        HookPoint.AFTER_UPDATE_BUFFER,
-        "_dashboard_content_refresh",
-    )
-    content_buffer.unregister_hook(
-        HookPoint.BEFORE_DROP_BUFFER,
-        "_dashboard_content_guard",
-    )
-
-    # Read and parse the option buffer as JSON.
+    # Read and parse the option buffer as JSON to get card config.
     text = option_buffer.get_text()
     if not text:
         return
-
-    # Parse the config JSON and guard that it is a dict.
     try:
         config: dict[str, Any] = json.loads(text)
     except json.JSONDecodeError:
@@ -952,9 +1005,38 @@ async def _after_drop_dashboard_card(
     if not isinstance(config, dict):
         return
 
-    # Extract the card ID and servers list from the config.
+    # Extract the card ID, template, and servers list from the config.
     card_id = config.get("id")
+    template_name = config.get("template")
     servers: list[str] = config.get("servers", [])
+
+    # Resolve the content buffer to unregister the hooks.
+    origin_name = _origin_name_from_option_buffer_name(option_buffer.name)
+    if origin_name is None:
+        return
+    content_buffer = dashboarder.get_buffer(origin_name)
+    if content_buffer is not None:
+        content_buffer.unregister_hook(
+            HookPoint.AFTER_UPDATE_BUFFER,
+            "_dashboard_content_refresh",
+        )
+        content_buffer.unregister_hook(
+            HookPoint.BEFORE_DROP_BUFFER,
+            "_dashboard_content_guard",
+        )
+
+    # Unregister the card template buffer hooks.
+    if template_name:
+        template_buffer = dashboarder.get_buffer(template_name)
+        if template_buffer is not None:
+            template_buffer.unregister_hook(
+                HookPoint.AFTER_UPDATE_BUFFER,
+                f"_dashboard_card_template_refresh_{card_id}",
+            )
+            template_buffer.unregister_hook(
+                HookPoint.BEFORE_DROP_BUFFER,
+                f"_dashboard_card_template_guard_{card_id}",
+            )
     if not servers:
         return
 
