@@ -10,7 +10,42 @@ from starlette.routing import Route
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Data Classes                                                              #
+# Public API                                                                                                           #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+def create_server(*, name: str, port: int, host: str = "localhost") -> str | None:
+    """Create a FastAPI + uvicorn web server and register it under the given name.
+
+    Returns None on success, or an error string if the port is already in use.
+    """
+    return _registry.create_server(name=name, port=port, host=host)
+
+
+def get_server(name: str) -> WebServer | str:
+    """Return the server registered under this name, or an error string if not registered."""
+    return _registry.get_server(name)
+
+
+async def register_server(name: str, server: WebServer) -> str | None:
+    """Register a running WebServer under the given name.
+
+    Returns None on success, or an error string if registration fails.
+    """
+    return await _registry.register_server(name, server)
+
+
+async def unregister_server(name: str) -> str | None:
+    """Remove a stopped server from the registry.
+
+    The server must be stopped before it can be unregistered.
+    Returns None on success, or an error string if unregistration fails.
+    """
+    return await _registry.unregister_server(name)
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Data Classes                                                                                                         #
 # -------------------------------------------------------------------------------------------------------------------- #
 
 @dataclass
@@ -21,7 +56,7 @@ class Endpoint:
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# WebServer                                                               #
+# WebServer                                                                                                            #
 # -------------------------------------------------------------------------------------------------------------------- #
 
 class WebServer:
@@ -208,7 +243,7 @@ class WebServer:
         del self._ws_handlers[path]
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Web Registry                                                           #
+# Web Registry                                                                                                         #
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
@@ -302,3 +337,10 @@ class WebRegistry:
 
         # Remove the server from the registry.
         del self._servers[name]
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Singleton                                                                                                            #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+_registry = WebRegistry()
