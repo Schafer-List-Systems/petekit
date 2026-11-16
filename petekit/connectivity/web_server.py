@@ -203,9 +203,19 @@ class WebServer:
             return f"GET handler already mounted on {path}"
 
         # Mount the handler on the FastAPI app for the given path.
-        route = self.app.add_api_route(path, handler, methods=["GET"])
+        self.app.add_api_route(path, handler, methods=["GET"])
 
-        # Store the endpoint handler in the get handlers dictionary.
+        # Capture the newly created route and store it with the handler.
+        # Iterate in reverse order — the new route is near the end, found quickly.
+        from fastapi.routing import APIRoute
+        route = next(
+            route
+            for route in reversed(self.app.routes)
+            if isinstance(route, APIRoute)
+            and route.endpoint is handler
+            and route.path == path
+            and "GET" in route.methods
+        )
         self._get_handlers[path] = Endpoint(route, handler)
 
     def unmount_get(self, path: str) -> str | None:
@@ -220,7 +230,7 @@ class WebServer:
         if endpoint is None:
             return f"no GET handler mounted on {path}"
 
-        # Remove the handler from the FastAPI app using the stored route.
+        # Remove the route from the FastAPI app.
         self.app.routes.remove(endpoint.route)
 
         # Remove the endpoint handler from the get handlers dictionary.
@@ -238,9 +248,19 @@ class WebServer:
             return f"WebSocket handler already mounted on {path}"
 
         # Mount the handler on the FastAPI app for the given path.
-        route = self.app.add_websocket_route(path, handler)
+        # app.websocket(path) returns a decorator — apply it to the handler.
+        self.app.websocket(path)(handler)
 
-        # Store the endpoint handler in the web socket handlers dictionary.
+        # Capture the newly created route and store it with the handler.
+        # Iterate in reverse order — the new route is near the end, found quickly.
+        from fastapi.routing import APIWebSocketRoute
+        route = next(
+            route
+            for route in reversed(self.app.routes)
+            if isinstance(route, APIWebSocketRoute)
+            and route.endpoint is handler
+            and route.path == path
+        )
         self._ws_handlers[path] = Endpoint(route, handler)
 
     def unmount_ws(self, path: str) -> str | None:
@@ -255,7 +275,7 @@ class WebServer:
         if endpoint is None:
             return f"no WebSocket handler mounted on {path}"
 
-        # Remove the handler from the FastAPI app using the stored route.
+        # Remove the route from the FastAPI app.
         self.app.routes.remove(endpoint.route)
 
         # Remove the endpoint handler from the web socket handlers dictionary.
