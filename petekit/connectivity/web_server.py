@@ -1,5 +1,7 @@
 # Web Server Module
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import asyncio
@@ -14,12 +16,12 @@ from starlette.routing import Route
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
-def create_server(*, name: str, port: int, host: str = "localhost") -> str | None:
+async def create_server(*, name: str, port: int, host: str = "localhost") -> str | None:
     """Create a FastAPI + uvicorn web server and register it under the given name.
 
     Returns None on success, or an error string if the port is already in use.
     """
-    return _registry.create_server(name=name, port=port, host=host)
+    return await _registry.create_server(name=name, port=port, host=host)
 
 
 def get_server(name: str) -> WebServer | str:
@@ -88,12 +90,29 @@ class WebServer:
         # Store the task reference so is_running returns True.
         self.task = asyncio.create_task(self._run(error))
 
-        # Wait for either the server startup or the error event to be set.
-        done, _ = await asyncio.wait([self.config.server.startup, error])
+        # Define the polling function that checks server.started until it is True.
+        async def poll_started() -> bool:
+            # Poll server.started until it becomes True.
+            while not self.config.server.started:
+                # Wait 100ms before polling again.
+                await asyncio.sleep(0.1)
+            return True
+
+        # Create the polling task to detect when the server is ready.
+        polling = asyncio.create_task(poll_started())
+
+        # Wait for whichever completes first: the polling or the error event.
+        done, pending = await asyncio.wait([
+            polling,
+            asyncio.create_task(error.wait())
+        ], return_when=asyncio.FIRST_COMPLETED)
+
+        # Cancel the pending task to prevent it from leaking.
+        for t in pending:
+            t.cancel()
 
         # When the error event is set first, the server failed to start.
-        # Return an error message directing the caller to use stop() for details.
-        if error in done:
+        if polling not in done:
             return "server failed to start, call stop() for details"
 
         # When the startup event is set first, the server is listening.
