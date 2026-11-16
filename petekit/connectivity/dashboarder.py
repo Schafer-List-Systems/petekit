@@ -17,6 +17,7 @@ from peteos.oap.agentic_object import AgenticObject
 
 from petekit.text.buffer_manager import Buffer, BufferManager, HookPoint
 from petekit.text.option_buffer_manager import _origin_name_from_option_buffer_name
+from petekit.connectivity.web_server import get_server
 
 
 _logger = logging.getLogger("dashboarder")
@@ -39,21 +40,21 @@ _DASHBOARDER_DOC_BUFFER = "doc:dashboarder"
 _DASHBOARDER_DOC = """
 ## Dashboarder
 
-You open an HTTP + WebSocket server per dashboard and fan out
-create/update/remove events to all connected browsers. Cards are placed on
-content buffers and subscribed to one or more dashboard servers.
+You mount GET and WebSocket endpoints on a pre-configured web server
+and fan out create/update/remove events to all connected browsers.
+Cards are placed on content buffers and subscribed to one or more dashboard servers.
 
 ### Workflow
 
 1. Create the main HTML template buffer:
    e.g. `my_directory/my_dashboard.html` — a content buffer with HTML + JS.
    This page opens a WebSocket to the server and handles the four event types.
-   -> The Dashboarder opens an HTTP server on host:port and starts serving the page.
+   -> The Dashboarder mounts the page on a configured web server at the given path.
 
 2. Create the dashboard server option buffer on that HTML template buffer:
    e.g. `my_directory/my_dashboard.html[dashboard]` stores:
-   {id: "mysrv", port: 8000, host: "0.0.0.0", title: "My Dashboard"}
-   -> The Dashboarder opens an HTTP server on host:port and starts serving the main page.
+   {id: "mysrv", server: "default", path: "/my-dashboard", title: "My Dashboard"}
+   -> The Dashboarder mounts GET and WS at /my-dashboard on the "default" web server.
 
 3. Create the card HTML template buffers (one per card type):
    e.g. `my_directory/my_card.html` — with a `<template>` element and a JS namespace that exposes window["my_card"].updateContent(event).
@@ -79,7 +80,7 @@ content buffers and subscribed to one or more dashboard servers.
    -> The Dashboarder broadcasts "remove_card" to all servers.
    -> The browser removes the card layer.
 
-9. When the dashboard server option buffer drops, the HTTP server stops.
+9. When the dashboard server option buffer drops, the endpoints are unmounted.
 
 ### Buffer Formats
 
@@ -90,9 +91,9 @@ content buffers and subscribed to one or more dashboard servers.
   The main page adds/removes/updates card layers via the DOM.
 
 <main-template-buffer>[dashboard]  Dashboard server option buffer (lives on the main template buffer)
-  id: str                          Unique server identifier
-  port: int                        TCP port (1-65535)
-  host: str                        Bind address (default "0.0.0.0")
+  id: str                          Unique dashboard identifier
+  server: str                      Name of the web server to mount on
+  path: str                        URL path where the dashboard is served (e.g. "/my-dashboard")
   title: str                       Page title shown in the browser
   template: str                    Buffer name of the main template (see <main-template-buffer> above)
 
@@ -114,8 +115,8 @@ content buffers and subscribed to one or more dashboard servers.
 #### Dashboard main page template
 
 The main page template buffer is served as a full HTML page. It must open a
-WebSocket to /ws and handle the four event types. Use `location.host` so the
-browser connects to the same host the page was served from.
+WebSocket to location.pathname and handle the four event types. Use `location.host`
+so the browser connects to the same host the page was served from.
 
 See `doc:dashboarder:main.html` for a working example.
 
@@ -132,7 +133,7 @@ See `doc:dashboarder:card.html` for a working example.
 
 2. Create the dashboard server option buffer on that HTML template buffer:
    `my_directory/my_dashboard.html[dashboard]` stores:
-   {id: "mysrv", port: 8000, host: "0.0.0.0", title: "My Dashboard"}
+   {id: "mysrv", server: "default", path: "/my-dashboard", title: "My Dashboard"}
 
 3. Create the card HTML template buffer `my_directory/my_card.html`.
 
@@ -143,9 +144,9 @@ See `doc:dashboarder:card.html` for a working example.
    `any_directory/my_data.json[dashboard-card]` stores:
    {id: "my-card", template: "my_directory/my_card.html", servers: ["mysrv"]}
 
-The Dashboarder opens the HTTP server, the browser loads the page, opens the
-WebSocket, receives the create_card event, renders the card, and re-renders on
-every update to my-data.
+The Dashboarder mounts the page on the web server, the browser loads the page,
+opens the WebSocket, receives the create_card event, renders the card, and
+re-renders on every update to my-data.
 """
 
 # Default HTML served to the browser when the main page buffer is empty.
@@ -230,9 +231,9 @@ _DEFAULT_DASHBOARD_HTML = """
       ns.updateContent(event);
     }
 
-    const socket = new WebSocket("ws://" + location.host + "/ws");
+    const socket = new WebSocket("ws://" + location.host + location.pathname);
     socket.addEventListener("open", () => {
-      console.log("[Dashboarder] WebSocket connected to ws://" + location.host + "/ws");
+      console.log("[Dashboarder] WebSocket connected to ws://" + location.host + location.pathname);
     });
     socket.addEventListener("error", (e) => {
       console.error("[Dashboarder] WebSocket error:", e);
@@ -333,9 +334,9 @@ _EXAMPLE_CARD_TEMPLATE = """
 class Dashboard:
     """Represents a single running dashboard instance."""
     id: str
+    path: str
     title: str
     config: dict[str, Any]
-    task: asyncio.Task | None = None
     clients: set[DashboardClient] = field(default_factory=set)
 
 
@@ -351,125 +352,87 @@ class DashboardClient:
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
-async def _start_server(
+async def serve_dashboard(
     dashboarder: Dashboarder,
     config: dict[str, Any],
     dashboard_id: str,
 ) -> Dashboard | str:
-    """Open the HTTP server for a dashboard and register the GET and WS handlers."""
+    """Get the web server, mount GET and WS endpoints, and register the dashboard."""
     # Guard that the dashboard is not already running.
+    # When already running, return an error.
     if dashboard_id in dashboarder._dashboards:
         return f"dashboard '{dashboard_id}' is already running"
 
-    # Validate required config keys.
-    port = config.get("port")
-    host = config.get("host")
-    title = config.get("title")
-    if not isinstance(port, int) or not (1 <= port <= 65535):
-        return f"port must be an integer between 1 and 65535"
-    if not isinstance(host, str) or not host:
-        return "host must be a non-empty string"
-    if not isinstance(title, str):
-        title = ""
+    # Get the web server from the registry using the server name from the config.
+    # When the server is not found, return an error.
+    server = get_server(config["server"])
+    if isinstance(server, str):
+        return server
 
-    # Create a per-dashboard FastAPI app and register the GET and WS handlers.
-    app = FastAPI()
+    # Get the path from the config.
+    path = config["path"]
 
-    # Serve the dashboard HTML page at the root path.
-    @app.get("/")
-    async def get_page() -> PlainTextResponse:
-        return PlainTextResponse(
-            await _http_get_handler(dashboarder, dashboard),
-            media_type="text/html",
-        )
+    # Create the Dashboard instance first, before the handlers, so the handlers can capture it.
+    dashboard = Dashboard(
+        id=dashboard_id,
+        path=path,
+        title=config.get("title", ""),
+        config=config,
+        clients=set(),
+    )
 
-    # Accept incoming WebSocket connections and relay events to and from the browser.
-    @app.websocket("/ws")
-    async def ws_route(websocket: WebSocket) -> None:
-        # Accept the WebSocket connection and establish the session.
-        await websocket.accept()
+    # Create the GET handler for this dashboard.
+    def get_page() -> PlainTextResponse:
+        return PlainTextResponse(_http_get_handler(dashboarder, dashboard), media_type="text/html")
 
-        # Register the new client connection on the dashboard.
-        client = DashboardClient(id=str(uuid.uuid4()), websocket=websocket)
-        dashboarder._dashboards[dashboard_id].clients.add(client)
+    # Create the WebSocket handler for this dashboard.
+    async def ws_handler(websocket: WebSocket) -> None:
+        await _ws_handler(dashboarder, dashboard, websocket)
 
-        # Replay all existing dashboard cards to the newly connected client.
-        dashboard = dashboarder._dashboards[dashboard_id]
-        await _replay_cards_to_client(dashboarder, dashboard, client)
+    # Mount the GET handler on the server at the path from the config.
+    # When mounting fails, return the error.
+    error = server.mount_get(path, get_page)
+    if error is not None:
+        return error
 
-        # Pump the WebSocket for incoming JSON events until the connection drops.
-        while True:
-            try:
-                # Receive a JSON event from the browser; exit on any error.
-                data = await websocket.receive_json()
-            except BaseException as exc:
-                # Log the error and exit the loop.
-                _logger.warning(f"[Dashboarder] WS[{dashboard_id}] connection error: {exc}")
-                break
+    # Mount the WebSocket handler on the server at the path from the config.
+    # When mounting fails, unmount the GET handler and return the error.
+    error = server.mount_ws(path, ws_handler)
+    if error is not None:
+        server.unmount_get(path)
+        return error
 
-            # Log the received event and forward it to the dashboarder for processing.
-            _logger.debug(f"[Dashboarder] WS[{dashboard_id}] received: {data}")
-            await _ws_handler(dashboarder, dashboard, data)
-
-    # Configure and start the uvicorn server as a background task in the dashboarder event loop.
-    async def _run_server() -> None:
-        # Build the uvicorn config with host, port, and silent logging.
-        config_uvicorn = uvicorn.Config(
-            app,
-            host=host,
-            port=port,
-            log_level="warning",
-            lifespan="off",
-        )
-
-        # Wrap in a Server and register the dashboard in the live servers dict.
-        server = uvicorn.Server(config_uvicorn)
-
-        # Run the server; clean up the registry when the task completes.
-        try:
-            _logger.info(f"[Dashboarder] server '{dashboard_id}' starting on {host}:{port}")
-            await server.serve()
-        except OSError as exc:
-            _logger.error(f"[Dashboarder] server '{dashboard_id}' failed to start on {host}:{port}: {exc}")
-            dashboarder._dashboards.pop(dashboard_id, None)
-        finally:
-            # Log the server shutdown and evict it from the registry.
-            _logger.info(f"[Dashboarder] server '{dashboard_id}' stopped")
-            dashboarder._dashboards.pop(dashboard_id, None)
-
-    # Create a background task for the server and store its reference.
-    task = asyncio.create_task(_run_server())
-
-    # Create the Dashboard instance and return it immediately.
-    dashboard = Dashboard(id=dashboard_id, title=title, config=config, task=task)
-
-    # Store the dashboard in the registry so _stop_server can find it by ID.
+    # Register the dashboard in the dashboarder's registry.
     dashboarder._dashboards[dashboard_id] = dashboard
 
-    # Return the dashboard to the caller.
+    # Return the Dashboard.
     return dashboard
 
 
-async def _stop_server(
+async def unserve_dashboard(
     dashboarder: Dashboarder,
     dashboard_id: str,
-) -> str | bool:
-    """Close the HTTP server for a dashboard and disconnect all its WS clients."""
-    # Guard that the dashboard is currently running.
+) -> str | None:
+    """Unmount GET and WS endpoints and remove the dashboard from the registry."""
+    # Get the dashboard from the registry.
+    # When not found, return an error.
     if dashboard_id not in dashboarder._dashboards:
         return f"dashboard '{dashboard_id}' is not running"
 
-    # Cancel the background task and remove the dashboard from the registry.
+    # Unmount the GET handler from the server using the path from the dashboard.
+    # Unmount the WebSocket handler from the server using the path from the dashboard.
     dashboard = dashboarder._dashboards[dashboard_id]
-    if dashboard.task is not None:
-        dashboard.task.cancel()
+    server = get_server(dashboard.config["server"])
+    if isinstance(server, str):
+        return server
+    server.unmount_get(dashboard.path)
+    server.unmount_ws(dashboard.path)
 
     # Remove the dashboard from the registry.
     del dashboarder._dashboards[dashboard_id]
 
-    # Log the successful shutdown and return True.
-    _logger.info(f"[Dashboarder] stopped dashboard '{dashboard_id}'")
-    return True
+    # Return None.
+    return None
 
 
 async def _broadcast_to_dashboard(
@@ -586,7 +549,7 @@ async def _replay_cards_to_client(
 # These are registered on the HTTP server and called on each incoming request.
 
 
-async def _http_get_handler(
+def _http_get_handler(
     dashboarder: Dashboarder,
     dashboard: Dashboard,
 ) -> str:
@@ -611,9 +574,44 @@ async def _http_get_handler(
 async def _ws_handler(
     dashboarder: Dashboarder,
     dashboard: Dashboard,
-    data: dict[str, Any] | None = None,
+    websocket: WebSocket,
 ) -> None:
     """Handle the WebSocket stream for the dashboard frontend.
+
+    Accepts the WebSocket, registers the client, replays existing cards,
+    and pumps incoming events until the connection drops.
+    """
+    # Accept the WebSocket connection and establish the session.
+    await websocket.accept()
+
+    # Register the new client connection on the dashboard.
+    client = DashboardClient(id=str(uuid.uuid4()), websocket=websocket)
+    dashboard.clients.add(client)
+
+    # Replay all existing dashboard cards to the newly connected client.
+    await _replay_cards_to_client(dashboarder, dashboard, client)
+
+    # Pump the WebSocket for incoming JSON events until the connection drops.
+    while True:
+        # Receive a JSON event from the browser.
+        # Exit on any error.
+        try:
+            data = await websocket.receive_json()
+        except Exception as exc:
+            _logger.warning(f"[Dashboarder] WS[{dashboard.id}] connection error: {exc}")
+            break
+
+        # Log the received event and forward it to the dashboarder for processing.
+        _logger.debug(f"[Dashboarder] WS[{dashboard.id}] received: {data}")
+        await _ws_message_handler(dashboarder, dashboard, data)
+
+
+async def _ws_message_handler(
+    dashboarder: Dashboarder,
+    dashboard: Dashboard,
+    data: dict[str, Any] | None = None,
+) -> None:
+    """Handle a single WebSocket message from the browser.
 
     Receives and dispatches create_card, update_card, and remove_card events
     to and from the browser. Maintains the set of connected clients.
@@ -1128,14 +1126,14 @@ def _before_create_dashboard_server(
 ) -> str | None:
     """Called before the dashboard server option buffer is created on a main page buffer.
 
-    Validate the option buffer JSON: it must be a dict with 'port' (int), 'host' (str),
+    Validate the option buffer JSON: it must be a dict with 'server' (str), 'path' (str),
     and 'title' (str). Reject the create if validation fails, which also blocks the
-    AFTER_CREATE hook that would open the HTTP server.
+    AFTER_CREATE hook that would mount the dashboard on the web server.
     """
     # Read the option buffer text and parse it as JSON.
     text = option_buffer.get_text()
     if not text:
-        return f"option buffer '{option_buffer.name}' is empty -- port, host, and title are required"
+        return f"option buffer '{option_buffer.name}' is empty -- server, path, and title are required"
 
     # Parse the config JSON and guard that it is a dict.
     try:
@@ -1147,28 +1145,37 @@ def _before_create_dashboard_server(
     if not isinstance(config, dict):
         return f"option buffer '{option_buffer.name}' must be a JSON object"
 
-    # Guard that port is present and valid.
-    port = config.get("port")
-    if not isinstance(port, int) or not (1 <= port <= 65535):
-        return f"port must be an integer between 1 and 65535"
+    # Guard that server is present and is a string.
+    # Return an error when no web server with that name is registered.
+    server = config.get("server")
+    if not isinstance(server, str) or not server:
+        return f"'server' must be a non-empty string in '{option_buffer.name}'"
 
-    # Default host to all interfaces when not provided.
-    host = config.get("host", "0.0.0.0")
+    # Check that a web server with the given name is registered in the WebRegistry.
+    # When not found, return an error.
+    result = get_server(server)
+    if isinstance(result, str):
+        return f"web server '{server}' not found: {result}"
+
+    # Guard that path is present and is a string.
+    # Return an error when path is not a non-empty string.
+    path = config.get("path")
+    if not isinstance(path, str) or not path:
+        return f"'path' must be a non-empty string in '{option_buffer.name}'"
 
     # Guard that title is present.
     if "title" not in config:
         return f"'title' is required in '{option_buffer.name}'"
 
     # Generate a new ID only when absent from the config; otherwise guard for duplicates.
-    server_id = config.get("id")
-    if server_id is None:
-        server_id = str(uuid.uuid4())
-        config["id"] = server_id
-    elif server_id in dashboarder._dashboards:
-        return f"dashboard with id '{server_id}' is already running"
-    config["host"] = host
+    dashboard_id = config.get("id")
+    if dashboard_id is None:
+        dashboard_id = str(uuid.uuid4())
+        config["id"] = dashboard_id
+    elif dashboard_id in dashboarder._dashboards:
+        return f"dashboard with id '{dashboard_id}' is already running"
 
-    # Persist the enriched config (with id and resolved host) back to the option buffer.
+    # Persist the enriched config back to the option buffer.
     option_buffer.set_text(json.dumps(config, indent=2))
 
     # We ensure that the template is filled. To that, we first derive the origin buffer name from the option buffer name.
@@ -1200,9 +1207,9 @@ async def _after_create_dashboard_server(
 ) -> None:
     """Called after the dashboard server option buffer is created on a main page buffer.
 
-    Extract the 'port', 'host', and 'title' from the option buffer. Open the HTTP
-    server and WebSocket server on the configured port and host. Register the
-    main dashboard page from the main page buffer so it is served to the frontend.
+    Extract the 'server', 'path', and 'title' from the option buffer. Mount the
+    GET and WebSocket handlers on the named web server at the given path.
+    Register the dashboard so it can receive broadcasts.
     """
     # Derive the origin buffer name from the option buffer name.
     origin_name = _origin_name_from_option_buffer_name(option_buffer.name)
@@ -1231,7 +1238,7 @@ async def _after_create_dashboard_server(
 
     # Open the HTTP server for this dashboard before registering the hooks.
     server_config["template"] = origin_name
-    start_result = await _start_server(dashboarder, server_config, server_id)
+    start_result = await serve_dashboard(dashboarder, server_config, server_id)
     if not isinstance(start_result, Dashboard):
         _logger.error(f"[Dashboarder] failed to start server: {start_result}")
         return
@@ -1258,7 +1265,7 @@ async def _after_drop_dashboard_server(
 ) -> None:
     """Called after the dashboard server option buffer is dropped from a main page buffer.
 
-    Close the HTTP server and WebSocket server that were opened for this dashboard.
+    Unmount the GET and WebSocket handlers from the web server at the given path.
     Stop serving the dashboard page and all active cards.
     """
     # Derive the server ID from the option buffer config.
@@ -1280,13 +1287,13 @@ async def _after_drop_dashboard_server(
         _logger.error(f"[Dashboarder] cannot derive origin from '{option_buffer.name}'")
         return
 
-    # Stop the HTTP server for this dashboard.
+    # Unmount the GET and WS endpoints for this dashboard.
     try:
-        stop_result = await _stop_server(dashboarder, server_id)
-        if stop_result is not True:
-            _logger.warning(f"[Dashboarder] failed to stop server: {stop_result}")
+        stop_result = await unserve_dashboard(dashboarder, server_id)
+        if stop_result is not None:
+            _logger.warning(f"[Dashboarder] failed to unserve dashboard: {stop_result}")
     except Exception as exc:
-        _logger.error(f"[Dashboarder] exception while stopping server: {exc}")
+        _logger.error(f"[Dashboarder] exception while unserving dashboard: {exc}")
 
     # Resolve the origin buffer to unregister the hooks.
     origin_buffer = dashboarder.get_buffer(origin_name)
