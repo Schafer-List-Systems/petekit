@@ -53,8 +53,8 @@ Cards are placed on content buffers and subscribed to one or more dashboard serv
 
 2. Create the dashboard server option buffer on that HTML template buffer:
    e.g. `my_directory/my_dashboard.html[dashboard]` stores:
-   {id: "mysrv", server: "default", path: "/my-dashboard", title: "My Dashboard"}
-   -> The Dashboarder mounts GET and WS at /my-dashboard on the "default" web server.
+   {id: "mysrv", server: "default", path: "/dashboards/my-dashboard", title: "My Dashboard"}
+   -> The Dashboarder mounts GET and WS at /dashboards/my-dashboard on the "default" web server.
 
 3. Create the card HTML template buffers (one per card type):
    e.g. `my_directory/my_card.html` — with a `<template>` element and a JS namespace that exposes window["my_card"].updateContent(event).
@@ -93,7 +93,7 @@ Cards are placed on content buffers and subscribed to one or more dashboard serv
 <main-template-buffer>[dashboard]  Dashboard server option buffer (lives on the main template buffer)
   id: str                          Unique dashboard identifier
   server: str                      Name of the web server to mount on
-  path: str                        URL path where the dashboard is served (e.g. "/my-dashboard")
+  path: str                        URL path where the dashboard is served (e.g. "/dashboards/my-dashboard")
   title: str                       Page title shown in the browser
   template: str                    Buffer name of the main template (see <main-template-buffer> above)
 
@@ -115,8 +115,8 @@ Cards are placed on content buffers and subscribed to one or more dashboard serv
 #### Dashboard main page template
 
 The main page template buffer is served as a full HTML page. It must open a
-WebSocket to location.pathname and handle the four event types. Use `location.host`
-so the browser connects to the same host the page was served from.
+WebSocket by converting the page URL from HTTP to WebSocket using
+`location.href.replace('http', 'ws').replace('https', 'wss')`.
 
 See `doc:dashboarder:main.html` for a working example.
 
@@ -133,7 +133,7 @@ See `doc:dashboarder:card.html` for a working example.
 
 2. Create the dashboard server option buffer on that HTML template buffer:
    `my_directory/my_dashboard.html[dashboard]` stores:
-   {id: "mysrv", server: "default", path: "/my-dashboard", title: "My Dashboard"}
+   {id: "mysrv", server: "default", path: "/dashboards/my-dashboard", title: "My Dashboard"}
 
 3. Create the card HTML template buffer `my_directory/my_card.html`.
 
@@ -231,9 +231,9 @@ _DEFAULT_DASHBOARD_HTML = """
       ns.updateContent(event);
     }
 
-    const socket = new WebSocket("ws://" + location.host + location.pathname);
+    const socket = new WebSocket(location.href.replace('http', 'ws').replace('https', 'wss'));
     socket.addEventListener("open", () => {
-      console.log("[Dashboarder] WebSocket connected to ws://" + location.host + location.pathname);
+      console.log("[Dashboarder] WebSocket connected to " + socket.url);
     });
     socket.addEventListener("error", (e) => {
       console.error("[Dashboarder] WebSocket error:", e);
@@ -326,7 +326,7 @@ _EXAMPLE_CARD_TEMPLATE = """
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Data Classes                                                                                                        #
+# Data Classes                                                                                                         #
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
@@ -348,7 +348,7 @@ class DashboardClient:
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Utils                                                                                                              #
+# Utils                                                                                                                #
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
@@ -543,7 +543,7 @@ async def _replay_cards_to_client(
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Web Handlers                                                                                                        #
+# Web Handlers                                                                                                         #
 # -------------------------------------------------------------------------------------------------------------------- #
 # HTTP GET and WebSocket handlers for the dashboard server.
 # These are registered on the HTTP server and called on each incoming request.
@@ -620,7 +620,7 @@ async def _ws_message_handler(
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Hooks                                                                                                              #
+# Hooks                                                                                                                #
 # -------------------------------------------------------------------------------------------------------------------- #
 # Dashboard card option buffer lives on the content buffer: CONTENT[dashboard-card].
 # It holds the card config: {id: "<card-id>", template: "<template-buffer-name>"}.
@@ -681,7 +681,7 @@ def _before_drop_template(
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Card Template Buffer Hooks                                                           #
+# Card Template Buffer Hooks                                                                                           #
 # -------------------------------------------------------------------------------------------------------------------- #
 # Fired when a card template buffer is updated or dropped.
 # These hooks are registered on the card template buffer when a dashboard card
@@ -743,7 +743,7 @@ async def _after_update_card_template(
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Content Buffer Hooks                                                              #
+# Content Buffer Hooks                                                                                                 #
 # -------------------------------------------------------------------------------------------------------------------- #
 # Fired when the content buffer (the data source for a card) changes or is dropped.
 # These hooks are registered on the content buffer when the card option buffer is created.
@@ -818,7 +818,7 @@ async def _after_update_content_buffer(
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Dashboard Card Option Buffer Hooks                                                        #
+# Dashboard Card Option Buffer Hooks                                                                                   #
 # -------------------------------------------------------------------------------------------------------------------- #
 # Fired when the dashboard card option buffer is created on or dropped from a content buffer.
 # The dashboard card option buffer lives on its content buffer: CONTENT[dashboard-card].
@@ -1112,7 +1112,7 @@ async def _after_update_content_card(
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Dashboard Server Option Buffer Hooks                                                        #
+# Dashboard Server Option Buffer Hooks                                                                                 #
 # -------------------------------------------------------------------------------------------------------------------- #
 # Fired when a dashboard server option buffer is created on or dropped from a main page buffer.
 # The dashboard server option buffer lives on its main page buffer: MAIN[dashboard].
@@ -1313,7 +1313,7 @@ async def _after_drop_dashboard_server(
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# Dashboarder                                                                                                       #
+# Dashboarder                                                                                                          #
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
