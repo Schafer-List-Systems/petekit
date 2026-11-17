@@ -3,12 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import asyncio
+import re
 import fastapi
 import uvicorn
 from fastapi import FastAPI
 from starlette.routing import Route
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Hook Infrastructure                                                                                                  #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+# MountHook type — called when an endpoint is mounted or unmounted.
+# Args: event (str) — "mount" or "unmount"
+# Args: method (str) — "GET", "POST", "WebSocket", etc.
+# Args: path (str) — the path being mounted or unmounted
+MountHook = Callable[[str, str, str], None]
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -57,6 +70,13 @@ class Endpoint:
     handler: callable
 
 
+@dataclass
+class Hook:
+    """Holds a pattern and a callable for hook-based routing."""
+    pattern: re.Pattern
+    handler: MountHook
+
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # WebServer                                                                                                            #
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -71,6 +91,64 @@ class WebServer:
         self.config.timeout = timeout
         self._get_handlers: dict[str, Endpoint] = {}
         self._ws_handlers: dict[str, Endpoint] = {}
+        self._hooks: dict[str, Hook] = {}
+
+    def register_hook(self, name: str, pattern: str, handler: MountHook) -> str | None:
+        """Register a hook under the given name with a path-matching pattern.
+
+        Compiles the pattern string to a regex and stores a Hook object
+        with the pattern and handler. The hook is called on mount events
+        with (event, method, path): event is "mount" or "unmount", method
+        is "GET" or "WebSocket", path is the mount path. Returns None on
+        success, or an error string if a hook is already registered.
+        """
+        # Guard that no hook is already registered under this name.
+        # When a hook already exists, return an error to prevent overwriting.
+        if name in self._hooks:
+            return f"hook '{name}' already registered"
+
+        # Compile the pattern string to a regex for path matching.
+        # When the pattern is invalid, return an error with the position of the error.
+        try:
+            compiled_pattern = re.compile(pattern)
+        except re.error as exc:
+            return f"invalid regex pattern '{pattern}': {exc.msg} (position {exc.pos})"
+
+        # Build the Hook object and store it in the hooks registry.
+        self._hooks[name] = Hook(pattern=compiled_pattern, handler=handler)
+
+        return None
+
+    def _call_hooks(self, event: str, method: str, path: str) -> None:
+        """Call all registered mount hooks whose pattern matches the path.
+
+        Iterates all registered hooks and calls each hook whose pattern
+        matches the given path. Passes event, method, and path as arguments.
+        """
+        # Iterate all registered hooks and call those whose pattern matches.
+        for hook in self._hooks.values():
+            # Skip hooks whose pattern does not match the path.
+            if not hook.pattern.match(path):
+                continue
+
+            # Call the hook with the event, method, and path.
+            hook.handler(event, method, path)
+
+    def unregister_hook(self, name: str) -> str | None:
+        """Unregister the hook under the given name.
+
+        Returns None on success, or an error string if no hook was
+        registered under this name.
+        """
+        # Guard that a hook is registered under this name.
+        # When not found, return an error.
+        if name not in self._hooks:
+            return f"no hook registered under '{name}'"
+
+        # Remove the hook from the hooks registry.
+        del self._hooks[name]
+
+        return None
 
     async def start(self) -> str | None:
         """Start the server and wait until it is ready to accept connections.
@@ -218,6 +296,9 @@ class WebServer:
         )
         self._get_handlers[path] = Endpoint(route, handler)
 
+        # Call all registered mount hooks whose pattern matches the path.
+        self._call_hooks("mount", "GET", path)
+
     def unmount_get(self, path: str) -> str | None:
         """Unmount the HTTP GET handler on the given path.
 
@@ -235,6 +316,9 @@ class WebServer:
 
         # Remove the endpoint handler from the get handlers dictionary.
         del self._get_handlers[path]
+
+        # Call all registered mount hooks whose pattern matches the path.
+        self._call_hooks("unmount", "GET", path)
 
     def mount_ws(self, path: str, handler: callable) -> str | None:
         """Mount an async WebSocket handler on the given path.
@@ -263,6 +347,9 @@ class WebServer:
         )
         self._ws_handlers[path] = Endpoint(route, handler)
 
+        # Call all registered mount hooks whose pattern matches the path.
+        self._call_hooks("mount", "WebSocket", path)
+
     def unmount_ws(self, path: str) -> str | None:
         """Unmount the WebSocket handler on the given path.
 
@@ -280,6 +367,9 @@ class WebServer:
 
         # Remove the endpoint handler from the web socket handlers dictionary.
         del self._ws_handlers[path]
+
+        # Call all registered mount hooks whose pattern matches the path.
+        self._call_hooks("unmount", "WebSocket", path)
 
 # -------------------------------------------------------------------------------------------------------------------- #
 # Web Registry                                                                                                         #
