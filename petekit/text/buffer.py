@@ -99,7 +99,7 @@ def _resolve_line_range(total: int, start: int | str | None, end: int | str | No
 
     # check for correct order of start and end
     if start > end:
-        return {"ok": False, "error": f"Start line number and end line number resolve to {start} > {end}, which is not allowed."}
+        return {"ok": False, "error": f"Start line number and end line number resolve to {start} > {end}. The end must come AFTER the start!"}
 
     return (start, end)
 
@@ -115,8 +115,9 @@ def _cluster_lines_to_ranges(
     """Cluster matching line numbers into num_clusters ranges by agglomerative neighbor merging.
 
     Each line starts as its own cluster. Repeatedly merges the pair of neighboring
-    clusters with the smallest content-based distance (sum of both cluster char
-    counts plus the char count of the lines between them). Stops when num_clusters
+    clusters with the smallest gap (char count of the lines between them). Merging
+    the smallest gap first leaves the largest gaps as cluster boundaries, which
+    minimizes the total volume the agent must read. Stops when num_clusters
     remain. Returns a list of dicts with start, end, match_count keys.
     """
     if not line_numbers:
@@ -130,17 +131,18 @@ def _cluster_lines_to_ranges(
     else:
         clusters = [{'s': ln, 'e': ln, 'v': len(buf_lines[ln].data) + 1, 'n': 1} for ln in line_numbers]
 
-    # Sum the char counts of two adjacent clusters plus the gap between them.
+    # Sum the char counts of the lines in a range, or 0 without a buffer.
     def span_chars(start: int, end: int) -> int:
         if buf_lines is _NO_BUFFER_:
             return 0
         return sum(len(buf_lines[i].data) + 1 for i in range(start, end + 1))
 
+    # Distance between neighbors is the gap only — the smallest gap merges first,
+    # leaving the largest gaps as cluster boundaries for minimal read volume.
     def neighbor_distance(i: int) -> int:
         a = clusters[i]
         b = clusters[i + 1]
-        between = span_chars(a['e'] + 1, b['s'])
-        return a['v'] + b['v'] + between
+        return span_chars(a['e'] + 1, b['s'] - 1)
 
     # Repeatedly merge the closest neighboring clusters until the target cluster count is reached.
     while len(clusters) > num_clusters:
