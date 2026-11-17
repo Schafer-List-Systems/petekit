@@ -371,6 +371,23 @@ class WebServer:
         # Call all registered mount hooks whose pattern matches the path.
         self._call_hooks("unmount", "WebSocket", path)
 
+    def mounted_endpoints(self) -> dict[str, list[str]]:
+        """Return all currently mounted endpoints as a mapping of method to paths.
+
+        The mapping holds one entry per transport method -- "GET" and
+        "WebSocket" -- listing the paths mounted for that method. Mount
+        hook subscribers use this to replay the current mount state.
+
+        Contracts:
+            - The snapshot is taken atomically per method list -- mounts
+              happening during the call may or may not be included.
+        """
+        # Snapshot both handler registries -- one path list per method.
+        return {
+            "GET": list(self._get_handlers),
+            "WebSocket": list(self._ws_handlers),
+        }
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # Web Registry                                                                                                         #
 # -------------------------------------------------------------------------------------------------------------------- #
