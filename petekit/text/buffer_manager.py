@@ -30,6 +30,7 @@ from .buffer import (
 
 from peteos.oap.agentic_object import AgenticObject
 from peteos import tool, sandbox
+from peteos.engine import Runner
 from peteos.utils import get_logger
 from peteos.utils.watchdog import Watchdog
 from peteos.utils.watchdog import FileSystemEvent
@@ -1359,9 +1360,12 @@ class BufferManager(AgenticObject):
         if not grep_result.ok:
             return {"ok": False, "error": grep_result.error}
 
-        # Cluster the match indices to keep the agent context bounded when results are numerous.
-        clusters = _cluster_lines_to_ranges(grep_result.matches, self._NUM_CLUSTERS)
-        return {"ok": True, "matches": clusters, "count": grep_result.count}
+        # Match path: for the agent context, cluster the match indices to keep
+        # the response bounded; a Python caller receives every match unclustered.
+        if Runner.returns_to_context():
+            clusters = _cluster_lines_to_ranges(grep_result.matches, self._NUM_CLUSTERS)
+            return {"ok": True, "matches": clusters, "count": grep_result.count}
+        return {"ok": True, "matches": grep_result.matches, "count": grep_result.count}
 
     @sandbox
     def _read_buffer(self, name: str, start: int = 0, end: int | str = "end", show_timestamps: bool = False, show_line_numbers: bool = False) -> dict[str, Any]:
@@ -1439,12 +1443,19 @@ class BufferManager(AgenticObject):
         }
         total_chars = result["total_chars"]
 
-        # Within-size path: mark entries as seen by the agent and return content directly.
-        if total_chars <= BufferManager._MAX_CHUNK_CHARS:
-            now = time.time()
-            buf = self._buffers[name]
-            for entry in buf.lines[result["start"]:result["end"]]:
-                entry.agent_at = now
+        # Classify the caller once — the content decision needs both the size
+        # threshold and whether the return value flows into the agent context.
+        returns_to_context = Runner.returns_to_context()
+
+        # Content path: within the threshold, or a Python caller with no context
+        # window to protect — hand the content over directly.
+        if total_chars <= BufferManager._MAX_CHUNK_CHARS or not returns_to_context:
+            # Mark entries as seen by the agent — only when content reaches the context.
+            if returns_to_context:
+                now = time.time()
+                buf = self._buffers[name]
+                for entry in buf.lines[result["start"]:result["end"]]:
+                    entry.agent_at = now
             if raw:
                 return result["content"]
             resp = {"ok": True, "content": result["content"], "start": result["start"], "end": result["end"], "lines": result["line_count"]}
@@ -1605,10 +1616,14 @@ class BufferManager(AgenticObject):
         return {"ok": True, "count": count, "old_string": ""}
 
     @tool
-    async def diff_buffers(self, a: str, b: str, overwrite: bool = False) -> dict[str, Any]:
+    async def diff_buffers(self, a: str, b: str, overwrite: bool = False, raw: bool = False) -> dict[str, Any] | str:
         """Diff two buffers line-by-line using a unified diff.
-        Stores the result in a target buffer named diff:a→b.
-        Use overwrite=True to overwrite an existing diff buffer.
+
+        Returns the diff directly when it fits the context budget. When the
+        diff is too large to return into the agent context, it is stored in a
+        buffer named diff:a→b and only the pointer to it is returned. Use
+        overwrite=True to replace an existing diff buffer. Set raw=True to get
+        the raw string instead of a dict — errors always return dict.
         """
         # Validate both buffer names exist before proceeding.
         if a not in self._buffers:
@@ -1622,7 +1637,27 @@ class BufferManager(AgenticObject):
         if buf_a == buf_b:
             return {"ok": True, "identical": True, "a": a, "b": b}
 
-        # Guard against overwriting an existing diff buffer.
+        # Generate the unified diff text.
+        import difflib
+        diff_lines = list(difflib.unified_diff(
+            buf_a, buf_b,
+            fromfile=f"buffer:{a}", tofile=f"buffer:{b}",
+            lineterm="",
+        ))
+        diff_text = "\n".join(diff_lines) + "\n"
+
+        # Classify the caller once — the decision needs both the size threshold
+        # and whether the return value flows into the agent context.
+        returns_to_context = Runner.returns_to_context()
+
+        # Content path: within the threshold, or a Python caller with no context
+        # window to protect — return the diff directly.
+        if len(diff_text) <= BufferManager._MAX_CHUNK_CHARS or not returns_to_context:
+            if raw:
+                return diff_text
+            return {"ok": True, "diff": diff_text, "a": a, "b": b}
+
+        # Over-size path: dump the diff into a buffer and return the pointer.
         diff_name = _diff_buffer_name(a, b)
         if diff_name in self._buffers and not overwrite:
             return {
@@ -1632,15 +1667,6 @@ class BufferManager(AgenticObject):
                     f"Use overwrite=True to replace it, or drop it first with drop_buffer."
                 ),
             }
-
-        # Generate the unified diff and persist it as a new named buffer.
-        import difflib
-        diff_lines = list(difflib.unified_diff(
-            buf_a, buf_b,
-            fromfile=f"buffer:{a}", tofile=f"buffer:{b}",
-            lineterm="",
-        ))
-        diff_text = "\n".join(diff_lines) + "\n"
         create_result = await self.create_buffer(diff_name, text=diff_text, overwrite=True)
         if not create_result.get("ok"):
             return create_result
