@@ -195,7 +195,7 @@ async def _fire_action(
     """Fire the action described by the action sub-dict on the origin buffer.
 
     Reads the action field from config, then dispatches to a built-in action
-    (!read, !touch, !notify) or calls a custom function via the
+    (!read, !touch, !notify, !drop) or calls a custom function via the
     option_buffer_manager's function manager.
     """
     # Guard against a missing or empty action field.
@@ -221,6 +221,16 @@ async def _fire_action(
             error = await _do_notify(option_buffer_manager, action_config, origin)
             if error:
                 _logger.error(f"[_fire_action] !notify failed for '{origin}': {error}")
+
+    elif action == "!drop":
+        # The buffer to drop comes from the config, defaulting to the origin.
+        action_config = config.get("action_config") or {}
+        target = action_config.get("buffer", origin)
+
+        # Drop the target buffer and log an error when the drop fails.
+        result = await option_buffer_manager.drop_buffer(target)
+        if not isinstance(result, dict) or not result.get("ok"):
+            _logger.error(f"[_fire_action] !drop failed for '{target}': {result.get('error', 'unknown')}")
 
     else:
         # Get the kwargs for the custom action.

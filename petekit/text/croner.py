@@ -95,6 +95,7 @@ or one of the built-in actions:
 - `!read`  --  reads the origin buffer, discarding the result but triggering the read hooks
 - `!touch`  --  writes an empty string to the origin buffer, triggering the update hooks
 - `!notify`  --  delivers a notification to you -- see `!notify` below
+- `!drop`  --  drops a buffer -- see `!drop` below
 
 #### Built-In Action: !notify
 
@@ -125,6 +126,27 @@ current date and time is used instead.
   are doing -- a thread ID string redirects the notification to that
   specific conversation instead.
 
+#### Built-In Action: !drop
+
+Set `action` to `!drop` to drop a buffer when the trigger fires:
+
+```json
+{{
+  "action": "!drop",
+  "action_config": {{
+    "buffer": "the buffer to drop"
+  }}
+}}
+```
+
+**What it does** -- calls `drop_buffer` on the target buffer when the
+trigger fires, running the normal drop hooks and guards.
+
+**Configure it** -- `action_config` holds:
+
+- `buffer` -- optional. The name of the buffer to drop.
+  If omitted, the origin buffer is dropped.
+
 ### Custom Action Signature
 
 The `action` is a function name string from the FunctionManager. It is called
@@ -141,7 +163,7 @@ Drop the option buffer (`[timer]`, `[alarm]`, or `[schedule]`) to remove the tri
 - The target buffer must exist before the [timer], [alarm], or [schedule] option buffer can be created.
 - Dropping the target buffer automatically drops its option buffers.
 - Exactly one trigger key (`timer`, `alarm`, or `schedule`) is required in the JSON.
-- The `action` must be a function known to the FunctionManager or a built-in action (!notify, !read, !touch).
+- The `action` must be a function known to the FunctionManager or a built-in action (!notify, !read, !touch, !drop).
 """
 
 
@@ -419,6 +441,16 @@ async def _fire_action(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None
         error = await _do_notify(croner, job)
         if error:
             _logger.error(f"[_fire_action] !notify failed for {job.origin}: {error}")
+
+    elif action == "!drop":
+        # The buffer to drop comes from the config, defaulting to the origin.
+        action_config = config.get("action_config") or {}
+        target = action_config.get("buffer", job.origin)
+
+        # Drop the target buffer and log an error when the drop fails.
+        result = await croner.drop_buffer(target)
+        if not isinstance(result, dict) or not result.get("ok"):
+            _logger.error(f"[_fire_action] !drop failed for {target}: {result.get('error', 'unknown')}")
 
     else:
         # Call the custom function with the origin buffer name as the argument.
