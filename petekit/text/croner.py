@@ -31,22 +31,23 @@ _CRONER_DOC_BUFFER = "doc:cron"
 _CRONER_DOC = f"""\
 ## Croner
 
-The Croner attaches time-based actions to any buffer via [timer], [alarm], and
-[schedule] option buffers. Create `<buffer-name>[timer]`, `[alarm]`, or `[schedule]`
-to schedule a timed action on that buffer. Only one option buffer per trigger type
-is allowed per origin buffer.
+The Croner attaches time-based actions to any buffer via [timer], [alarm],
+[schedule], and [event] option buffers. Create `<buffer-name>[timer]`, `[alarm]`,
+`[schedule]`, or `[event]` to schedule a timed action on that buffer. Only one
+option buffer per trigger type is allowed per origin buffer.
 
 ### Buffer Naming
 
 - `<buffer-name>[timer]`  --  a recurring or one-shot timer
 - `<buffer-name>[alarm]`  --  a wall-clock alarm
 - `<buffer-name>[schedule]`  --  a crontab-style schedule
+- `<buffer-name>[event]`  --  a one-shot event at a date and time
 
 ### Creating a Scheduled Action
 
 Create the option buffer on the target buffer to enable the trigger.
 The target buffer must exist first. The option buffer holds a flat JSON object
-with an `action` and one trigger specifier (`timer`, `alarm`, or `schedule`).
+with an `action` and one trigger specifier (`timer`, `alarm`, `schedule`, or `event`).
 
 ### Trigger Types
 
@@ -86,6 +87,14 @@ Examples:
 - `weekday: 0`  --  Sunday only
 - `weekday: 1`  --  Monday only
 - `minute: 0, hour: "9-17", weekday: "1-5"`  --  weekdays 9am-5pm, on the hour
+
+`event`  --  Point-in-time event. The `date` (YYYY-MM-DD) and `time` (HH:MM:SS)
+are both required. The event fires once at that datetime and the [event] option
+buffer is dropped afterwards. The datetime must lie in the future:
+
+```json
+{{"action": "!notify", "date": "2026-12-24", "time": "18:00:00", "action_config": {{"prompt": "it is time"}}}}
+```
 
 ### Built-In Actions
 
@@ -194,6 +203,13 @@ class _Schedule:
     task: asyncio.Task | None = None
 
 
+@dataclass
+class _Event:
+    origin: str
+    timeout: float | None = None
+    task: asyncio.Task | None = None
+
+
 # -------------------------------------------------------------------------------------------------------------------- #
 # Utils                                                                                                             #
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -283,6 +299,42 @@ def _get_schedule_timeout(
         return f"[Croner] cannot parse or resolve schedule for {origin}  --  {e}"
 
     return (next_fire - datetime.datetime.now()).total_seconds()
+
+
+def _get_event_timeout(
+    config: dict[str, Any],
+    origin: str,
+) -> float | str:
+    """Compute the timeout in seconds until the event fires.
+
+    Reads the date (YYYY-MM-DD) and time (HH:MM:SS) fields from the config,
+    combines them into the target datetime, and returns the difference in
+    seconds from now. An event in the past is a config error. Returns an
+    error string on failure.
+    """
+    # Parse the event date -- both fields are required for a point-in-time event.
+    date_str = config.get("date", "")
+    try:
+        event_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return f"[Croner] invalid date format in [event] for {origin} -- expected YYYY-MM-DD"
+
+    # Parse the event time.
+    time_str = config.get("time", "")
+    try:
+        event_time = datetime.datetime.strptime(time_str, "%H:%M:%S").time()
+    except ValueError:
+        return f"[Croner] invalid time format in [event] for {origin} -- expected HH:MM:SS"
+
+    # Combine into the target datetime and compute the timeout from now.
+    target = datetime.datetime.combine(event_date, event_time)
+    timeout = (target - datetime.datetime.now()).total_seconds()
+
+    # An event in the past is a config error -- it can never fire.
+    if timeout < 0:
+        return f"[Croner] event datetime for {origin} is in the past ({target})"
+
+    return timeout
 
 
 def _validate_and_prepare_action_config(
@@ -401,7 +453,7 @@ async def _do_notify(
     return None
 
 
-async def _fire_action(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None:
+async def _fire_action(croner: Croner, job: _Timer | _Alarm | _Schedule | _Event) -> None:
     """Fire the action configured on the job.
 
     Reads the option buffer config, dispatches to a built-in action, or calls the
@@ -412,6 +464,8 @@ async def _fire_action(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None
         suffix = "[timer]"
     elif isinstance(job, _Alarm):
         suffix = "[alarm]"
+    elif isinstance(job, _Event):
+        suffix = "[event]"
     else:
         suffix = "[schedule]"
     option_buffer_name = f"{job.origin}{suffix}"
@@ -459,9 +513,12 @@ async def _fire_action(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None
     # Drop one-shot event buffers.
     if isinstance(job, _Timer) and not job.repeat:
         await croner.drop_buffer(f"{job.origin}[timer]")
-        
 
-async def _wait_for(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None:
+    # An event fires once -- drop its option buffer so the job is removed.
+    if isinstance(job, _Event):
+        await croner.drop_buffer(f"{job.origin}[event]")
+
+async def _wait_for(croner: Croner, job: _Timer | _Alarm | _Schedule | _Event) -> None:
     """The event loop for a timer, alarm, or schedule task.
 
     Sleeps for the job timeout, resets state on normal return, and rearms.
@@ -480,6 +537,11 @@ async def _wait_for(croner: Croner, job: _Timer | _Alarm | _Schedule) -> None:
         # On normal return: reset state and rearm.
         job.timeout = None
         job.task = None
+
+        # An event is one-shot by nature -- its option buffer is dropped by
+        # _fire_action and the AFTER_DROP hook removes the job.
+        if isinstance(job, _Event):
+            return
 
         # Rearm recurring events.
         if not isinstance(job, _Timer) or job.repeat:
@@ -564,9 +626,33 @@ def _rearm_schedule(
     job.task = asyncio.create_task(_wait_for(croner, job))
 
 
+def _rearm_event(
+    croner: Croner,
+    job: _Event,
+) -> str | None:
+    """Rearm the event task from the job object.
+
+    Reads the [event] config, computes the timeout until the fire datetime, and
+    starts a new asyncio task. Returns an error string on failure, None on success.
+    """
+    # Read and parse the [event] config, then abort if unavailable.
+    config = _read_option_buffer_config(croner, f"{job.origin}[event]")
+    if config is None:
+        return "[Croner] event config not found"
+
+    # Delegate the timeout computation to the dedicated helper.
+    timeout_or_error = _get_event_timeout(config, job.origin)
+    if not isinstance(timeout_or_error, float):
+        return timeout_or_error
+
+    # Assign the timeout and schedule the event loop as a new task.
+    job.timeout = timeout_or_error
+    job.task = asyncio.create_task(_wait_for(croner, job))
+
+
 def _dispatch_rearm(
     croner: Croner,
-    job: _Timer | _Alarm | _Schedule,
+    job: _Timer | _Alarm | _Schedule | _Event,
 ) -> str | None:
     """Dispatch to the correct rearm function based on the job type.
 
@@ -578,6 +664,8 @@ def _dispatch_rearm(
         return _rearm_timer(croner, job)
     if isinstance(job, _Alarm):
         return _rearm_alarm(croner, job)
+    if isinstance(job, _Event):
+        return _rearm_event(croner, job)
     else:
         return _rearm_schedule(croner, job)
 
@@ -732,6 +820,56 @@ def _before_update_schedule(
     return None
 
 
+def _before_update_event(
+    croner: Croner,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> str | None:
+    """Guard the [event] option buffer against invalid JSON.
+
+    Required: action (string), date (string YYYY-MM-DD), time (string HH:MM:SS).
+    The event datetime must lie in the future.
+    """
+    # Accept empty buffer as a no-op.
+    text = new_buffer.get_text()
+    if not text or not text.strip():
+        return None
+
+    # Parse the JSON content.
+    try:
+        job = json.loads(text)
+    except json.JSONDecodeError:
+        return "event buffer is not valid JSON"
+
+    # Reject non-dict content.
+    if not isinstance(job, dict):
+        return "event buffer must be a JSON object"
+
+    # Reject missing or empty action.
+    if not isinstance(job.get("action"), str) or not job["action"]:
+        return "action is required and must be a non-empty string"
+
+    # Validate and prepare the action_config from the buffer.
+    prepare_error = _validate_and_prepare_action_config(new_buffer, croner)
+    if prepare_error:
+        return prepare_error
+
+    # Validate the event datetime using the dedicated helper.
+    origin = new_buffer.name.removesuffix("[event]")
+    timeout_or_error = _get_event_timeout(job, origin)
+    if not isinstance(timeout_or_error, float):
+        return timeout_or_error
+
+    # Reject any unknown top-level key.
+    valid_fields = {"date", "time", "action_config"}
+    unknown = {k for k in job if k not in {"action"} and k not in valid_fields}
+    if unknown:
+        return f"event has unknown fields: {', '.join(sorted(unknown))}"
+
+    return None
+
+
 async def _after_update_timer(
     croner: Croner,
     old_buffer: Buffer | None,
@@ -812,6 +950,29 @@ async def _after_update_schedule(
         _logger.error(error)
 
 
+async def _after_update_event(
+    croner: Croner,
+    old_buffer: Buffer | None,
+    new_buffer: Buffer,
+    args: dict[str, Any],
+) -> None:
+    """Called after an [event] buffer is created or updated.
+
+    Creates the job if absent, then rearms it.
+    """
+    # Derive the origin buffer name from the event option buffer name.
+    origin = new_buffer.name.removesuffix("[event]")
+
+    # Create the event job if it does not yet exist in the dictionary.
+    if origin not in croner._cron_events:
+        croner._cron_events[origin] = _Event(origin=origin)
+
+    # Rearm the event job.
+    error = _dispatch_rearm(croner, croner._cron_events[origin])
+    if error:
+        _logger.error(error)
+
+
 async def _after_drop_cron(
     croner: Croner,
     old_buffer: Buffer,
@@ -830,6 +991,8 @@ async def _after_drop_cron(
         tasks = croner._cron_alarms
     elif old_buffer.name.endswith("[schedule]"):
         tasks = croner._cron_schedules
+    elif old_buffer.name.endswith("[event]"):
+        tasks = croner._cron_events
     else:
         return
 
@@ -838,6 +1001,8 @@ async def _after_drop_cron(
         origin = old_buffer.name.removesuffix("[timer]")
     elif old_buffer.name.endswith("[alarm]"):
         origin = old_buffer.name.removesuffix("[alarm]")
+    elif old_buffer.name.endswith("[event]"):
+        origin = old_buffer.name.removesuffix("[event]")
     else:
         origin = old_buffer.name.removesuffix("[schedule]")
 
@@ -864,6 +1029,7 @@ class Croner(FunctionCaller, OptionBufferManager, AgenticObject):
         self._cron_timers: dict[str, _Timer] = {}
         self._cron_alarms: dict[str, _Alarm] = {}
         self._cron_schedules: dict[str, _Schedule] = {}
+        self._cron_events: dict[str, _Event] = {}
 
         # Seed the doc buffer with the module documentation.
         self._create_buffer(_CRONER_DOC_BUFFER, text=_CRONER_DOC)
@@ -919,6 +1085,22 @@ class Croner(FunctionCaller, OptionBufferManager, AgenticObject):
             apply_to_existing=True,
         )
 
+        # Then register the event guard hooks on [event] buffers.
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_UPDATE_BUFFER,
+            "event_guard",
+            r"^.+\[event\]$",
+            _before_update_event,
+            apply_to_existing=True,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.BEFORE_CREATE_BUFFER,
+            "event_guard",
+            r"^.+\[event\]$",
+            lambda bm, new_buffer, args: _before_update_event(bm, None, new_buffer, args),
+            apply_to_existing=True,
+        )
+
         # Register the after-update hooks for timer, alarm, and schedule to start or
         # restart the respective tasks when the option buffer is written.
         # First register the timer after-update hooks.
@@ -969,12 +1151,28 @@ class Croner(FunctionCaller, OptionBufferManager, AgenticObject):
             apply_to_existing=True,
         )
 
+        # Then register the event after-update hooks.
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_UPDATE_BUFFER,
+            "after_event",
+            r"^.+\[event\]$",
+            _after_update_event,
+            apply_to_existing=True,
+        )
+        self.register_buffer_pattern_hook(
+            HookPoint.AFTER_CREATE_BUFFER,
+            "after_event",
+            r"^.+\[event\]$",
+            lambda bm, new_buffer, args: _after_update_event(bm, None, new_buffer, args),
+            apply_to_existing=True,
+        )
+
         # Cancel and remove the task when the option buffer is dropped.
         # One shared hook inspects the buffer name to determine the trigger type.
         self.register_buffer_pattern_hook(
             HookPoint.AFTER_DROP_BUFFER,
             "after_drop_cron",
-            r"^.+\[(timer|alarm|schedule)\]$",
+            r"^.+\[(timer|alarm|schedule|event)\]$",
             _after_drop_cron,
             apply_to_existing=True,
         )
