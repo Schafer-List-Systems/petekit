@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
+import logging
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable, Union
 
 import asyncio
 import re
@@ -11,6 +13,9 @@ import fastapi
 import uvicorn
 from fastapi import FastAPI
 from starlette.routing import Route
+
+
+_logger = logging.getLogger("web_server")
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -21,7 +26,13 @@ from starlette.routing import Route
 # Args: event (str) — "mount" or "unmount"
 # Args: method (str) — "GET", "POST", "WebSocket", etc.
 # Args: path (str) — the path being mounted or unmounted
-MountHook = Callable[[str, str, str], None]
+#
+# A hook may be a plain function or a coroutine function. The server awaits
+# coroutine hooks when they fire -- mounting awaits its hooks.
+MountHook = Union[
+    Callable[[str, str, str], None],
+    Callable[[str, str, str], Awaitable[None]],
+]
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
@@ -119,20 +130,29 @@ class WebServer:
 
         return None
 
-    def _call_hooks(self, event: str, method: str, path: str) -> None:
+    async def _call_hooks(self, event: str, method: str, path: str) -> None:
         """Call all registered mount hooks whose pattern matches the path.
 
         Iterates all registered hooks and calls each hook whose pattern
         matches the given path. Passes event, method, and path as arguments.
+        Sync hooks run inline; coroutine hooks are awaited to completion.
+        A failing hook never breaks the mount -- it is logged and skipped.
         """
-        # Iterate all registered hooks and call those whose pattern matches.
-        for hook in self._hooks.values():
+        # Snapshot the hooks -- awaiting mid-iteration yields to the loop,
+        # and a hook may register or unregister while we deliver.
+        for hook in list(self._hooks.values()):
             # Skip hooks whose pattern does not match the path.
             if not hook.pattern.match(path):
                 continue
 
-            # Call the hook with the event, method, and path.
-            hook.handler(event, method, path)
+            # Call the hook and await it when it is a coroutine function.
+            # A failing hook never breaks the mount -- report and move on.
+            try:
+                result = hook.handler(event, method, path)
+                if inspect.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                _logger.error("[WebServer] mount hook failed on %s: %s", path, exc)
 
     def unregister_hook(self, name: str) -> str | None:
         """Unregister the hook under the given name.
@@ -270,7 +290,7 @@ class WebServer:
 
         return None
 
-    def mount_get(self, path: str, handler: callable) -> str | None:
+    async def mount_get(self, path: str, handler: callable) -> str | None:
         """Mount an async HTTP GET handler on the given path.
 
         The handler is immediately callable. Returns None on success,
@@ -297,9 +317,9 @@ class WebServer:
         self._get_handlers[path] = Endpoint(route, handler)
 
         # Call all registered mount hooks whose pattern matches the path.
-        self._call_hooks("mount", "GET", path)
+        await self._call_hooks("mount", "GET", path)
 
-    def unmount_get(self, path: str) -> str | None:
+    async def unmount_get(self, path: str) -> str | None:
         """Unmount the HTTP GET handler on the given path.
 
         After unmounting, requests to this path return 404.
@@ -318,9 +338,9 @@ class WebServer:
         del self._get_handlers[path]
 
         # Call all registered mount hooks whose pattern matches the path.
-        self._call_hooks("unmount", "GET", path)
+        await self._call_hooks("unmount", "GET", path)
 
-    def mount_ws(self, path: str, handler: callable) -> str | None:
+    async def mount_ws(self, path: str, handler: callable) -> str | None:
         """Mount an async WebSocket handler on the given path.
 
         WebSocket connections on this path are routed to this handler.
@@ -348,9 +368,9 @@ class WebServer:
         self._ws_handlers[path] = Endpoint(route, handler)
 
         # Call all registered mount hooks whose pattern matches the path.
-        self._call_hooks("mount", "WebSocket", path)
+        await self._call_hooks("mount", "WebSocket", path)
 
-    def unmount_ws(self, path: str) -> str | None:
+    async def unmount_ws(self, path: str) -> str | None:
         """Unmount the WebSocket handler on the given path.
 
         After unmounting, WebSocket connections on this path are rejected.
@@ -369,7 +389,7 @@ class WebServer:
         del self._ws_handlers[path]
 
         # Call all registered mount hooks whose pattern matches the path.
-        self._call_hooks("unmount", "WebSocket", path)
+        await self._call_hooks("unmount", "WebSocket", path)
 
     def mounted_endpoints(self) -> dict[str, list[str]]:
         """Return all currently mounted endpoints as a mapping of method to paths.

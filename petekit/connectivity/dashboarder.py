@@ -391,15 +391,15 @@ async def serve_dashboard(
 
     # Mount the GET handler on the server at the path from the config.
     # When mounting fails, return the error.
-    error = server.mount_get(path, get_page)
+    error = await server.mount_get(path, get_page)
     if error is not None:
         return error
 
     # Mount the WebSocket handler on the server at the path from the config.
     # When mounting fails, unmount the GET handler and return the error.
-    error = server.mount_ws(path, ws_handler)
+    error = await server.mount_ws(path, ws_handler)
     if error is not None:
-        server.unmount_get(path)
+        await server.unmount_get(path)
         return error
 
     # Register the dashboard in the dashboarder's registry.
@@ -425,8 +425,8 @@ async def unserve_dashboard(
     server = get_server(dashboard.config["server"])
     if isinstance(server, str):
         return server
-    server.unmount_get(dashboard.path)
-    server.unmount_ws(dashboard.path)
+    await server.unmount_get(dashboard.path)
+    await server.unmount_ws(dashboard.path)
 
     # Remove the dashboard from the registry.
     del dashboarder._dashboards[dashboard_id]
