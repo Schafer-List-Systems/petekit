@@ -11,18 +11,21 @@ from __future__ import annotations
 
 import bisect
 import logging
+import time
 from typing import Any
 
 from ..text.buffer_manager import (
     Buffer,
     BufferManager,
     HookPoint,
+    _over_size_hint,
 )
 from ..text.option_buffer_manager import (
     OptionBufferManager,
     _origin_name_from_option_buffer_name,
     _option_type_from_option_buffer_name,
 )
+from peteos.engine import Runner
 from peteos.oap.agentic_object import AgenticObject
 
 _logger = logging.getLogger("stream_buffer_manager")
@@ -357,60 +360,79 @@ class StreamBufferManager(OptionBufferManager, AgenticObject):
         positive floats are absolute Unix timestamps.
         Set raw=True to get the raw string instead of a dict.
         """
-        # Delegate immediately for non-time-based reading — no time conversion needed.
-        if not isinstance(start, float) and not isinstance(end, float):
-            return await super().read_buffer(
-                name,
-                start=start,
-                end=end,
-                show_timestamps=show_timestamps,
-                show_line_numbers=show_line_numbers,
-                raw=raw,
-            )
+        # Classify the caller here — the super() delegation defeats the base's
+        # stack walk (this override frame reads as user code), so the base
+        # always yields the full version. The protection happens below instead.
+        returns_to_context = Runner.returns_to_context()
 
-        # Detect whether this buffer is a stream by checking for the [stream] option buffer.
-        if not self.is_stream_buffer(name):
-            return {"ok": False, "error": f"Time-based reading requires a stream buffer. '{name}' has no [stream] option."}
+        # Time-based path: resolve float references to line indices.
+        if isinstance(start, float) or isinstance(end, float):
+            # Detect whether this buffer is a stream by checking for the [stream] option buffer.
+            if not self.is_stream_buffer(name):
+                return {"ok": False, "error": f"Time-based reading requires a stream buffer. '{name}' has no [stream] option."}
 
-        # Resolve the buffer — it must exist for time-based reading to work.
-        buf = self._buffers.get(name)
-        if buf is None:
-            return {"ok": False, "error": f"No buffer named '{name}'."}
+            # Resolve the buffer — it must exist for time-based reading to work.
+            buf = self._buffers.get(name)
+            if buf is None:
+                return {"ok": False, "error": f"No buffer named '{name}'."}
 
-        # Reject time queries on empty buffers — there are no timestamps to reference.
-        if not buf.lines:
-            return {"ok": False, "error": f"Buffer '{name}' is empty."}
+            # Reject time queries on empty buffers — there are no timestamps to reference.
+            if not buf.lines:
+                return {"ok": False, "error": f"Buffer '{name}' is empty."}
 
-        # Use the last entry's modified_at as the anchor for resolving relative timestamps.
-        anchor = buf.lines[-1].modified_at
+            # Use the last entry's modified_at as the anchor for resolving relative timestamps.
+            anchor = buf.lines[-1].modified_at
 
-        # Convert float start to a line index; propagate errors from out-of-range timestamps.
-        if isinstance(start, float):
-            try:
-                start = _time_ref_to_line(buf, start, anchor, "start")
-            except ValueError as e:
-                return {"ok": False, "error": str(e)}
+            # Convert float start to a line index; propagate errors from out-of-range timestamps.
+            if isinstance(start, float):
+                try:
+                    start = _time_ref_to_line(buf, start, anchor, "start")
+                except ValueError as e:
+                    return {"ok": False, "error": str(e)}
 
-        # Convert float end to a line index; propagate errors from out-of-range timestamps.
-        if isinstance(end, float):
-            try:
-                end = _time_ref_to_line(buf, end, anchor, "end")
-            except ValueError as e:
-                return {"ok": False, "error": str(e)}
+            # Convert float end to a line index; propagate errors from out-of-range timestamps.
+            if isinstance(end, float):
+                try:
+                    end = _time_ref_to_line(buf, end, anchor, "end")
+                except ValueError as e:
+                    return {"ok": False, "error": str(e)}
 
-        # Auto-enable timestamps for time-based reads so callers can see when each entry arrived.
-        if not raw:
-            show_timestamps = True
+            # Auto-enable timestamps for time-based reads so callers can see when each entry arrived.
+            if not raw:
+                show_timestamps = True
 
-        # Delegate to the base read_buffer with resolved integer indices.
-        return await super().read_buffer(
+        # Delegate to the base read_buffer with raw disabled — the protection
+        # below needs the dict shape and applies raw afterwards.
+        result = await super().read_buffer(
             name,
             start=start,
             end=end,
             show_timestamps=show_timestamps,
             show_line_numbers=show_line_numbers,
-            raw=raw,
+            raw=False,
         )
+
+        # Errors pass through unchanged.
+        if not isinstance(result, dict) or not result.get("ok"):
+            return result
+
+        # Over-size results become the reduced-view hint for the agent.
+        # No agent_at marking — the content itself never reached the context.
+        if len(result["content"]) > BufferManager._MAX_CHUNK_CHARS and returns_to_context:
+            return _over_size_hint(result["content"], result["start"], result["end"], result["lines"])
+
+        # Mark entries as seen — only when the content reaches the context.
+        if returns_to_context:
+            now = time.time()
+            buf = self._buffers[name]
+            for entry in buf.lines[result["start"]:result["end"]]:
+                entry.agent_at = now
+
+        # Raw passthrough — mirror the base's raw contract.
+        if raw:
+            return result["content"]
+
+        return result
 
     def is_stream_buffer(self, buffer_name: str) -> bool:
         """Return True if 'buffer_name' is a stream buffer (has a "buffer_name[stream]" option buffer)."""

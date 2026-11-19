@@ -879,6 +879,49 @@ def _make_buckets(segment: list[str], num_buckets: int, start_offset: int) -> li
     return buckets
 
 
+def _over_size_hint(content: str, start: int, end: int, line_count: int) -> dict[str, Any]:
+    """Build the reduced-view hint for an over-size read result.
+
+    Splits the formatted content into lines and reports either the heaviest
+    lines to skip (when few suffice) or the bucket distribution, prompting the
+    caller to narrow the read range.
+    """
+    # Split the formatted content into lines for heavy-line detection; this segment reflects the
+    # pre-formatted text (with line numbers and timestamps as applicable) and its total char
+    # count is the authoritative measure used by the skip and bucket heuristics.
+    segment = content.split("\n")
+    if content.endswith("\n"):
+        segment = segment[:-1]
+
+    # The char count of the content is the authoritative measure for both hints.
+    total_chars = len(content)
+
+    # Check whether excluding the heaviest lines would bring the segment under the threshold.
+    to_skip, _ = _lines_to_skip(segment, start, BufferManager._MAX_CHUNK_CHARS)
+    if to_skip and len(to_skip) <= 10:
+        skip_msg = ", ".join(f"line {idx}({cl} chars)" for idx, cl in to_skip)
+        return {
+            "ok": False,
+            "error": (
+                f"Range [{start}:{end}) is {total_chars} chars ({line_count} lines). "
+                f"Heaviest lines ({len(to_skip)} totaling {sum(c for _, c in to_skip)} chars): {skip_msg}. "
+                f"Consider re-reading with a narrower range to avoid them."
+            ),
+        }
+
+    # Report bucket distribution and prompt the caller to narrow the range.
+    buckets = _make_buckets(segment, 10, start)
+    bucket_msgs = ", ".join(f"{sa}-{en}:{c}" for sa, en, c in buckets)
+    return {
+        "ok": False,
+        "error": (
+            f"Range [{start}:{end}) is {total_chars} chars ({line_count} lines) and exceeds the {BufferManager._MAX_CHUNK_CHARS}-char threshold. "
+            f"Reduce the read range to stay under the limit. "
+            f"Bucket distribution (start-end:chars): {bucket_msgs}."
+        ),
+    }
+
+
 # --------------------------------------------------------------------------------------------------
 # Main class
 # --------------------------------------------------------------------------------------------------
@@ -1447,54 +1490,28 @@ class BufferManager(AgenticObject):
         # threshold and whether the return value flows into the agent context.
         returns_to_context = Runner.returns_to_context()
 
+        # Over-size path: build the reduced-view hint prompting a narrower range.
+        if total_chars > BufferManager._MAX_CHUNK_CHARS and returns_to_context:
+            return _over_size_hint(result["content"], result["start"], result["end"], result["line_count"])
+
         # Content path: within the threshold, or a Python caller with no context
         # window to protect — hand the content over directly.
-        if total_chars <= BufferManager._MAX_CHUNK_CHARS or not returns_to_context:
+        if returns_to_context:
             # Mark entries as seen by the agent — only when content reaches the context.
-            if returns_to_context:
-                now = time.time()
-                buf = self._buffers[name]
-                for entry in buf.lines[result["start"]:result["end"]]:
-                    entry.agent_at = now
-            if raw:
-                return result["content"]
-            resp = {"ok": True, "content": result["content"], "start": result["start"], "end": result["end"], "lines": result["line_count"]}
-            if result.get("skipped_tail"):
-                resp["skipped_tail"] = result["skipped_tail"]
-            return resp
+            now = time.time()
+            buf = self._buffers[name]
+            for entry in buf.lines[result["start"]:result["end"]]:
+                entry.agent_at = now
 
-        # Split the formatted content into lines for heavy-line detection; this segment reflects the
-        # pre-formatted text (with line numbers and timestamps as applicable) and its total char
-        # count is the authoritative measure used by the skip and bucket heuristics.
-        segment = result["content"].split("\n")
-        if result["content"].endswith("\n"):
-            segment = segment[:-1]
+        # Return raw content directly
+        if raw:
+            return result["content"]
 
-        # Over-size path: check whether excluding the heaviest lines would bring the segment under the threshold.
-        to_skip, _ = _lines_to_skip(segment, result["start"], BufferManager._MAX_CHUNK_CHARS)
-        if to_skip and len(to_skip) <= 10:
-            skip_lines = to_skip
-            skip_msg = ", ".join(f"line {idx}({cl} chars)" for idx, cl in skip_lines)
-            return {
-                "ok": False,
-                "error": (
-                    f"Range [{result['start']}:{result['end']}) is {total_chars} chars ({result['line_count']} lines). "
-                    f"Heaviest lines ({len(skip_lines)} totaling {sum(c for _, c in skip_lines)} chars): {skip_msg}. "
-                    f"Consider re-reading with a narrower range to avoid them."
-                ),
-            }
-
-        # Over-size path: report bucket distribution and prompt the caller to narrow the range.
-        buckets = _make_buckets(segment, 10, result["start"])
-        bucket_msgs = ", ".join(f"{sa}-{en}:{c}" for sa, en, c in buckets)
-        return {
-            "ok": False,
-            "error": (
-                f"Range [{result['start']}:{result['end']}) is {total_chars} chars ({result['line_count']} lines) and exceeds the {BufferManager._MAX_CHUNK_CHARS}-char threshold. "
-                f"Reduce the read range to stay under the limit. "
-                f"Bucket distribution (start-end:chars): {bucket_msgs}."
-            ),
-        }
+        # Otherwise, pack it inside a dictionary with additional information.
+        resp = {"ok": True, "content": result["content"], "start": result["start"], "end": result["end"], "lines": result["line_count"]}
+        if result.get("skipped_tail"):
+            resp["skipped_tail"] = result["skipped_tail"]
+        return resp
 
     @tool
     async def edit_buffer(self, name: str, old_string: str, new_string: str, start: int = 0, end: int | str = "end", replace_all: bool = False) -> dict[str, Any]:
