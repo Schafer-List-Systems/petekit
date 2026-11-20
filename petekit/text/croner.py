@@ -422,6 +422,8 @@ async def _do_notify(
         config_name = f"{job.origin}[timer]"
     elif isinstance(job, _Alarm):
         config_name = f"{job.origin}[alarm]"
+    elif isinstance(job, _Event):
+        config_name = f"{job.origin}[event]"
     else:
         config_name = f"{job.origin}[schedule]"
 
@@ -508,7 +510,9 @@ async def _fire_action(croner: Croner, job: _Timer | _Alarm | _Schedule | _Event
 
     else:
         # Call the custom function with the origin buffer name as the argument.
-        await croner.call_function(action, buffer_name=job.origin)
+        result = await croner.call_function(action, kwargs={"buffer_name": job.origin})
+        if not isinstance(result, dict) or not result.get("ok"):
+            _logger.error(f"[_fire_action] custom action '{action}' failed for {job.origin}: {result.get('error', 'unknown')}")
 
     # Drop one-shot event buffers.
     if isinstance(job, _Timer) and not job.repeat:

@@ -1101,8 +1101,11 @@ class BufferManager(AgenticObject):
     @tool
     async def write_buffer(self, name: str, text: str, pos: int | str = 'end') -> dict[str, Any]:
         """Write into an existing text buffer.
-        Default: APPEND
-        A trailing newline is always appended, i.e., an empty input creates a blank line in the buffer.
+        Default: APPEND -- the first line of text continues the buffer's last
+        line, and further lines become new entries. A trailing newline in the
+        text starts a new empty line, while the final line without one merges
+        into the line at the insertion point. An empty write therefore changes
+        no content: it bumps the modification time and fires the write hooks.
         Set pos to an integer (0-based line index) to insert at that position.
         Negative indices are relative to the end (Python array style).
         """
